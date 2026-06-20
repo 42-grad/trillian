@@ -467,45 +467,52 @@ fn left_join(
         .into_iter()
         .cloned()
         .collect();
-    let new_vars: Vec<String> = opt_var_order
-        .iter()
-        .filter(|v| !left_var_order.contains(v))
-        .cloned()
-        .collect();
+
+    // Gemeinsame Variablen (Join-Schlüssel) und neue Variablen bestimmen.
+    // shared: (Position in der linken Zeile, Position in der OPTIONAL-Zeile),
+    // in OPTIONAL-Reihenfolge, damit linker und rechter Schlüssel gleich geordnet sind.
+    let mut shared: Vec<(usize, usize)> = Vec::new();
+    let mut new_positions: Vec<usize> = Vec::new();
+    let mut new_vars: Vec<String> = Vec::new();
+    for (opt_pos, v) in opt_var_order.iter().enumerate() {
+        if let Some(left_pos) = left_var_order.iter().position(|lv| lv == v) {
+            shared.push((left_pos, opt_pos));
+        } else {
+            new_positions.push(opt_pos);
+            new_vars.push(v.clone());
+        }
+    }
     let mut new_var_order = left_var_order.to_vec();
-    new_var_order.extend(new_vars.clone());
+    new_var_order.extend(new_vars.iter().cloned());
 
     const NULL_ID: u32 = u32::MAX;
+
+    // OPTIONAL-Muster **einmal** ausführen (statt pro linker Zeile) und nach
+    // den Join-Schlüsselwerten indizieren -> klassischer Hash-Left-Join.
+    let opt_rows = engine.execute(store, &opt_internal_full);
+    let mut index: rustc_hash::FxHashMap<Vec<u32>, Vec<Vec<u32>>> =
+        rustc_hash::FxHashMap::default();
+    for orow in &opt_rows {
+        let key: Vec<u32> = shared.iter().map(|&(_, op)| orow[op]).collect();
+        let new_vals: Vec<u32> = new_positions.iter().map(|&p| orow[p]).collect();
+        index.entry(key).or_default().push(new_vals);
+    }
+
     let mut result = Vec::with_capacity(left_rows.len());
-
     for row in left_rows {
-        let bindings: std::collections::HashMap<String, u32> = left_var_order
-            .iter()
-            .cloned()
-            .zip(row.iter().cloned())
-            .collect();
-        let substituted = substitute_pattern(&opt_internal_full, &bindings);
-
-        let substituted_var_order: Vec<String> = substituted
-            .variable_order()
-            .into_iter()
-            .cloned()
-            .collect();
-        let ext_rows = engine.execute(store, &substituted);
-        if ext_rows.is_empty() {
-            let mut new_row = row.clone();
-            new_row.resize(new_var_order.len(), NULL_ID);
-            result.push(new_row);
-        } else {
-            for ext in ext_rows {
-                let mut new_row = row.clone();
-                for new_var in &new_vars {
-                    let pos = substituted_var_order
-                        .iter()
-                        .position(|v| v == new_var)
-                        .expect("optional var in substituted var_order");
-                    new_row.push(ext[pos]);
+        let key: Vec<u32> = shared.iter().map(|&(lp, _)| row[lp]).collect();
+        match index.get(&key) {
+            Some(matches) if !matches.is_empty() => {
+                for m in matches {
+                    let mut new_row = row.clone();
+                    new_row.extend_from_slice(m);
+                    result.push(new_row);
                 }
+            }
+            _ => {
+                // Kein Match -> OPTIONAL-Variablen bleiben ungebunden (NULL).
+                let mut new_row = row.clone();
+                new_row.resize(new_var_order.len(), NULL_ID);
                 result.push(new_row);
             }
         }
@@ -551,38 +558,6 @@ fn term_pattern_variables(tp: &spargebra::term::TermPattern) -> Vec<String> {
     }
 }
 
-fn substitute_pattern(
-    pattern: &GraphPattern,
-    bindings: &std::collections::HashMap<String, u32>,
-) -> GraphPattern {
-    GraphPattern {
-        patterns: pattern
-            .patterns
-            .iter()
-            .map(|tp| TriplePattern {
-                subject: substitute_pattern_term(&tp.subject, bindings),
-                predicate: substitute_pattern_term(&tp.predicate, bindings),
-                object: substitute_pattern_term(&tp.object, bindings),
-            })
-            .collect(),
-    }
-}
-
-fn substitute_pattern_term(
-    term: &PatternTerm,
-    bindings: &std::collections::HashMap<String, u32>,
-) -> PatternTerm {
-    match term {
-        PatternTerm::Variable(name) => {
-            if let Some(id) = bindings.get(name) {
-                PatternTerm::Bound(*id)
-            } else {
-                PatternTerm::Variable(name.clone())
-            }
-        }
-        PatternTerm::Bound(id) => PatternTerm::Bound(*id),
-    }
-}
 
 fn sparql_json(result: &SelectResult, store: &TripleStore) -> Value {
     let mut var_indices = Vec::with_capacity(result.vars.len());
@@ -972,6 +947,37 @@ mod tests {
             .map(|r| r.get("age").and_then(|v| v.get("value")).and_then(|v| v.as_str()).map(|s| s.parse().unwrap()))
             .collect();
         assert!(ages.contains(&Some(25)));
+        assert!(ages.contains(&None));
+    }
+
+    #[test]
+    fn optional_multi_match_expands_rows() {
+        // bob hat zwei Alter -> die linke Zeile alice->bob muss zu ZWEI
+        // Ausgabezeilen expandieren; carol (kein Alter) bleibt eine NULL-Zeile.
+        let mut store = TripleStore::new();
+        store.ingest_str_triples(&[
+            ("http://example.org/alice", "http://example.org/knows", "http://example.org/bob"),
+            ("http://example.org/alice", "http://example.org/knows", "http://example.org/carol"),
+            ("http://example.org/bob", "http://example.org/age", "25"),
+            ("http://example.org/bob", "http://example.org/age", "26"),
+        ]);
+        let engine = HybridEngine::new();
+        let query = "SELECT ?b ?age WHERE { ?a <http://example.org/knows> ?b . OPTIONAL { ?b <http://example.org/age> ?age } }";
+        let result = execute_sparql(&store, &engine, query).unwrap();
+        let rows = result["results"]["bindings"].as_array().unwrap();
+        // bob×{25,26} = 2 Zeilen + carol×NULL = 1 Zeile.
+        assert_eq!(rows.len(), 3);
+        let ages: Vec<Option<String>> = rows
+            .iter()
+            .map(|r| {
+                r.get("age")
+                    .and_then(|v| v.get("value"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+            .collect();
+        assert!(ages.contains(&Some("25".to_string())));
+        assert!(ages.contains(&Some("26".to_string())));
         assert!(ages.contains(&None));
     }
 
