@@ -4,7 +4,7 @@ use rustc_hash::FxHashMap;
 
 use super::dictionary::{Dictionary, TermType};
 use super::export::ParsedTriple;
-use super::index::{intersect_sorted, LayeredIndex};
+use super::index::{intersect_sorted, FlatCsr, LayeredIndex, U32Arena};
 use super::stats::Stats;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -298,9 +298,15 @@ impl TripleStore {
         let osp: Vec<(u32, u32, u32)> = triples.iter().map(|t| (t.2, t.0, t.1)).collect();
         self.osp = LayeredIndex::build(&osp);
 
+        self.rebuild_aux();
+    }
+
+    /// Leitet Prädikat-Schlüssellisten und Statistik aus den (bereits
+    /// gebauten/gemappten) Permutationen ab. Genutzt nach Bulk-Load **und**
+    /// nach dem Laden eines mmap-Snapshots.
+    fn rebuild_aux(&mut self) {
         // Prädikat-Schlüssellisten (distinkte Subjekte/Objekte je Prädikat)
-        // aus den bereits sortierten Permutationen in O(n) ableiten – die
-        // Sortierung erlaubt last()-Deduplikation statt binärer Suche.
+        // in O(n) ableiten – die Sortierung erlaubt last()-Deduplikation.
         self.pred_subjects.clear();
         self.pred_objects.clear();
         // SPO ist nach (s,p,o) sortiert -> je Prädikat sind die s monoton.
@@ -318,12 +324,118 @@ impl TripleStore {
             }
         }
 
-        // Statistik aus den deduplizierten Index-Inhalten ableiten, damit
-        // sie konsistent mit den inkrementellen Updates (distinkt) ist.
+        // Statistik aus den deduplizierten Index-Inhalten ableiten.
         self.stats = Stats::default();
         for (s, p, o) in self.spo.all_triples() {
             self.stats.add_triple(s, p, o);
         }
+    }
+
+    /// Kompaktiert die Deltas aller drei Permutationen in die flachen Basen.
+    pub fn compact_all(&mut self) {
+        self.spo.compact();
+        self.pos.compact();
+        self.osp.compact();
+    }
+
+    /// Schreibt einen Binär-Snapshot (Dictionary + die 3 flachen CSR-Indizes).
+    ///
+    /// Die Index-Arrays liegen 4-Byte-aligned hintereinander, sodass sie beim
+    /// Laden zero-copy memory-gemappt werden können (vgl. Tentris/metall).
+    pub fn save_snapshot(&mut self, path: &str) -> std::io::Result<()> {
+        self.compact_all();
+
+        let perms = [self.spo.base(), self.pos.base(), self.osp.base()];
+        let mut arrays: Vec<&[u32]> = Vec::with_capacity(15);
+        for csr in perms {
+            for a in csr.arrays() {
+                arrays.push(a);
+            }
+        }
+
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"TTRSNAP1");
+        buf.extend_from_slice(&1u32.to_le_bytes()); // version
+        buf.extend_from_slice(&(self.dict.len() as u32).to_le_bytes());
+        let arrays_off_pos = buf.len();
+        buf.extend_from_slice(&0u64.to_le_bytes()); // arrays_offset (Platzhalter)
+        let dict_off_pos = buf.len();
+        buf.extend_from_slice(&0u64.to_le_bytes()); // dict_offset (Platzhalter)
+        for a in &arrays {
+            buf.extend_from_slice(&(a.len() as u32).to_le_bytes());
+        }
+        while buf.len() % 8 != 0 {
+            buf.push(0);
+        }
+        let arrays_off = buf.len() as u64;
+        for a in &arrays {
+            buf.extend_from_slice(bytemuck::cast_slice::<u32, u8>(a));
+        }
+        let dict_off = buf.len() as u64;
+        self.dict.serialize_into(&mut buf);
+
+        buf[arrays_off_pos..arrays_off_pos + 8].copy_from_slice(&arrays_off.to_le_bytes());
+        buf[dict_off_pos..dict_off_pos + 8].copy_from_slice(&dict_off.to_le_bytes());
+
+        std::fs::write(path, buf)
+    }
+
+    /// Lädt einen Snapshot per `mmap`: die Index-Arrays werden **zero-copy** in
+    /// die Datei gemappt (resident wie bei Tentris), das Dictionary in den RAM
+    /// gelesen; Statistik und Prädikatlisten werden abgeleitet.
+    pub fn load_snapshot(path: &str) -> std::io::Result<TripleStore> {
+        let file = std::fs::File::open(path)?;
+        // SAFETY: read-only Snapshot; die Datei wird nicht von außen verändert.
+        let map = std::sync::Arc::new(unsafe { memmap2::Mmap::map(&file)? });
+        let b: &[u8] = &map;
+
+        let rd_u32 = |b: &[u8], p: usize| u32::from_le_bytes(b[p..p + 4].try_into().unwrap());
+        let rd_u64 = |b: &[u8], p: usize| u64::from_le_bytes(b[p..p + 8].try_into().unwrap());
+
+        assert_eq!(&b[0..8], b"TTRSNAP1", "ungültiger Snapshot");
+        let arrays_off = rd_u64(b, 16) as usize;
+        let dict_off = rd_u64(b, 24) as usize;
+        let mut p = 32;
+        let mut lens = [0usize; 15];
+        for l in &mut lens {
+            *l = rd_u32(b, p) as usize;
+            p += 4;
+        }
+
+        let mut byte_off = arrays_off;
+        let mut arenas: Vec<U32Arena> = Vec::with_capacity(15);
+        for &len in &lens {
+            arenas.push(U32Arena::Mapped {
+                map: map.clone(),
+                byte_offset: byte_off,
+                len,
+            });
+            byte_off += len * 4;
+        }
+
+        let mut it = arenas.into_iter();
+        let take5 = |it: &mut std::vec::IntoIter<U32Arena>| {
+            FlatCsr::from_arenas(
+                it.next().unwrap(),
+                it.next().unwrap(),
+                it.next().unwrap(),
+                it.next().unwrap(),
+                it.next().unwrap(),
+            )
+        };
+        let spo = LayeredIndex::from_base(take5(&mut it));
+        let pos = LayeredIndex::from_base(take5(&mut it));
+        let osp = LayeredIndex::from_base(take5(&mut it));
+
+        let dict = Dictionary::deserialize(&b[dict_off..]);
+
+        let mut store = TripleStore::new();
+        store.dict = dict;
+        store.spo = spo;
+        store.pos = pos;
+        store.osp = osp;
+        store.rebuild_aux();
+        Ok(store)
     }
 
     /// Wählt die Permutation mit den meisten führenden gebundenen Variablen.
@@ -559,6 +671,51 @@ mod tests {
             store2.dict.resolve_type(lit2),
             Some(super::super::dictionary::TermType::Literal { lang: Some(_), .. })
         ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn snapshot_mmap_roundtrip() {
+        let mut store = TripleStore::new();
+        store.ingest_str_triples(&[
+            ("http://example.org/a", "http://example.org/p", "http://example.org/b"),
+            ("http://example.org/a", "http://example.org/p", "http://example.org/c"),
+            ("http://example.org/b", "http://example.org/q", "http://example.org/c"),
+        ]);
+        // ein typisiertes Literal mit aufnehmen
+        let s = store.dict.insert("http://example.org/a");
+        let name = store.dict.insert("http://example.org/name");
+        let lit = store
+            .dict
+            .insert_with_type("Alice", super::super::dictionary::TermType::literal_lang("en"));
+        store.insert_triple(s, name, lit);
+
+        let path = std::env::temp_dir().join("tentris_clone_snapshot.bin");
+        let path_str = path.to_str().unwrap();
+        store.save_snapshot(path_str).unwrap();
+
+        let loaded = TripleStore::load_snapshot(path_str).unwrap();
+        assert_eq!(loaded.triple_count(), store.triple_count());
+
+        // Query über den gemappten Index
+        let p = loaded.dict.lookup("http://example.org/p").unwrap();
+        let a = loaded.dict.lookup("http://example.org/a").unwrap();
+        if let QueryResult::Single(Var::O, objs) = loaded.query(Term::Bound(a), Term::Bound(p), Term::Wildcard)
+        {
+            assert_eq!(objs.len(), 2); // b, c
+        } else {
+            panic!("expected Single");
+        }
+
+        // Literal-Typ verlustfrei
+        let lit2 = loaded.dict.lookup("Alice").unwrap();
+        assert!(matches!(
+            loaded.dict.resolve_type(lit2),
+            Some(super::super::dictionary::TermType::Literal { lang: Some(_), .. })
+        ));
+
+        // WCOJ-Hilfslisten korrekt abgeleitet
+        assert!(loaded.has_predicate(p));
         let _ = std::fs::remove_file(path);
     }
 

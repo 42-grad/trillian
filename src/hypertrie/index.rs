@@ -1,6 +1,45 @@
 use std::borrow::Cow;
+use std::sync::Arc;
 
+use memmap2::Mmap;
 use rustc_hash::FxHashMap;
+
+/// Ein `u32`-Array, das entweder im RAM liegt (`Owned`) oder **zero-copy** in
+/// eine memory-gemappte Snapshot-Datei zeigt (`Mapped`). Damit kann der Index
+/// beim Laden direkt aus der Datei bedient werden (resident wie bei Tentris),
+/// ohne ihn in den RAM zu kopieren.
+#[derive(Debug, Clone)]
+pub enum U32Arena {
+    Owned(Vec<u32>),
+    Mapped {
+        map: Arc<Mmap>,
+        byte_offset: usize,
+        len: usize,
+    },
+}
+
+impl Default for U32Arena {
+    fn default() -> Self {
+        U32Arena::Owned(Vec::new())
+    }
+}
+
+impl U32Arena {
+    #[inline]
+    pub fn as_slice(&self) -> &[u32] {
+        match self {
+            U32Arena::Owned(v) => v.as_slice(),
+            U32Arena::Mapped {
+                map,
+                byte_offset,
+                len,
+            } => {
+                let bytes = &map[*byte_offset..*byte_offset + *len * 4];
+                bytemuck::cast_slice(bytes)
+            }
+        }
+    }
+}
 
 /// Kompakte, **flache CSR-Arena** für eine feste Triple-Permutation
 /// (z. B. SPO, POS, OSP) plus kleines **Delta-Overlay** für inkrementelle
@@ -27,14 +66,15 @@ pub struct LayeredIndex {
     len: usize,
 }
 
-/// Unveränderliche, dreistufige flache CSR-Struktur.
+/// Unveränderliche, dreistufige flache CSR-Struktur. Die fünf Arrays liegen
+/// entweder im RAM oder zero-copy in einem mmap-Snapshot ([`U32Arena`]).
 #[derive(Debug, Clone, Default)]
-struct FlatCsr {
-    keys: Vec<u32>,        // sortierte, distinkte first-Werte
-    key_off: Vec<u32>,     // keys.len()+1; Bereich in l1
-    l1: Vec<u32>,          // pro first: sortierte distinkte second-Werte
-    l1_off: Vec<u32>,      // l1.len()+1; Bereich in vals
-    vals: Vec<u32>,        // pro (first, second): sortierte distinkte thirds
+pub struct FlatCsr {
+    keys: U32Arena,    // sortierte, distinkte first-Werte
+    key_off: U32Arena, // keys.len()+1; Bereich in l1
+    l1: U32Arena,      // pro first: sortierte distinkte second-Werte
+    l1_off: U32Arena,  // l1.len()+1; Bereich in vals
+    vals: U32Arena,    // pro (first, second): sortierte distinkte thirds
 }
 
 impl FlatCsr {
@@ -44,46 +84,108 @@ impl FlatCsr {
         sorted.sort_unstable();
         sorted.dedup();
 
-        let mut csr = FlatCsr {
-            key_off: vec![0],
-            l1_off: vec![0],
-            ..Default::default()
-        };
+        let mut keys = Vec::new();
+        let mut key_off = vec![0u32];
+        let mut l1 = Vec::new();
+        let mut l1_off = vec![0u32];
+        let mut vals = Vec::new();
 
         let mut i = 0;
         while i < sorted.len() {
             let first = sorted[i].0;
-            csr.keys.push(first);
+            keys.push(first);
             while i < sorted.len() && sorted[i].0 == first {
                 let second = sorted[i].1;
-                csr.l1.push(second);
+                l1.push(second);
                 while i < sorted.len() && sorted[i].0 == first && sorted[i].1 == second {
-                    csr.vals.push(sorted[i].2);
+                    vals.push(sorted[i].2);
                     i += 1;
                 }
-                csr.l1_off.push(csr.vals.len() as u32);
+                l1_off.push(vals.len() as u32);
             }
-            csr.key_off.push(csr.l1.len() as u32);
+            key_off.push(l1.len() as u32);
         }
-        csr
+
+        FlatCsr {
+            keys: U32Arena::Owned(keys),
+            key_off: U32Arena::Owned(key_off),
+            l1: U32Arena::Owned(l1),
+            l1_off: U32Arena::Owned(l1_off),
+            vals: U32Arena::Owned(vals),
+        }
+    }
+
+    /// Konstruiert eine FlatCsr aus fünf Arenas (z. B. mmap-Slices).
+    pub fn from_arenas(
+        keys: U32Arena,
+        key_off: U32Arena,
+        l1: U32Arena,
+        l1_off: U32Arena,
+        vals: U32Arena,
+    ) -> Self {
+        FlatCsr {
+            keys,
+            key_off,
+            l1,
+            l1_off,
+            vals,
+        }
+    }
+
+    /// Die fünf Arrays als Slices (für Serialisierung).
+    pub fn arrays(&self) -> [&[u32]; 5] {
+        [
+            self.keys.as_slice(),
+            self.key_off.as_slice(),
+            self.l1.as_slice(),
+            self.l1_off.as_slice(),
+            self.vals.as_slice(),
+        ]
+    }
+
+    #[inline]
+    fn keys(&self) -> &[u32] {
+        self.keys.as_slice()
+    }
+    #[inline]
+    fn key_off(&self) -> &[u32] {
+        self.key_off.as_slice()
+    }
+    #[inline]
+    fn l1(&self) -> &[u32] {
+        self.l1.as_slice()
+    }
+    #[inline]
+    fn l1_off(&self) -> &[u32] {
+        self.l1_off.as_slice()
+    }
+    #[inline]
+    fn vals(&self) -> &[u32] {
+        self.vals.as_slice()
     }
 
     /// Absoluter l1-Index für `(first, second)`, falls vorhanden.
     #[inline]
     fn leaf_index(&self, first: u32, second: u32) -> Option<usize> {
-        let i = self.keys.binary_search(&first).ok()?;
-        let start = self.key_off[i] as usize;
-        let end = self.key_off[i + 1] as usize;
-        self.l1[start..end].binary_search(&second).ok().map(|p| p + start)
+        let keys = self.keys();
+        let i = keys.binary_search(&first).ok()?;
+        let key_off = self.key_off();
+        let start = key_off[i] as usize;
+        let end = key_off[i + 1] as usize;
+        self.l1()[start..end]
+            .binary_search(&second)
+            .ok()
+            .map(|p| p + start)
     }
 
     #[inline]
     fn query_two(&self, first: u32, second: u32) -> &[u32] {
         match self.leaf_index(first, second) {
             Some(j) => {
-                let s = self.l1_off[j] as usize;
-                let e = self.l1_off[j + 1] as usize;
-                &self.vals[s..e]
+                let l1_off = self.l1_off();
+                let s = l1_off[j] as usize;
+                let e = l1_off[j + 1] as usize;
+                &self.vals()[s..e]
             }
             None => &[],
         }
@@ -95,15 +197,20 @@ impl FlatCsr {
     }
 
     fn all_triples(&self) -> Vec<(u32, u32, u32)> {
-        let mut out = Vec::with_capacity(self.vals.len());
-        for (i, &first) in self.keys.iter().enumerate() {
-            let ls = self.key_off[i] as usize;
-            let le = self.key_off[i + 1] as usize;
+        let keys = self.keys();
+        let key_off = self.key_off();
+        let l1 = self.l1();
+        let l1_off = self.l1_off();
+        let vals = self.vals();
+        let mut out = Vec::with_capacity(vals.len());
+        for (i, &first) in keys.iter().enumerate() {
+            let ls = key_off[i] as usize;
+            let le = key_off[i + 1] as usize;
             for j in ls..le {
-                let second = self.l1[j];
-                let vs = self.l1_off[j] as usize;
-                let ve = self.l1_off[j + 1] as usize;
-                for &third in &self.vals[vs..ve] {
+                let second = l1[j];
+                let vs = l1_off[j] as usize;
+                let ve = l1_off[j + 1] as usize;
+                for &third in &vals[vs..ve] {
                     out.push((first, second, third));
                 }
             }
@@ -113,7 +220,7 @@ impl FlatCsr {
 
     #[inline]
     fn len(&self) -> usize {
-        self.vals.len()
+        self.vals().len()
     }
 }
 
@@ -132,6 +239,28 @@ impl LayeredIndex {
             del: FxHashMap::default(),
             len,
         }
+    }
+
+    /// Konstruiert den Index aus einer (z. B. mmap-gemappten) Basis, leeres Delta.
+    pub fn from_base(base: FlatCsr) -> Self {
+        let len = base.len();
+        Self {
+            base,
+            ins: FxHashMap::default(),
+            del: FxHashMap::default(),
+            len,
+        }
+    }
+
+    /// Liefert die flache Basis (nur sinnvoll nach [`compact`](Self::compact),
+    /// wenn das Delta leer ist) – für die Snapshot-Serialisierung.
+    pub fn base(&self) -> &FlatCsr {
+        &self.base
+    }
+
+    /// Ob das Delta leer ist (Basis = vollständiger Inhalt).
+    pub fn delta_is_empty(&self) -> bool {
+        self.ins.is_empty() && self.del.is_empty()
     }
 
     /// Anzahl Delta-Einträge (für Kompaktierungs-Heuristik).
@@ -226,10 +355,12 @@ impl LayeredIndex {
     pub fn query_one_pairs(&self, first: u32) -> Vec<(u32, u32)> {
         // Distinkte second-Werte unter first sammeln (Basis + Delta-Inserts).
         let mut seconds: Vec<u32> = Vec::new();
-        if let Ok(i) = self.base.keys.binary_search(&first) {
-            let ls = self.base.key_off[i] as usize;
-            let le = self.base.key_off[i + 1] as usize;
-            seconds.extend_from_slice(&self.base.l1[ls..le]);
+        let base_keys = self.base.keys();
+        if let Ok(i) = base_keys.binary_search(&first) {
+            let key_off = self.base.key_off();
+            let ls = key_off[i] as usize;
+            let le = key_off[i + 1] as usize;
+            seconds.extend_from_slice(&self.base.l1()[ls..le]);
         }
         for &(f, s) in self.ins.keys() {
             if f == first {
