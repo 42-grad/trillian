@@ -73,6 +73,16 @@ Basis gefaltet → Updates bleiben inkrementell.
 - Ingest 1005 → 804 ms; Updates noch schneller (INSERT 9,43M/s, DELETE 15,2M/s).
 - Latenz/Korrektheit unverändert.
 
+### Executor-Umbau (RowBlock) — `6d15c15` — flache Zeilen-Materialisierung
+`Vec<Vec<u32>>` (eine Allokation pro Zeile) → flache row-major `RowBlock` (ein
+Puffer). Binär-Planer + WCOJ + Projektion/DISTINCT/LIMIT + OPTIONAL-Join
+schreiben direkt in den Puffer.
+- **optional p95: 69,6 → 40,2 ms (−42 %)**, median 37,5 → 35,1 ms.
+- chain 7,1 → 6,7 ms, triangle 4,3 → 4,0 ms; Memory stabil (332 MB).
+- **optional bleibt aber Tentris 1,2×** (vorher 1,3×) — der Rest-Abstand liegt
+  jetzt im Output-Pfad (JSON-Serialisierung von 16k Ergebniszeilen), nicht mehr
+  in der Engine. Korrektheit über alle Queries identisch.
+
 ### OPTIONAL Hash-Join — `58052d7` — perf-neutral, Ursache identifiziert
 OPTIONAL läuft jetzt als echter Hash-Left-Join (OPTIONAL-Muster einmal statt pro
 linker Zeile). Korrektheit identisch, Code sauberer — aber auf diesem Benchmark

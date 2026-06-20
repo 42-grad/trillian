@@ -1,0 +1,61 @@
+[final_duel] synthetic_1m.nt vorhanden und graph-förmig (98.6 MB).
+[final_duel] SPARQL-Abfragen geschrieben (chain, triangle).
+[final_duel] Datensatz: 1000000 Triples.
+[final_duel] Baue Rust SPARQL-Server (cargo build --release --bin server)...
+[final_duel] Running: cargo build --release --bin server
+[final_duel] Starte Rust SPARQL-Server auf Port 9081...
+[final_duel] Rust-Server bereit (Ingest/Startup: 803.0 ms).
+[final_duel] Verwende Tentris-Variante: Forschungs-Tentris
+[final_duel] Running: /opt/tentris_clone/third_party/tentris/build/build/Release/execs/tentris-loader/tentris_loader -f /opt/tentris_clone/synthetic_1m.nt -s /opt/tentris_clone/tentris-data
+[final_duel] Tentris-Server bereit (Ingest/Startup: 6262.3 ms).
+[final_duel] [rust] Query 'chain' (cold + 200 warm)...
+[final_duel] [rust] Query 'triangle' (cold + 200 warm)...
+[final_duel] [rust] Query 'star' (cold + 200 warm)...
+[final_duel] [rust] Query 'distinct' (cold + 200 warm)...
+[final_duel] [rust] Query 'optional' (cold + 200 warm)...
+[final_duel] [rust] Update-Throughput (20000 Triples)...
+[final_duel] [tentris] Query 'chain' (cold + 200 warm)...
+[final_duel] [tentris] Query 'triangle' (cold + 200 warm)...
+[final_duel] [tentris] Query 'star' (cold + 200 warm)...
+[final_duel] [tentris] Query 'distinct' (cold + 200 warm)...
+[final_duel] [tentris] Query 'optional' (cold + 200 warm)...
+[final_duel] [tentris] Update-Throughput (20000 Triples)...
+
+==========================================================================================
+FINALES DUELL v2: Rust SPARQL-Endpoint vs. C++ Tentris (Forschungs-Tentris)
+Datensatz: 1000000 Triples (graph-förmig)
+==========================================================================================
+
+### Ingest / Startup
+| Metrik | Rust | Tentris | Gewinner |
+| :-- | :-- | :-- | :-- |
+| Ingest+Startup | 802.99 ms | 6262.28 ms | Rust (7.8x) |
+
+### Query-Latenz (Warm-Median / p95 / Cold) + Konsistenz
+| Query | Rust median | Rust p95 | Rust cold | Tentris median | Tentris p95 | Tentris cold | Rows R/T | Gewinner(median) |
+| :-- | --: | --: | --: | --: | --: | --: | :--: | :-- |
+| chain | 6.651 ms | 8.294 ms | 53.27 ms | 15.075 ms | 56.158 ms | 24.93 ms | 3584/3584 OK | Rust (2.3x) |
+| triangle | 4.023 ms | 4.931 ms | 14.03 ms | 11.056 ms | 51.724 ms | 12.38 ms | 3000/3000 OK | Rust (2.7x) |
+| star | 1.514 ms | 1.783 ms | 7.83 ms | 3.489 ms | 5.681 ms | 4.92 ms | 821/821 OK | Rust (2.3x) |
+| distinct | 10.451 ms | 13.541 ms | 64.66 ms | 8.927 ms | 49.244 ms | 9.01 ms | 13207/13207 OK | Tentris (1.2x) |
+| optional | 35.082 ms | 40.178 ms | 137.70 ms | 30.468 ms | 37.422 ms | 38.63 ms | 16002/16002 OK | Tentris (1.2x) |
+
+### Update-Throughput (INSERT/DELETE DATA)
+| Operation | Rust | Tentris | Gewinner |
+| :-- | --: | --: | :-- |
+| INSERT (triples/s) | 6642954 /s | 1832208 /s | Rust (3.6x) |
+| DELETE (triples/s) | 22839602 /s | 1305151 /s | Rust (17.5x) |
+
+### Memory-Footprint
+| Metrik | Rust (in-memory) | Tentris (mmap/disk) |
+| :-- | --: | --: |
+| Peak-RSS (VmHWM) | 332.41 MB | 267.82 MB |
+| RSS (VmRSS) | 332.41 MB | 267.82 MB |
+| Disk-Store | 98.64 MB (.nt-Quelle) | 512.86 MB (metall) |
+| Bytes/Triple (RSS) | 348.6 B | 280.8 B |
+
+Hinweis: Tentris ist disk-/mmap-basiert – VmRSS kann den realen Footprint unterschätzen; der metall-Store auf Disk ist die ehrlichere Größe. Der Rust-Klon hält den Index komplett im RAM (3 Permutationen + Prädikat-Relationen), daher ist RSS dort die maßgebliche Größe.
+[final_duel] Beende Tentris-Server...
+[final_duel] Beende Rust-Server...
+
+=== STDERR ===
