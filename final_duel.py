@@ -247,13 +247,28 @@ def build_rust_server() -> None:
 
 
 def start_rust_server():
+    """Loader + Server analog zu Tentris: erst Index bauen + als mmap-Snapshot
+    persistieren, dann den Server starten, der den Snapshot memory-mappt.
+    Damit ist Ingest/Startup apples-to-apples (beide disk-backed/mmap)."""
     if not port_is_free(RUST_HOST, RUST_PORT):
         log(f"FEHLER: Port {RUST_PORT} ist bereits belegt.")
         sys.exit(1)
-    log(f"Starte Rust SPARQL-Server auf Port {RUST_PORT}...")
+    server_bin = str(PROJECT_ROOT / "target" / "release" / "server")
+    snapshot = PROJECT_ROOT / "rust-snapshot.bin"
+
     start = time.perf_counter()
+    # Loader: Index bauen + persistieren.
+    log("Rust-Loader: baue + persistiere Index (mmap-Snapshot)...")
+    result = run_command([server_bin, "build", str(NT_FILE), str(snapshot)], timeout=600)
+    if result.returncode != 0:
+        log("FEHLER: Rust-Loader fehlgeschlagen.")
+        print(result.stdout + result.stderr)
+        sys.exit(1)
+
+    # Server: Snapshot per mmap laden + serven.
+    log(f"Starte Rust SPARQL-Server (mmap-load) auf Port {RUST_PORT}...")
     proc = subprocess.Popen(
-        [str(PROJECT_ROOT / "target" / "release" / "server"), str(NT_FILE), str(RUST_PORT)],
+        [server_bin, "load", str(snapshot), str(RUST_PORT)],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     if not wait_for_port(RUST_HOST, RUST_PORT):
@@ -261,7 +276,7 @@ def start_rust_server():
         stop_server(proc, "Rust")
         sys.exit(1)
     ingest_ms = (time.perf_counter() - start) * 1000
-    log(f"Rust-Server bereit (Ingest/Startup: {ingest_ms:.1f} ms).")
+    log(f"Rust-Server bereit (Loader+mmap-Startup: {ingest_ms:.1f} ms).")
     return proc, ingest_ms
 
 
