@@ -1,8 +1,7 @@
 use std::time::Instant;
 
 use tentris_clone::hypertrie::{
-    export_ntriples, parse_ntriples, GraphPattern, HybridEngine, PatternTerm, TriplePattern,
-    TripleStore,
+    export_ntriples, GraphPattern, HybridEngine, PatternTerm, TriplePattern, TripleStore,
 };
 
 fn main() {
@@ -16,34 +15,25 @@ fn main() {
     }
 
     // ------------------------------------------------------------------
-    // 1. N-Triples-Datei einlesen
+    // Streamendes Laden + Ingest (Dictionary + CSR-Indizes), ohne den
+    // gesamten Parse-Puffer im Speicher zu halten.
     // ------------------------------------------------------------------
-    log("Lese N-Triples-Datei...");
-    let t0 = Instant::now();
-    let raw_triples = parse_ntriples(NT_FILE).expect("Failed to parse .nt file");
-    let parse_time = t0.elapsed();
-    log(&format!(
-        "Gelesen: {} Triples in {:.1} ms",
-        raw_triples.len(),
-        parse_time.as_secs_f64() * 1000.0
-    ));
-
-    // ------------------------------------------------------------------
-    // 2. Ingest in TripleStore (Dictionary + CSR-Indizes + WCOJ-Relationen)
-    // ------------------------------------------------------------------
+    log("Lade N-Triples-Datei (streaming)...");
     let t0 = Instant::now();
     let mut store = TripleStore::new();
-    store.ingest(&raw_triples);
+    let n_triples = store
+        .ingest_ntriples_file(NT_FILE)
+        .expect("Failed to parse .nt file");
     let ingest_time = t0.elapsed();
 
     println!("=== Ingest Benchmark ===");
     println!("Source file:      {}", NT_FILE);
-    println!("Triples:          {}", raw_triples.len());
+    println!("Triples:          {}", n_triples);
     println!("Unique terms:     {}", store.dict.len());
     println!("Ingest time:      {} ms", ingest_time.as_millis());
     println!(
         "Ingest throughput: {:.0} triples/sec",
-        raw_triples.len() as f64 / ingest_time.as_secs_f64()
+        n_triples as f64 / ingest_time.as_secs_f64()
     );
 
     // ------------------------------------------------------------------

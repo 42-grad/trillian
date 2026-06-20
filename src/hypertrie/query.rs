@@ -85,6 +85,49 @@ impl TripleStore {
         self.build_indexes(id_triples);
     }
 
+    /// Wie [`ingest`](Self::ingest), nimmt die geparsten Tripel aber per Wert
+    /// und **gibt den String-Puffer frei, bevor die Indizes gebaut werden**.
+    pub fn ingest_owned(&mut self, triples: Vec<ParsedTriple>) {
+        let mut id_triples = Vec::with_capacity(triples.len());
+        for t in &triples {
+            let sid = self.dict.insert_with_type(&t.subject.value, t.subject.typ.clone());
+            let pid = self.dict.insert_with_type(&t.predicate.value, t.predicate.typ.clone());
+            let oid = self.dict.insert_with_type(&t.object.value, t.object.typ.clone());
+            id_triples.push((sid, pid, oid));
+        }
+        drop(triples); // Parse-Puffer (Strings) freigeben
+        self.build_indexes(id_triples);
+    }
+
+    /// **Streamendes** Laden einer N-Triples-Datei: jede Zeile wird einzeln
+    /// geparst und sofort ins Dictionary gemappt (ID-Tripel), ohne jemals den
+    /// gesamten `ParsedTriple`-Puffer (~3M Strings) im Speicher zu halten.
+    ///
+    /// Senkt damit **sowohl** den Peak-RSS (kein Parse-Puffer beim Laden)
+    /// **als auch** den resident RSS. Liefert die Anzahl geladener Tripel.
+    pub fn ingest_ntriples_file(&mut self, path: &str) -> std::io::Result<usize> {
+        use std::io::BufRead;
+        let file = std::fs::File::open(path)?;
+        let reader = std::io::BufReader::new(file);
+        let mut id_triples: Vec<(u32, u32, u32)> = Vec::new();
+        for line in reader.lines() {
+            let line = line?;
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(t) = super::export::parse_triple_line(line) {
+                let sid = self.dict.insert_with_type(&t.subject.value, t.subject.typ);
+                let pid = self.dict.insert_with_type(&t.predicate.value, t.predicate.typ);
+                let oid = self.dict.insert_with_type(&t.object.value, t.object.typ);
+                id_triples.push((sid, pid, oid));
+            }
+        }
+        let n = id_triples.len();
+        self.build_indexes(id_triples);
+        Ok(n)
+    }
+
     /// Ingest aus String-Tripeln (Rückwärtskompatibilität; alles als IRI).
     pub fn ingest_str_triples(&mut self, triples: &[(&str, &str, &str)]) {
         let parsed: Vec<ParsedTriple> = triples

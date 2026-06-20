@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use tentris_clone::hypertrie::{parse_ntriples, TripleStore};
+use tentris_clone::hypertrie::TripleStore;
 use tentris_clone::sparql::serve_with_persistence;
 
 #[tokio::main]
@@ -14,14 +14,14 @@ async fn main() {
     };
 
     println!("Loading N-Triples file: {}", nt_file.display());
-    let raw_triples = parse_ntriples(nt_file.to_str().unwrap()).expect("Failed to parse .nt file");
-    println!("Parsed {} triples", raw_triples.len());
-
     let mut store = TripleStore::new();
-    store.ingest(&raw_triples);
+    // Streamendes Laden: nie den gesamten Parse-Puffer im Speicher halten.
+    let n_triples = store
+        .ingest_ntriples_file(nt_file.to_str().unwrap())
+        .expect("Failed to parse .nt file");
     println!(
         "Ingested {} triples, {} unique terms",
-        raw_triples.len(),
+        n_triples,
         store.dict.len()
     );
 

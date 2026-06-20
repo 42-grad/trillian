@@ -65,7 +65,7 @@ pub fn parse_ntriples(path: &str) -> std::io::Result<Vec<ParsedTriple>> {
     Ok(triples)
 }
 
-fn parse_triple_line(line: &str) -> Option<ParsedTriple> {
+pub fn parse_triple_line(line: &str) -> Option<ParsedTriple> {
     let (s, rest) = parse_term(line)?;
     let rest = skip_whitespace(rest);
     let (p, rest) = parse_term(rest)?;
