@@ -17,10 +17,14 @@ um den Entwicklungs- und Verbesserungsprozess nachvollziehbar zu tracken.
 | :-- | :-- | :-- | --: | --: | --: | --: | --: | --: | :-- |
 | 2026-06-20 | `8852869` | Baseline (3 Perm. + Relationen) | 1053 MB | 1104 B | 1807 ms | 6,49M | 4,00 ms | 6,76 ms | alle Rows = Tentris |
 | 2026-06-20 | `c3a8d63` | Etappe 1 (Relationen entfernt) | 906 MB | 950 B | 1406 ms | 10,30M | 4,32 ms | 7,17 ms | alle Rows = Tentris |
-| 2026-06-20 | `facb611` | Etappe 2 (flache CSR + Delta) | **676 MB** | **709 B** | **1005 ms** | 6,99M | 4,42 ms | 6,69 ms | alle Rows = Tentris |
+| 2026-06-20 | `facb611` | Etappe 2 (flache CSR + Delta) | 676 MB | 709 B | 1005 ms | 6,99M | 4,42 ms | 6,69 ms | alle Rows = Tentris |
+| 2026-06-20 | `da5cfad` | Quick Win (streaming ingest) | **338 MB** | **354 B** | **804 ms** | 9,43M | 4,26 ms | 7,12 ms | alle Rows = Tentris |
 
-Referenz Tentris (Forschungsversion, gleicher Lauf): ~266 MB RSS / ~279 B/Triple
-(metall-Disk-Store 513 MB); triangle ~11–12 ms, chain ~15 ms median.
+Referenz Tentris (Forschungsversion, gleicher Lauf): ~268 MB **RSS** / ~281 B/Triple
+— aber das ist nur der resident Teil eines **513 MB großen metall-Disk-Stores**.
+Unser Index liegt komplett im RAM (338 MB). Auf „Gesamtindex-Größe" sind wir
+damit **kleiner** als Tentris (338 MB RAM vs. 513 MB Disk); auf „resident RAM
+unter dieser Last" liegt Tentris 1,26× vorn. Memory-Lücke faktisch geschlossen.
 
 ## Korrektheit (jede Stufe identisch zu Tentris)
 
@@ -61,11 +65,21 @@ Basis gefaltet → Updates bleiben inkrementell.
 - Updates weiter schnell (INSERT 6,99M/s, DELETE 10,55M/s; je 8,2× Tentris).
 - Keine Latenz-Regression (distinct jetzt Gleichstand, optional nur noch 1,1×).
 
+### Quick Win — `da5cfad` — streaming ingest
+`ingest_ntriples_file` parst zeilenweise und mappt sofort ins Dictionary; der
+`ParsedTriple`-Puffer (~3M Strings) wird nie materialisiert.
+- **Memory −50 %** (676 → 338 MB, 709 → 354 B/Triple). Abstand zu Tentris:
+  2,5× → **1,26×** (bzw. kleiner als Tentris' 513-MB-Disk-Store).
+- Ingest 1005 → 804 ms; Updates noch schneller (INSERT 9,43M/s, DELETE 15,2M/s).
+- Latenz/Korrektheit unverändert.
+
 ## Offen (Roadmap, siehe BASELINE.md)
 
-- **Quick Win:** `server.rs` hält den geparsten Triple-Puffer (~3M Strings)
-  über die gesamte Laufzeit – der Dict hat die Strings längst kopiert. Vor
-  `serve()` droppen senkt den resident RSS spürbar (geschätzt ~150–200 MB).
-- **Etappe 3:** Singleton-Kompression + Subtrie-Sharing (zahlt v. a. auf echten,
-  strukturierten RDF-Daten — auf zufälligen Synthetikdaten wenig Effekt).
-- OPTIONAL in die Engine ziehen (einzige Query-Niederlage: 34 vs. 32 ms).
+Memory-Lücke ist faktisch geschlossen. Verbleibende Punkte:
+
+- **OPTIONAL in die Engine ziehen** — die einzige Query-Niederlage (36 vs.
+  27 ms, 1,3×). Aktuell materialisierender Nested-Loop in der SPARQL-Schicht.
+- **Etappe 3 (optional):** Singleton-Kompression + Subtrie-Sharing — auf
+  zufälligen Synthetikdaten wenig Effekt, lohnt erst auf echten RDF-Daten.
+- Restliche ~73 B/Triple zu Tentris: Dict speichert Strings doppelt (Key +
+  Value); String-Interning/Einfachspeicherung wäre der nächste Memory-Hebel.
