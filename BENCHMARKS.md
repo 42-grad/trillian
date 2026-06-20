@@ -73,12 +73,22 @@ Basis gefaltet → Updates bleiben inkrementell.
 - Ingest 1005 → 804 ms; Updates noch schneller (INSERT 9,43M/s, DELETE 15,2M/s).
 - Latenz/Korrektheit unverändert.
 
+### OPTIONAL Hash-Join — `58052d7` — perf-neutral, Ursache identifiziert
+OPTIONAL läuft jetzt als echter Hash-Left-Join (OPTIONAL-Muster einmal statt pro
+linker Zeile). Korrektheit identisch, Code sauberer — aber auf diesem Benchmark
+**perf-neutral** (optional ~37 ms, Tentris weiter ~1,3× vorn). Befund: der
+Flaschenhals ist **nicht** der Join, sondern die executor-weite
+`Vec<Vec<u32>>`-Zeilen-Materialisierung (eine Heap-Allokation pro Ergebniszeile;
+bei optional ~100k kleine Allokationen über zwei 15k-Zwischenresultate + 16k
+Ergebniszeilen). → adressiert vom Executor-Umbau (RowBlock, flache Bindings).
+
 ## Offen (Roadmap, siehe BASELINE.md)
 
 Memory-Lücke ist faktisch geschlossen. Verbleibende Punkte:
 
-- **OPTIONAL in die Engine ziehen** — die einzige Query-Niederlage (36 vs.
-  27 ms, 1,3×). Aktuell materialisierender Nested-Loop in der SPARQL-Schicht.
+- **Executor-Umbau (in Arbeit):** `Vec<Vec<u32>>` → flache row-major `RowBlock`
+  (eine Allokation statt einer pro Zeile). Ziel: optional unter Tentris, generell
+  niedrigere Query-Latenz + weniger Query-Peak-Memory.
 - **Etappe 3 (optional):** Singleton-Kompression + Subtrie-Sharing — auf
   zufälligen Synthetikdaten wenig Effekt, lohnt erst auf echten RDF-Daten.
 - Restliche ~73 B/Triple zu Tentris: Dict speichert Strings doppelt (Key +
