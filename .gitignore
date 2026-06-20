@@ -1,0 +1,19 @@
+/target
+*.nt
+/third_party
+__pycache__/
+*.pyc
+.claude/
+chain_query.sparql
+triangle_query.sparql
+duel_output.log
+infra/terraform/.terraform
+infra/terraform/*.tfstate
+infra/terraform/*.tfstate.*
+infra/terraform/terraform.tfvars
+infra/ansible/inventory.ini
+infra/ansible/*.log
+# Ephemeres SSH-Keypair (wird von run_remote_duel.sh generiert) - NIE committen
+infra/terraform/duel_key
+infra/terraform/duel_key.pub
+# .terraform.lock.hcl sollte versioniert werden, daher nicht ignorieren

@@ -1,0 +1,55 @@
+---
+- name: Remove partial Tentris clone if present
+  file:
+    path: "{{ project_dir }}/third_party/tentris"
+    state: absent
+
+- name: Clone Tentris repository
+  git:
+    repo: https://github.com/dice-group/tentris.git
+    dest: "{{ project_dir }}/third_party/tentris"
+    recursive: yes
+    version: main
+    force: yes
+
+- name: Ensure Conan profile exists
+  shell: |
+    conan profile detect --force || true
+  args:
+    creates: /root/.conan2/profiles/default
+  environment:
+    PATH: "{{ ansible_env.PATH }}:/root/.local/bin"
+
+- name: Add DICE Conan remote
+  shell: |
+    conan remote add dice-group https://conan.dice-research.org/artifactory/api/conan/tentris --force || true
+  environment:
+    PATH: "{{ ansible_env.PATH }}:/root/.local/bin"
+
+- name: Install Tentris dependencies via Conan
+  shell: |
+    conan install . \
+      --output-folder=build \
+      --build=missing \
+      -s build_type=Release \
+      -s compiler.cppstd=20
+  args:
+    chdir: "{{ project_dir }}/third_party/tentris"
+  environment:
+    PATH: "{{ ansible_env.PATH }}:/root/.local/bin"
+
+- name: Configure Tentris with CMake
+  shell: |
+    cmake --preset conan-release -DTENTRIS_BUILD_TESTS=OFF
+  args:
+    chdir: "{{ project_dir }}/third_party/tentris"
+  environment:
+    PATH: "{{ ansible_env.PATH }}:/root/.local/bin"
+
+- name: Build Tentris
+  shell: |
+    cmake --build --preset conan-release
+  args:
+    chdir: "{{ project_dir }}/third_party/tentris"
+  environment:
+    PATH: "{{ ansible_env.PATH }}:/root/.local/bin"

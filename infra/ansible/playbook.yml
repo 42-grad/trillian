@@ -1,0 +1,11 @@
+---
+- name: Deploy Rust clone and Tentris, then run the final duel
+  hosts: duel
+  become: yes
+  vars:
+    project_dir: /opt/tentris_clone
+  roles:
+    - common
+    - rust_clone
+    - tentris
+    - duel

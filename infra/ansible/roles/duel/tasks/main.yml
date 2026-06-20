@@ -1,0 +1,17 @@
+---
+- name: Run final duel script
+  shell: |
+    . $HOME/.cargo/env
+    python3 final_duel.py
+  args:
+    chdir: "{{ project_dir }}"
+  environment:
+    PATH: "{{ ansible_env.PATH }}:/root/.cargo/bin:/root/.local/bin"
+  register: duel_output
+  timeout: 1800
+
+- name: Save duel output to log file
+  copy:
+    content: "{{ duel_output.stdout }}\n\n=== STDERR ===\n{{ duel_output.stderr }}"
+    dest: "{{ project_dir }}/duel_output.log"
+    mode: '0644'
