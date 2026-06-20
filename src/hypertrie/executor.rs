@@ -247,7 +247,7 @@ pub fn execute_wcoj(store: &TripleStore, pattern: &GraphPattern) -> Vec<Vec<u32>
 fn is_wcoj_applicable(pattern: &GraphPattern, store: &TripleStore) -> bool {
     pattern.patterns.iter().all(|pat| {
         // Genau ein gebundenes Prädikat und zwei Variablen an Subjekt/Objekt
-        let pred_bound = matches!(pat.predicate, PatternTerm::Bound(pid) if store.relations.contains_key(&pid));
+        let pred_bound = matches!(pat.predicate, PatternTerm::Bound(pid) if store.has_predicate(pid));
         let two_vars = [pat.subject.is_variable(), pat.object.is_variable()]
             .iter()
             .filter(|&&x| x)
@@ -371,24 +371,28 @@ fn pattern_slice_for_var<'a>(
         PatternTerm::Bound(pid) => pid,
         _ => return None,
     };
-    let relation = store.relations.get(&pid)?;
+    if !store.has_predicate(pid) {
+        return None;
+    }
 
     let var_at_subject = pat.subject.variable_name() == Some(var_name);
     let var_at_object = pat.object.variable_name() == Some(var_name);
 
     if var_at_subject {
-        // A-Kandidaten; falls B gebunden, einschränken
+        // Subjekt-Kandidaten; falls Objekt gebunden, über POS einschränken,
+        // sonst alle distinkten Subjekte des Prädikats.
         if let Some(bound_obj) = pat.object.bound_or_resolved(binding, var_map) {
-            Some(relation.subjects_for(bound_obj))
+            Some(store.subjects_of(pid, bound_obj))
         } else {
-            Some(relation.all_subjects())
+            Some(store.subjects_with_predicate(pid))
         }
     } else if var_at_object {
-        // B-Kandidaten; falls A gebunden, einschränken
+        // Objekt-Kandidaten; falls Subjekt gebunden, über SPO einschränken,
+        // sonst alle distinkten Objekte des Prädikats.
         if let Some(bound_sub) = pat.subject.bound_or_resolved(binding, var_map) {
-            Some(relation.objects_for(bound_sub))
+            Some(store.objects_of(bound_sub, pid))
         } else {
-            Some(relation.all_objects())
+            Some(store.objects_with_predicate(pid))
         }
     } else {
         None

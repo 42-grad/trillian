@@ -1,9 +1,8 @@
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 use super::dictionary::{Dictionary, TermType};
 use super::export::ParsedTriple;
 use super::index::{intersect_sorted, LayeredIndex};
-use super::relation::PredicateRelation;
 use super::stats::Stats;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,16 +33,25 @@ pub enum QueryResult<'a> {
 }
 
 /// Gesamtspeicher aller drei Permutations-Indizes, Dictionary, Stats und
-/// binärer Prädikat-Relationen für WCOJ.
+/// schlanker Prädikat-Schlüssellisten für WCOJ.
 ///
 /// Die Indizes sind die alleinige Quelle der Wahrheit – es gibt keine
 /// separate Triple-Liste mehr. Dadurch sind `insert_triple`/`delete_triple`/
 /// `apply_updates` echte **inkrementelle** In-Place-Operationen ohne
 /// Komplett-Neuaufbau.
+///
+/// Etappe 1 des Hypertrie-Umbaus: Die früheren Forward/Reverse-CSR-Relationen
+/// pro Prädikat (zwei volle Datenkopien) sind entfernt. WCOJ bezieht
+/// `objects_for`/`subjects_for` direkt aus den Permutationen (SPO/POS) und
+/// braucht zusätzlich nur die sortierten **distinkten** Subjekt-/Objekt-Listen
+/// je Prädikat – hier als `pred_subjects`/`pred_objects` gehalten.
 pub struct TripleStore {
     pub dict: Dictionary,
     pub stats: Stats,
-    pub relations: FxHashMap<u32, PredicateRelation>,
+    /// p -> sortierte, distinkte Subjekte mit Prädikat p (für WCOJ-Kandidaten).
+    pred_subjects: FxHashMap<u32, Vec<u32>>,
+    /// p -> sortierte, distinkte Objekte mit Prädikat p.
+    pred_objects: FxHashMap<u32, Vec<u32>>,
     spo: LayeredIndex, // Reihenfolge: S, P, O
     pos: LayeredIndex, // Reihenfolge: P, O, S
     osp: LayeredIndex, // Reihenfolge: O, S, P
@@ -54,7 +62,8 @@ impl TripleStore {
         Self {
             dict: Dictionary::new(),
             stats: Stats::default(),
-            relations: FxHashMap::default(),
+            pred_subjects: FxHashMap::default(),
+            pred_objects: FxHashMap::default(),
             spo: LayeredIndex::empty(),
             pos: LayeredIndex::empty(),
             osp: LayeredIndex::empty(),
@@ -123,37 +132,83 @@ impl TripleStore {
     }
 
     /// Inkrementelles Einfügen in alle drei Permutationen, die Prädikat-
-    /// Relation und die Statistik. Liefert `true`, wenn das Triple neu war.
+    /// Schlüssellisten und die Statistik. Liefert `true`, wenn das Triple neu war.
     fn add_one(&mut self, s: u32, p: u32, o: u32) -> bool {
         let is_new = self.spo.insert(s, p, o);
         if is_new {
             self.pos.insert(p, o, s);
             self.osp.insert(o, s, p);
-            self.relations
-                .entry(p)
-                .or_insert_with(|| PredicateRelation::empty(p))
-                .insert(s, o);
+            sorted_insert(self.pred_subjects.entry(p).or_default(), s);
+            sorted_insert(self.pred_objects.entry(p).or_default(), o);
             self.stats.add_triple(s, p, o);
         }
         is_new
     }
 
-    /// Inkrementelles Entfernen aus allen Strukturen. Leere Prädikat-
-    /// Relationen werden aufgeräumt. Liefert `true`, wenn es vorhanden war.
+    /// Inkrementelles Entfernen aus allen Strukturen. Eine Subjekt-/Objekt-ID
+    /// fällt nur dann aus der Prädikat-Schlüsselliste, wenn sie unter p kein
+    /// weiteres Triple mehr besitzt. Liefert `true`, wenn es vorhanden war.
     fn remove_one(&mut self, s: u32, p: u32, o: u32) -> bool {
         let existed = self.spo.delete(s, p, o);
         if existed {
             self.pos.delete(p, o, s);
             self.osp.delete(o, s, p);
-            if let Some(rel) = self.relations.get_mut(&p) {
-                rel.delete(s, o);
-                if rel.is_empty() {
-                    self.relations.remove(&p);
+
+            // s verliert seinen Eintrag in pred_subjects[p] nur, wenn (s,p)
+            // kein Objekt mehr hat.
+            if self.spo.query_two(s, p).is_empty() {
+                if let Some(subs) = self.pred_subjects.get_mut(&p) {
+                    sorted_remove(subs, s);
+                    if subs.is_empty() {
+                        self.pred_subjects.remove(&p);
+                    }
+                }
+            }
+            // o verliert seinen Eintrag in pred_objects[p] nur, wenn (p,o)
+            // kein Subjekt mehr hat.
+            if self.pos.query_two(p, o).is_empty() {
+                if let Some(objs) = self.pred_objects.get_mut(&p) {
+                    sorted_remove(objs, o);
+                    if objs.is_empty() {
+                        self.pred_objects.remove(&p);
+                    }
                 }
             }
             self.stats.remove_triple(s, p, o);
         }
         existed
+    }
+
+    // --- WCOJ-/Slice-Zugriffe (ersetzen die früheren PredicateRelation-APIs) ---
+
+    /// Objekte von (s, p) als sortierter Slice – direkt aus dem SPO-Index.
+    #[inline]
+    pub fn objects_of(&self, s: u32, p: u32) -> &[u32] {
+        self.spo.query_two(s, p)
+    }
+
+    /// Subjekte von (p, o) als sortierter Slice – direkt aus dem POS-Index.
+    #[inline]
+    pub fn subjects_of(&self, p: u32, o: u32) -> &[u32] {
+        self.pos.query_two(p, o)
+    }
+
+    /// Sortierte, distinkte Subjekte mit Prädikat p.
+    #[inline]
+    pub fn subjects_with_predicate(&self, p: u32) -> &[u32] {
+        self.pred_subjects.get(&p).map_or(&[], |v| v.as_slice())
+    }
+
+    /// Sortierte, distinkte Objekte mit Prädikat p.
+    #[inline]
+    pub fn objects_with_predicate(&self, p: u32) -> &[u32] {
+        self.pred_objects.get(&p).map_or(&[], |v| v.as_slice())
+    }
+
+    /// Ob das Prädikat p im Store vorkommt (für WCOJ-Anwendbarkeit).
+    #[inline]
+    pub fn has_predicate(&self, p: u32) -> bool {
+        self.pred_subjects.contains_key(&p)
     }
 
     /// Schreibt den gesamten Store verlustfrei als N-Triples-Datei.
@@ -197,14 +252,24 @@ impl TripleStore {
         let osp: Vec<(u32, u32, u32)> = triples.iter().map(|t| (t.2, t.0, t.1)).collect();
         self.osp = LayeredIndex::build(&osp);
 
-        // Binäre Relationen pro Prädikat für WCOJ aufbauen.
-        let mut predicate_set = FxHashSet::default();
-        for (_, p, _) in &triples {
-            predicate_set.insert(*p);
+        // Prädikat-Schlüssellisten (distinkte Subjekte/Objekte je Prädikat)
+        // aus den bereits sortierten Permutationen in O(n) ableiten – die
+        // Sortierung erlaubt last()-Deduplikation statt binärer Suche.
+        self.pred_subjects.clear();
+        self.pred_objects.clear();
+        // SPO ist nach (s,p,o) sortiert -> je Prädikat sind die s monoton.
+        for (s, p, _o) in self.spo.all_triples() {
+            let subs = self.pred_subjects.entry(p).or_default();
+            if subs.last() != Some(&s) {
+                subs.push(s);
+            }
         }
-        self.relations.clear();
-        for p in predicate_set {
-            self.relations.insert(p, PredicateRelation::build(p, &triples));
+        // POS ist nach (p,o,s) sortiert -> je Prädikat sind die o monoton.
+        for (p, o, _s) in self.pos.all_triples() {
+            let objs = self.pred_objects.entry(p).or_default();
+            if objs.last() != Some(&o) {
+                objs.push(o);
+            }
         }
 
         // Statistik aus den deduplizierten Index-Inhalten ableiten, damit
@@ -306,6 +371,20 @@ impl TripleStore {
 impl Default for TripleStore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Fügt `val` sortiert in `vec` ein, falls noch nicht vorhanden.
+fn sorted_insert(vec: &mut Vec<u32>, val: u32) {
+    if let Err(pos) = vec.binary_search(&val) {
+        vec.insert(pos, val);
+    }
+}
+
+/// Entfernt `val` aus dem sortierten `vec`, falls vorhanden.
+fn sorted_remove(vec: &mut Vec<u32>, val: u32) {
+    if let Ok(pos) = vec.binary_search(&val) {
+        vec.remove(pos);
     }
 }
 
