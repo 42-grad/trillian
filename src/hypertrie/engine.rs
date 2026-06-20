@@ -1,6 +1,6 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::executor::{execute_plan, execute_wcoj};
+use super::executor::{execute_plan, execute_wcoj, RowBlock};
 use super::planner::GraphPattern;
 use super::query::TripleStore;
 
@@ -24,7 +24,7 @@ impl HybridEngine {
     }
 
     /// Führt ein Graph-Pattern aus und wählt automatisch den optimalen Pfad.
-    pub fn execute(&self, store: &TripleStore, pattern: &GraphPattern) -> Vec<Vec<u32>> {
+    pub fn execute(&self, store: &TripleStore, pattern: &GraphPattern) -> RowBlock {
         if has_cycle(pattern) {
             execute_wcoj(store, pattern)
         } else {

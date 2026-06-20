@@ -5,38 +5,169 @@ use rustc_hash::FxHashMap;
 use super::planner::{ExecutionPlan, GraphPattern, PatternTerm, TriplePattern};
 use super::query::{QueryResult, Term, TripleStore, Var};
 
-/// Eine partielle oder vollständige Variablenbindung.
-/// `values[i]` gehört zur Variable mit Index `i` im `var_map`.
-#[derive(Debug, Clone)]
-pub struct Binding {
-    values: Vec<Option<u32>>,
+/// Sentinel für eine noch ungebundene Variable in einer (partiellen) Zeile.
+/// Echte Dictionary-IDs liegen weit unter `u32::MAX`, daher kollisionsfrei.
+pub const UNBOUND: u32 = u32::MAX;
+
+/// Flache, zeilen-orientierte Ergebnis-Matrix.
+///
+/// Statt `Vec<Vec<u32>>` (eine Heap-Allokation **pro Zeile**) liegen alle
+/// Zeilen row-major in **einem** `Vec<u32>`. Das eliminiert die Millionen
+/// kleiner Allokationen, die zuvor die Query-Latenz und den Query-Peak-Speicher
+/// dominierten.
+#[derive(Debug, Clone, Default)]
+pub struct RowBlock {
+    n_vars: usize,
+    n_rows: usize,
+    data: Vec<u32>,
 }
 
-impl Binding {
+impl RowBlock {
     pub fn new(n_vars: usize) -> Self {
         Self {
-            values: vec![None; n_vars],
+            n_vars,
+            n_rows: 0,
+            data: Vec::new(),
         }
     }
 
     #[inline]
-    pub fn get(&self, idx: usize) -> Option<u32> {
-        self.values[idx]
+    pub fn n_vars(&self) -> usize {
+        self.n_vars
     }
 
     #[inline]
-    pub fn set(&mut self, idx: usize, val: u32) {
-        self.values[idx] = Some(val);
+    pub fn n_rows(&self) -> usize {
+        self.n_rows
     }
 
     #[inline]
-    pub fn is_bound(&self, idx: usize) -> bool {
-        self.values[idx].is_some()
+    pub fn is_empty(&self) -> bool {
+        self.n_rows == 0
     }
 
-    /// Liefert alle Werte als flachen Vec – nützlich für finale Ergebnisse.
-    pub fn into_row(self) -> Vec<u32> {
-        self.values.into_iter().map(|v| v.unwrap()).collect()
+    #[inline]
+    pub fn row(&self, i: usize) -> &[u32] {
+        let s = i * self.n_vars;
+        &self.data[s..s + self.n_vars]
+    }
+
+    pub fn rows(&self) -> RowIter<'_> {
+        RowIter { block: self, i: 0 }
+    }
+
+    /// Hängt eine Zeile an (Breite muss `n_vars` sein).
+    #[inline]
+    pub fn push_row(&mut self, row: &[u32]) {
+        debug_assert_eq!(row.len(), self.n_vars);
+        self.data.extend_from_slice(row);
+        self.n_rows += 1;
+    }
+
+    /// Beginnt eine neue Zeile als Kopie von `prior` (oder ganz `UNBOUND`) und
+    /// liefert deren Start-Offset, damit der Aufrufer einzelne Spalten setzt –
+    /// ohne temporäre Zeilen-`Vec`.
+    #[inline]
+    fn push_from_prior(&mut self, prior: Option<&[u32]>) -> usize {
+        let start = self.data.len();
+        match prior {
+            Some(p) => self.data.extend_from_slice(p),
+            None => self.data.resize(start + self.n_vars, UNBOUND),
+        }
+        self.n_rows += 1;
+        start
+    }
+
+    /// Hängt eine Zeile aus `prefix` an, mit `fill` auf `n_vars` aufgefüllt.
+    pub fn push_row_padded(&mut self, prefix: &[u32], fill: u32) {
+        debug_assert!(prefix.len() <= self.n_vars);
+        self.data.extend_from_slice(prefix);
+        let pad = self.n_vars - prefix.len();
+        self.data.resize(self.data.len() + pad, fill);
+        self.n_rows += 1;
+    }
+
+    /// Hängt eine Zeile als Verkettung `prefix ++ suffix` an.
+    pub fn push_row_concat(&mut self, prefix: &[u32], suffix: &[u32]) {
+        debug_assert_eq!(prefix.len() + suffix.len(), self.n_vars);
+        self.data.extend_from_slice(prefix);
+        self.data.extend_from_slice(suffix);
+        self.n_rows += 1;
+    }
+
+    /// Hängt alle Zeilen eines anderen Blocks an (gleiche Breite).
+    pub fn append(&mut self, other: &RowBlock) {
+        debug_assert_eq!(self.n_vars, other.n_vars);
+        self.data.extend_from_slice(&other.data);
+        self.n_rows += other.n_rows;
+    }
+
+    /// Neuer Block mit nur den ausgewählten Spalten (in der gegebenen Reihenfolge).
+    pub fn project(&self, indices: &[usize]) -> RowBlock {
+        let mut out = RowBlock::new(indices.len());
+        out.data.reserve(self.n_rows * indices.len());
+        for r in self.rows() {
+            for &i in indices {
+                out.data.push(r[i]);
+            }
+        }
+        out.n_rows = self.n_rows;
+        out
+    }
+
+    /// Sortiert die Zeilen und entfernt Duplikate (SPARQL `DISTINCT`).
+    pub fn sort_distinct(&mut self) {
+        if self.n_vars == 0 {
+            self.n_rows = self.n_rows.min(1);
+            return;
+        }
+        let mut idx: Vec<usize> = (0..self.n_rows).collect();
+        idx.sort_unstable_by(|&a, &b| self.row(a).cmp(self.row(b)));
+        let mut new_data: Vec<u32> = Vec::with_capacity(self.data.len());
+        let mut new_rows = 0usize;
+        let mut prev: Option<usize> = None;
+        for &i in &idx {
+            if let Some(p) = prev {
+                if self.row(p) == self.row(i) {
+                    continue;
+                }
+            }
+            new_data.extend_from_slice(self.row(i));
+            new_rows += 1;
+            prev = Some(i);
+        }
+        self.data = new_data;
+        self.n_rows = new_rows;
+    }
+
+    /// Wendet OFFSET/LIMIT an (in Zeilen).
+    pub fn apply_offset_limit(&mut self, offset: usize, limit: Option<usize>) {
+        let start = offset.min(self.n_rows);
+        let end = match limit {
+            Some(l) => (start + l).min(self.n_rows),
+            None => self.n_rows,
+        };
+        if self.n_vars > 0 {
+            self.data = self.data[start * self.n_vars..end * self.n_vars].to_vec();
+        }
+        self.n_rows = end - start;
+    }
+}
+
+pub struct RowIter<'a> {
+    block: &'a RowBlock,
+    i: usize,
+}
+
+impl<'a> Iterator for RowIter<'a> {
+    type Item = &'a [u32];
+    fn next(&mut self) -> Option<&'a [u32]> {
+        if self.i >= self.block.n_rows {
+            return None;
+        }
+        let r = self.block.row(self.i);
+        self.i += 1;
+        Some(r)
     }
 }
 
@@ -49,11 +180,7 @@ pub fn execute_plan(
     store: &TripleStore,
     pattern: &GraphPattern,
     plan: &ExecutionPlan,
-) -> Vec<Vec<u32>> {
-    if plan.steps.is_empty() {
-        return Vec::new();
-    }
-
+) -> RowBlock {
     let mut var_map: FxHashMap<String, usize> = FxHashMap::default();
     for pat in &pattern.patterns {
         collect_vars(&pat.subject, &mut var_map);
@@ -62,30 +189,31 @@ pub fn execute_plan(
     }
     let n_vars = var_map.len();
 
-    let mut results: Vec<Binding> = Vec::new();
-
-    for (step_idx, step) in plan.steps.iter().enumerate() {
-        let triple_pattern = &pattern.patterns[step.pattern_index];
-
-        if step_idx == 0 {
-            results = execute_pattern(store, triple_pattern, None, &var_map, n_vars);
-        } else {
-            let mut new_results = Vec::new();
-            for binding in &results {
-                let extensions = execute_pattern(
-                    store,
-                    triple_pattern,
-                    Some(binding.clone()),
-                    &var_map,
-                    n_vars,
-                );
-                new_results.extend(extensions);
-            }
-            results = new_results;
-        }
+    if plan.steps.is_empty() {
+        return RowBlock::new(n_vars);
     }
 
-    results.into_iter().map(|b| b.into_row()).collect()
+    let mut results = RowBlock::new(n_vars);
+    for (step_idx, step) in plan.steps.iter().enumerate() {
+        let triple_pattern = &pattern.patterns[step.pattern_index];
+        if step_idx == 0 {
+            extend_pattern(store, triple_pattern, None, &var_map, n_vars, &mut results);
+        } else {
+            let mut next = RowBlock::new(n_vars);
+            for i in 0..results.n_rows() {
+                extend_pattern(
+                    store,
+                    triple_pattern,
+                    Some(results.row(i)),
+                    &var_map,
+                    n_vars,
+                    &mut next,
+                );
+            }
+            results = next;
+        }
+    }
+    results
 }
 
 fn collect_vars(term: &PatternTerm, var_map: &mut FxHashMap<String, usize>) {
@@ -97,45 +225,42 @@ fn collect_vars(term: &PatternTerm, var_map: &mut FxHashMap<String, usize>) {
     }
 }
 
-fn execute_pattern(
+/// Wertet ein Muster gegen den Store aus und schreibt die (erweiterten) Zeilen
+/// direkt in `out` – ohne temporäre Zeilen-`Vec` pro Ergebniszeile.
+fn extend_pattern(
     store: &TripleStore,
     pattern: &TriplePattern,
-    prior: Option<Binding>,
+    prior: Option<&[u32]>,
     var_map: &FxHashMap<String, usize>,
     n_vars: usize,
-) -> Vec<Binding> {
-    let eff_s = effective_term(&pattern.subject, prior.as_ref(), var_map);
-    let eff_p = effective_term(&pattern.predicate, prior.as_ref(), var_map);
-    let eff_o = effective_term(&pattern.object, prior.as_ref(), var_map);
-
-    let mut out = Vec::new();
+    out: &mut RowBlock,
+) {
+    let _ = n_vars;
+    let eff_s = effective_term(&pattern.subject, prior, var_map);
+    let eff_p = effective_term(&pattern.predicate, prior, var_map);
+    let eff_o = effective_term(&pattern.object, prior, var_map);
 
     match store.query(eff_s, eff_p, eff_o) {
         QueryResult::Exact(true) => {
-            out.push(prior.unwrap_or_else(|| Binding::new(n_vars)));
+            out.push_from_prior(prior);
         }
         QueryResult::Exact(false) | QueryResult::Empty => {}
 
         QueryResult::Single(var, values) => {
-            let var_name = pattern_var_name(pattern, var);
-            let var_idx = var_map[var_name];
+            let var_idx = var_map[pattern_var_name(pattern, var)];
             for &val in values.iter() {
-                let mut binding = prior.clone().unwrap_or_else(|| Binding::new(n_vars));
-                binding.set(var_idx, val);
-                out.push(binding);
+                let start = out.push_from_prior(prior);
+                out.data[start + var_idx] = val;
             }
         }
 
         QueryResult::Double(var1, var2, pairs) => {
-            let name1 = pattern_var_name(pattern, var1);
-            let name2 = pattern_var_name(pattern, var2);
-            let idx1 = var_map[name1];
-            let idx2 = var_map[name2];
+            let idx1 = var_map[pattern_var_name(pattern, var1)];
+            let idx2 = var_map[pattern_var_name(pattern, var2)];
             for (val1, val2) in pairs {
-                let mut binding = prior.clone().unwrap_or_else(|| Binding::new(n_vars));
-                binding.set(idx1, val1);
-                binding.set(idx2, val2);
-                out.push(binding);
+                let start = out.push_from_prior(prior);
+                out.data[start + idx1] = val1;
+                out.data[start + idx2] = val2;
             }
         }
 
@@ -149,36 +274,33 @@ fn execute_pattern(
             let o_idx = pattern.object.as_variable().and_then(|n| var_map.get(n)).copied();
 
             for (s, p, o) in triples {
-                let mut binding = Binding::new(n_vars);
+                let start = out.push_from_prior(prior);
                 if let Some(idx) = s_idx {
-                    binding.set(idx, s);
+                    out.data[start + idx] = s;
                 }
                 if let Some(idx) = p_idx {
-                    binding.set(idx, p);
+                    out.data[start + idx] = p;
                 }
                 if let Some(idx) = o_idx {
-                    binding.set(idx, o);
+                    out.data[start + idx] = o;
                 }
-                out.push(binding);
             }
         }
     }
-
-    out
 }
 
 fn effective_term(
     term: &PatternTerm,
-    prior: Option<&Binding>,
+    prior: Option<&[u32]>,
     var_map: &FxHashMap<String, usize>,
 ) -> Term {
     match term {
         PatternTerm::Bound(id) => Term::Bound(*id),
         PatternTerm::Variable(name) => {
-            if let Some(binding) = prior {
-                let idx = var_map[name];
-                if let Some(val) = binding.get(idx) {
-                    Term::Bound(val)
+            if let Some(row) = prior {
+                let v = row[var_map[name]];
+                if v != UNBOUND {
+                    Term::Bound(v)
                 } else {
                     Term::Wildcard
                 }
@@ -212,11 +334,7 @@ impl PatternTerm {
 // ---------------------------------------------------------------------------
 
 /// Führt ein Graph-Pattern mit Worst-Case-Optimal Join aus.
-///
-/// Aktuell optimiert für binäre Muster `(?X, P, ?Y)` mit gebundenem
-/// Prädikat P (das Dreiecks-Szenario). Andere Muster werden transparent
-/// an den klassischen planbasierten Executor delegiert.
-pub fn execute_wcoj(store: &TripleStore, pattern: &GraphPattern) -> Vec<Vec<u32>> {
+pub fn execute_wcoj(store: &TripleStore, pattern: &GraphPattern) -> RowBlock {
     if !is_wcoj_applicable(pattern, store) {
         let plan = pattern.optimize(&store.stats);
         return execute_plan(store, pattern, &plan);
@@ -229,8 +347,9 @@ pub fn execute_wcoj(store: &TripleStore, pattern: &GraphPattern) -> Vec<Vec<u32>
         .map(|(i, v)| (v.clone(), i))
         .collect();
 
-    let mut results: Vec<Vec<u32>> = Vec::new();
-    let mut binding = Binding::new(var_order.len());
+    let n = var_order.len();
+    let mut results = RowBlock::new(n);
+    let mut binding = vec![UNBOUND; n];
 
     wcoj_recurse(
         store,
@@ -261,7 +380,6 @@ fn is_wcoj_applicable(pattern: &GraphPattern, store: &TripleStore) -> bool {
 
 fn determine_variable_order(pattern: &GraphPattern) -> Vec<String> {
     // Heuristik: Variablen in ihrer ersten Erscheinungsreihenfolge.
-    // Für symmetrische Muster (Dreieck) ist die Reihenfolge nicht kritisch.
     let mut seen = FxHashMap::default();
     let mut order = Vec::new();
     for pat in &pattern.patterns {
@@ -275,18 +393,19 @@ fn determine_variable_order(pattern: &GraphPattern) -> Vec<String> {
     order
 }
 
+#[allow(clippy::too_many_arguments)]
 fn wcoj_recurse(
     store: &TripleStore,
     pattern: &GraphPattern,
     var_order: &[String],
     var_map: &FxHashMap<String, usize>,
     depth: usize,
-    binding: &mut Binding,
-    results: &mut Vec<Vec<u32>>,
+    binding: &mut Vec<u32>,
+    results: &mut RowBlock,
     parallel: bool,
 ) {
     if depth == var_order.len() {
-        results.push(binding.clone().into_row());
+        results.push_row(binding);
         return;
     }
 
@@ -300,12 +419,12 @@ fn wcoj_recurse(
     if parallel && depth == 0 {
         use rayon::prelude::*;
 
-        let local_results: Vec<Vec<Vec<u32>>> = candidates
+        let blocks: Vec<RowBlock> = candidates
             .par_iter()
             .map(|&val| {
-                let mut local_binding = Binding::new(var_order.len());
-                local_binding.set(var_map[var_name], val);
-                let mut local_results = Vec::new();
+                let mut local_binding = vec![UNBOUND; var_order.len()];
+                local_binding[var_map[var_name]] = val;
+                let mut local_results = RowBlock::new(var_order.len());
                 wcoj_recurse(
                     store,
                     pattern,
@@ -320,12 +439,12 @@ fn wcoj_recurse(
             })
             .collect();
 
-        for mut r in local_results {
-            results.append(&mut r);
+        for b in &blocks {
+            results.append(b);
         }
     } else {
         for &val in &candidates {
-            binding.set(var_map[var_name], val);
+            binding[var_map[var_name]] = val;
             wcoj_recurse(
                 store,
                 pattern,
@@ -345,7 +464,7 @@ fn leapfrog_candidates(
     store: &TripleStore,
     pattern: &GraphPattern,
     var_name: &str,
-    binding: &Binding,
+    binding: &[u32],
     var_map: &FxHashMap<String, usize>,
 ) -> Vec<u32> {
     let mut slices: Vec<Cow<[u32]>> = Vec::new();
@@ -360,16 +479,14 @@ fn leapfrog_candidates(
     leapfrog_intersect(&refs)
 }
 
-/// Liefert den sortierten Kandidaten-Slice für eine Variable in einem Muster,
-/// unter Berücksichtigung bereits gebundener Variablen.
+/// Liefert den sortierten Kandidaten-Slice für eine Variable in einem Muster.
 fn pattern_slice_for_var<'a>(
     store: &'a TripleStore,
     pat: &'a TriplePattern,
     var_name: &str,
-    binding: &Binding,
+    binding: &[u32],
     var_map: &FxHashMap<String, usize>,
 ) -> Option<Cow<'a, [u32]>> {
-    // Nur binäre Muster mit gebundenem Prädikat
     let pid = match pat.predicate {
         PatternTerm::Bound(pid) => pid,
         _ => return None,
@@ -382,16 +499,12 @@ fn pattern_slice_for_var<'a>(
     let var_at_object = pat.object.variable_name() == Some(var_name);
 
     if var_at_subject {
-        // Subjekt-Kandidaten; falls Objekt gebunden, über POS einschränken,
-        // sonst alle distinkten Subjekte des Prädikats.
         if let Some(bound_obj) = pat.object.bound_or_resolved(binding, var_map) {
             Some(store.subjects_of(pid, bound_obj))
         } else {
             Some(Cow::Borrowed(store.subjects_with_predicate(pid)))
         }
     } else if var_at_object {
-        // Objekt-Kandidaten; falls Subjekt gebunden, über SPO einschränken,
-        // sonst alle distinkten Objekte des Prädikats.
         if let Some(bound_sub) = pat.subject.bound_or_resolved(binding, var_map) {
             Some(store.objects_of(bound_sub, pid))
         } else {
@@ -411,7 +524,6 @@ fn leapfrog_intersect(slices: &[&[u32]]) -> Vec<u32> {
         return slices[0].to_vec();
     }
 
-    // Starte mit dem kleinsten Slice
     let mut idx = 0usize;
     let mut min_len = usize::MAX;
     for (i, s) in slices.iter().enumerate() {
@@ -444,7 +556,7 @@ fn leapfrog_intersect(slices: &[&[u32]]) -> Vec<u32> {
     result
 }
 
-// Hilfs-Traits für PatternTerm
+// Hilfs-Methoden für PatternTerm
 impl PatternTerm {
     pub fn is_variable(&self) -> bool {
         matches!(self, PatternTerm::Variable(_))
@@ -457,18 +569,22 @@ impl PatternTerm {
         }
     }
 
-    /// Falls der Term eine Konstante ist oder eine Variable, die bereits
-    /// in `binding` gebunden ist, wird der konkrete u32-Wert zurückgegeben.
+    /// Konkreter u32-Wert, falls Konstante oder bereits gebundene Variable.
     pub fn bound_or_resolved(
         &self,
-        binding: &Binding,
+        binding: &[u32],
         var_map: &FxHashMap<String, usize>,
     ) -> Option<u32> {
         match self {
             PatternTerm::Bound(id) => Some(*id),
             PatternTerm::Variable(name) => {
-                let idx = var_map.get(name)?;
-                binding.get(*idx)
+                let idx = *var_map.get(name)?;
+                let v = binding[idx];
+                if v != UNBOUND {
+                    Some(v)
+                } else {
+                    None
+                }
             }
         }
     }
@@ -480,7 +596,6 @@ mod wcoj_tests {
 
     #[test]
     fn wcoj_triangle() {
-        // Dreieck: alice-bob-charlie-alice
         let mut store = TripleStore::new();
         store.ingest_str_triples(&[
             ("alice", "knows", "bob"),
@@ -512,6 +627,6 @@ mod wcoj_tests {
 
         let results = execute_wcoj(&store, &pattern);
         // Jede Rotation des Dreiecks ist ein Ergebnis: (a,b,c), (b,c,a), (c,a,b)
-        assert_eq!(results.len(), 3);
+        assert_eq!(results.n_rows(), 3);
     }
 }

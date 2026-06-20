@@ -70,7 +70,7 @@ fn main() {
 
     // Einmal ausführen, um Ergebniszahl zu ermitteln
     let chain_results = engine.execute(&store, &chain_pattern);
-    let chain_count = chain_results.len();
+    let chain_count = chain_results.n_rows();
 
     // Benchmark: 1.000 Durchläufe
     const N_CHAIN_RUNS: usize = 1_000;
@@ -116,7 +116,7 @@ fn main() {
 
     // Einmal ausführen, um Ergebniszahl zu ermitteln
     let triangle_results = engine.execute(&store, &triangle_pattern);
-    let triangle_count = triangle_results.len();
+    let triangle_count = triangle_results.n_rows();
 
     // Benchmark: 20 Durchläufe
     const N_TRIANGLE_RUNS: usize = 20;

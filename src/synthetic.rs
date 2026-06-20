@@ -140,7 +140,7 @@ mod tests {
                 TriplePattern { subject: var("y"), predicate: PatternTerm::Bound(p2), object: var("z") },
             ],
         };
-        let chain_rows = engine.execute(&store, &chain).len();
+        let chain_rows = engine.execute(&store, &chain).n_rows();
 
         // Triangle: (?a,p0,?b)(?b,p0,?c)(?c,p0,?a)
         let triangle = GraphPattern {
@@ -150,7 +150,7 @@ mod tests {
                 TriplePattern { subject: var("c"), predicate: PatternTerm::Bound(p0), object: var("a") },
             ],
         };
-        let triangle_rows = engine.execute(&store, &triangle).len();
+        let triangle_rows = engine.execute(&store, &triangle).n_rows();
 
         assert!(chain_rows > 0, "chain join must be non-empty, got {}", chain_rows);
         assert!(

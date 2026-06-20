@@ -13,7 +13,8 @@ use spargebra::term::{GroundQuad, GroundTerm, Literal, NamedNode, NamedOrBlankNo
 use spargebra::{Query as SparqlQuery, SparqlParser};
 
 use crate::hypertrie::{
-    Dictionary, GraphPattern, HybridEngine, PatternTerm, TermType, TriplePattern, TripleStore,
+    Dictionary, GraphPattern, HybridEngine, PatternTerm, RowBlock, TermType, TriplePattern,
+    TripleStore,
 };
 
 const DEFAULT_CACHE_SIZE: usize = 256;
@@ -164,7 +165,7 @@ pub async fn stream_handler(
                 let header = json!({ "head": { "vars": vars } }).to_string();
                 let _ = tx.blocking_send(Ok(Bytes::from(header + "\n")));
 
-                for row in &select.rows {
+                for row in select.rows.rows() {
                     let obj: Map<String, Value> = vars
                         .iter()
                         .enumerate()
@@ -307,7 +308,7 @@ fn cache_entry_from_result(result: &Value) -> Option<CacheEntry> {
 
 struct SelectResult {
     vars: Vec<String>,
-    rows: Vec<Vec<u32>>,
+    rows: RowBlock,
     var_order: Vec<String>,
 }
 
@@ -348,7 +349,7 @@ fn execute_sparql(
         SparqlQuery::Ask { pattern, .. } => {
             let (bgp, _, _, _, _, _) = extract_bgp_and_projection(&pattern)?;
             let has_match = match translate_bgp(bgp, &store.dict)? {
-                Some(internal) => !engine.execute(store, &internal).is_empty(),
+                Some(internal) => engine.execute(store, &internal).n_rows() > 0,
                 None => false,
             };
             Ok(json!({ "head": {}, "boolean": has_match }))
@@ -372,7 +373,7 @@ fn evaluate_select_with_modifiers(
         None => {
             return Ok(SelectResult {
                 vars: projection.unwrap_or_default(),
-                rows: Vec::new(),
+                rows: RowBlock::new(0),
                 var_order: Vec::new(),
             });
         }
@@ -406,24 +407,13 @@ fn evaluate_select_with_modifiers(
 
     // Projektion VOR DISTINCT/OFFSET/LIMIT – das ist die korrekte
     // SPARQL-Auswertungsreihenfolge (Projektion → DISTINCT → OFFSET/LIMIT).
-    let mut rows: Vec<Vec<u32>> = rows
-        .into_iter()
-        .map(|row| var_indices.iter().map(|&i| row[i]).collect())
-        .collect();
+    let mut rows = rows.project(&var_indices);
     let var_order = vars.clone();
 
     if distinct {
-        rows.sort_unstable();
-        rows.dedup();
+        rows.sort_distinct();
     }
-
-    let offset = offset.unwrap_or(0);
-    if offset > 0 {
-        rows = rows.into_iter().skip(offset).collect();
-    }
-    if let Some(limit) = limit {
-        rows.truncate(limit);
-    }
+    rows.apply_offset_limit(offset.unwrap_or(0), limit);
 
     Ok(SelectResult {
         vars,
@@ -436,9 +426,11 @@ fn left_join(
     store: &TripleStore,
     engine: &HybridEngine,
     left_var_order: &[String],
-    left_rows: Vec<Vec<u32>>,
+    left_rows: RowBlock,
     opt_bgp: &[spargebra::term::TriplePattern],
-) -> Result<(Vec<Vec<u32>>, Vec<String>), String> {
+) -> Result<(RowBlock, Vec<String>), String> {
+    const NULL_ID: u32 = u32::MAX;
+
     let opt_internal_full = match translate_bgp(opt_bgp, &store.dict)? {
         Some(pat) => pat,
         None => {
@@ -450,15 +442,11 @@ fn left_join(
                 .collect();
             let mut new_var_order = left_var_order.to_vec();
             new_var_order.extend(opt_vars.iter().cloned());
-            const NULL_ID: u32 = u32::MAX;
-            let rows = left_rows
-                .into_iter()
-                .map(|mut row| {
-                    row.resize(new_var_order.len(), NULL_ID);
-                    row
-                })
-                .collect();
-            return Ok((rows, new_var_order));
+            let mut out = RowBlock::new(new_var_order.len());
+            for row in left_rows.rows() {
+                out.push_row_padded(row, NULL_ID);
+            }
+            return Ok((out, new_var_order));
         }
     };
 
@@ -484,41 +472,38 @@ fn left_join(
     }
     let mut new_var_order = left_var_order.to_vec();
     new_var_order.extend(new_vars.iter().cloned());
+    let new_arity = new_vars.len();
 
-    const NULL_ID: u32 = u32::MAX;
-
-    // OPTIONAL-Muster **einmal** ausführen (statt pro linker Zeile) und nach
-    // den Join-Schlüsselwerten indizieren -> klassischer Hash-Left-Join.
+    // OPTIONAL-Muster **einmal** ausführen und nach den Join-Schlüsselwerten
+    // indizieren (klassischer Hash-Left-Join). Die neuen Spalten je Schlüssel
+    // liegen flach hintereinander (new_arity Spalten pro Match).
     let opt_rows = engine.execute(store, &opt_internal_full);
-    let mut index: rustc_hash::FxHashMap<Vec<u32>, Vec<Vec<u32>>> =
-        rustc_hash::FxHashMap::default();
-    for orow in &opt_rows {
+    let mut index: rustc_hash::FxHashMap<Vec<u32>, Vec<u32>> = rustc_hash::FxHashMap::default();
+    for orow in opt_rows.rows() {
         let key: Vec<u32> = shared.iter().map(|&(_, op)| orow[op]).collect();
-        let new_vals: Vec<u32> = new_positions.iter().map(|&p| orow[p]).collect();
-        index.entry(key).or_default().push(new_vals);
+        let bucket = index.entry(key).or_default();
+        for &p in &new_positions {
+            bucket.push(orow[p]);
+        }
     }
 
-    let mut result = Vec::with_capacity(left_rows.len());
-    for row in left_rows {
+    let mut out = RowBlock::new(new_var_order.len());
+    for row in left_rows.rows() {
         let key: Vec<u32> = shared.iter().map(|&(lp, _)| row[lp]).collect();
         match index.get(&key) {
-            Some(matches) if !matches.is_empty() => {
-                for m in matches {
-                    let mut new_row = row.clone();
-                    new_row.extend_from_slice(m);
-                    result.push(new_row);
+            Some(flat) if new_arity > 0 && !flat.is_empty() => {
+                for chunk in flat.chunks(new_arity) {
+                    out.push_row_concat(row, chunk);
                 }
             }
             _ => {
-                // Kein Match -> OPTIONAL-Variablen bleiben ungebunden (NULL).
-                let mut new_row = row.clone();
-                new_row.resize(new_var_order.len(), NULL_ID);
-                result.push(new_row);
+                // Kein Match (oder OPTIONAL ohne neue Variablen) -> NULL-Auffüllung.
+                out.push_row_padded(row, NULL_ID);
             }
         }
     }
 
-    Ok((result, new_var_order))
+    Ok((out, new_var_order))
 }
 
 fn variables_in_bgp(bgp: &[spargebra::term::TriplePattern]) -> Vec<String> {
@@ -572,7 +557,7 @@ fn sparql_json(result: &SelectResult, store: &TripleStore) -> Value {
 
     let bindings: Vec<Map<String, Value>> = result
         .rows
-        .iter()
+        .rows()
         .map(|row| {
             result
                 .vars
@@ -608,7 +593,7 @@ fn execute_count(
             let result = evaluate_select_with_modifiers(
                 store, engine, bgp, optionals, projection, distinct, limit, offset,
             )?;
-            Ok(json!({ "count": result.rows.len() }))
+            Ok(json!({ "count": result.rows.n_rows() }))
         }
         SparqlQuery::Ask { pattern, .. } => {
             let (bgp, _, _, _, _, _) = extract_bgp_and_projection(&pattern)?;
@@ -1023,7 +1008,7 @@ mod tests {
         let engine = HybridEngine::new();
         let query = "SELECT ?a ?b WHERE { ?a <http://example.org/knows> ?b }";
         let select = evaluate_select(&store, &engine, query).unwrap();
-        assert_eq!(select.rows.len(), 3);
+        assert_eq!(select.rows.n_rows(), 3);
         assert_eq!(select.vars, vec!["a", "b"]);
     }
 }
