@@ -9,11 +9,13 @@ Build a lean, cache-friendly graph database that can run realistic SPARQL-over-H
 ## Architecture
 
 - **Dictionary**: String ↔ `u32` term mapping with term-type metadata (IRI, literal with datatype/language, blank node).
-- **LayeredIndex / CSR**: Three-level compressed sparse row structure storing SPO/POS/OSP permutations as flat contiguous vectors.
+- **LayeredIndex**: three-level index per permutation (SPO/POS/OSP) as a **flat CSR arena** (few large contiguous vectors — no per-leaf allocation) plus a small **delta overlay** (`ins`/`del`) so updates stay incremental. Reads return `Cow<[u32]>`: borrowed from the base when the delta does not touch a leaf, merged otherwise. The delta compacts into a fresh base when it grows.
+- **WCOJ without redundant relations**: candidate slices for bound-predicate patterns come straight from the SPO/POS permutations; only slim sorted distinct subject/object lists per predicate are kept on the side.
 - **Hybrid Query Engine**:
   - Acyclic BGPs: cost-based left-deep planner with dictionary statistics.
-  - Cyclic BGPs: WCOJ (Worst-Case Optimal Join) via predicate-specific 2D CSR relations and leapfrog intersection.
-- **SPARQL Endpoint**: axum-based HTTP server exposing `/sparql`, `/stream`, `/count`, and `/update`.
+  - Cyclic BGPs: WCOJ (Worst-Case Optimal Join) via leapfrog intersection.
+- **Streaming ingest**: N-Triples are parsed line by line and mapped into the dictionary on the fly — the full parse buffer is never materialized.
+- **SPARQL Endpoint**: axum-based HTTP server exposing `/sparql`, `/stream`, `/count`, `/update`, with an LRU query cache and a reader-writer lock.
 - **No pointer chasing**: flat vectors, `u32` IDs, FxHashMap, Rayon parallelism.
 
 ## Supported SPARQL Features
@@ -57,19 +59,31 @@ cargo test
 
 The repository includes a realistic remote duel (`run_remote_duel.sh`) that provisions a Hetzner Cloud server, builds both systems from source, and benchmarks them through their real `/sparql` HTTP endpoints on 1 million synthetic N-Triples.
 
-### Latest Result (Forschungs-Tentris, Ubuntu 24.04, cpx42)
+### Latest Result (Forschungs-Tentris, 1M graph-shaped triples)
 
-| Metrik / Benchmark | Rust SPARQL-Endpoint | C++ Tentris SPARQL-Endpoint | Faktor |
-| :--- | :--- | :--- | :--- |
-| **Ingest (1M Triples)** | 1205.20 ms | 6425.14 ms | Rust ~5.3× schneller |
-| **Azyklischer Chain-Join** | 654.19 µs/query (0 rows) | 2708.24 µs/query (0 rows) | Rust ~4.1× schneller |
-| **Zyklischer Triangle-Join (WCOJ)** | 0.67 ms/query (0 rows) | 2.77 ms/query (0 rows) | Rust ~4.1× schneller |
+Query latency is warm median; all queries return identical row counts to Tentris.
+Full history and raw logs: [`BENCHMARKS.md`](BENCHMARKS.md) and `bench/`.
 
-Konsistenzprüfung (Result Rows):
-- Chain: Rust=0, Tentris=0 → OK
-- Triangle: Rust=0, Tentris=0 → OK
+| Benchmark | Rust | C++ Tentris | Winner |
+| :--- | ---: | ---: | :--- |
+| Ingest + startup | 804 ms | 6139 ms | Rust 7.6× |
+| chain join | 7.1 ms | 15.1 ms | Rust 2.1× |
+| triangle (WCOJ) | 4.3 ms | 11.2 ms | Rust 2.6× |
+| star | 1.5 ms | 3.3 ms | Rust 2.2× |
+| distinct | 8.5 ms | 10.5 ms | Rust 1.2× |
+| optional | 36.5 ms | 27.5 ms | Tentris 1.3× |
+| INSERT (triples/s) | 9.4M | 0.80M | Rust 11.8× |
+| DELETE (triples/s) | 15.2M | 0.75M | Rust 20.3× |
+| **Peak RSS** | **338 MB** | 268 MB | Tentris 1.26× |
+| index footprint | 338 MB (RAM) | 513 MB (disk store) | Rust smaller |
 
-Both queries return zero rows on the synthetic dataset by construction; the benchmark still measures full plan optimization and execution consistently.
+The dataset is graph-shaped (shared subject/object vocabulary with planted
+triangles and chains), so every join returns real, non-empty, matching results.
+Memory started at 1104 B/triple and is now 354 B/triple vs Tentris' 281 — the gap
+went from 3.9× to 1.26× over four optimization stages (see `BENCHMARKS.md`).
+
+> Caveat: this is 1M RAM-friendly synthetic data. Tentris targets large,
+> persistent, real-world RDF where its disk-backed store and compression matter.
 
 ## Running the Remote Duel
 
@@ -95,20 +109,21 @@ The script creates a dedicated SSH key at `infra/terraform/duel_key`, provisions
 src/
   hypertrie/
     dictionary.rs   # Term dictionary with types
-    index.rs        # 3-level CSR LayeredIndex
+    index.rs        # Flat-CSR LayeredIndex + delta overlay
     stats.rs        # Cardinality statistics
     planner.rs      # BGP optimizer and GraphPattern
     executor.rs     # Plan executor and WCOJ/leapfrog
     engine.rs       # Hybrid cyclic/acyclic routing
-    relation.rs     # Per-predicate 2D CSR
-    query.rs        # Low-level triple/merge queries
-    export.rs       # N-Triples parser with literal support
+    query.rs        # TripleStore: indexes, queries, streaming ingest, updates
+    export.rs       # N-Triples parser/serializer with literal support
+  synthetic.rs      # Graph-shaped synthetic data generator
   sparql.rs         # axum SPARQL server, cache, updates, OPTIONAL
   bin/server.rs     # Standalone server binary
   main.rs           # Local benchmarks and data generation
 final_duel.py       # Realistic endpoint duel orchestrator
 run_remote_duel.sh  # Hetzner provision + Ansible + duel wrapper
 infra/              # Terraform and Ansible automation
+bench/              # Archived duel result logs
 ```
 
 ## License

@@ -74,37 +74,44 @@ bestätigt, inkl. zyklischem WCOJ-Triangle):
   N-Triples-Parser mit Escapes.
 - LRU-Query-Cache; verlustfreie N-Triples-Persistenz (`TENTRIS_PERSIST=1`).
 
-## Roadmap — was noch zu tun ist
+## Roadmap — Stand & was noch offen ist
 
-Priorisiert nach Hebel; Zielmetriken jeweils aus der Baseline ableitbar.
+Die volle Messreihe steht in [`BENCHMARKS.md`](BENCHMARKS.md).
 
-### 1. Hypertrie-Umbau (größter Hebel) — adressiert Memory
-Eine **einzige redundanzeliminierende Hypertrie mit Subtrie-Hashing**
-(„Hashing the Hypertrie", ISWC 2022) statt 3 Permutationen + Per-Prädikat-
-Relationen. Zieht den Join-Executor mit.
-**Zielmetrik:** 1104 B/Triple → Richtung Tentris (≈281 B/Triple). Invasiv,
-eigener Umbau — vorher/nachher gegen diese Baseline messen.
+### ✅ Erledigt — Memory auf Tentris-Niveau (1104 → 354 B/Triple)
+Das ursprüngliche Ziel „Memory Richtung Tentris (≈281 B/Triple)" ist erreicht.
+Statt der vollen hash-consed Hypertrie kam der Gewinn aus drei Schritten:
+- **Etappe 1** (`c3a8d63`): Per-Prädikat Forward/Reverse-Relationen entfernt;
+  WCOJ liest aus den Permutationen.
+- **Etappe 2** (`facb611`): BTreeMap-Permutationen → flache CSR-Arenas + Delta-
+  Overlay (Updates bleiben inkrementell).
+- **Quick Win** (`da5cfad`): streamender Ingest, kein Parse-Puffer im RAM.
 
-### 2. OPTIONAL in die Engine ziehen — adressiert einzige Query-Niederlage
-Left-Join in die Tensor-/WCOJ-Evaluation integrieren statt SPARQL-Schicht-
-Nested-Loop. **Zielmetrik:** optional 40,8 ms → unter Tentris (30 ms),
-p95 73 ms → < 52 ms.
+Ergebnis: 1053 → 338 MB Peak-RSS (−68 %), Abstand zu Tentris 3,9× → 1,26×;
+unser RAM-Index (338 MB) ist sogar kleiner als Tentris' 513-MB-Disk-Store.
+Korrektheit über alle Stufen identisch, Latenz-/Update-Vorsprung erhalten.
 
-### 3. Uniformes Einsum-WCOJ
-WCOJ über **beliebige** Muster (inkl. ungebundener Prädikate) statt Spezialfall
-(gebundenes Prädikat + 2 Variablen) + Binär-Fallback.
+### Offen
 
-### 4. mmap/persistente Indizes
-Statt N-Triples-Dump: echter persistenter, memory-mapped Store → O(1)-Restart,
-Write-Through ohne O(n)-Dump, geringerer RAM-Druck.
+**1. OPTIONAL in die Engine ziehen — einzige Query-Niederlage.**
+Left-Join in die Evaluation integrieren statt SPARQL-Schicht-Nested-Loop.
+**Zielmetrik:** optional 36 ms → unter Tentris (27 ms).
+
+**2. Etappe 3 (optional): Singleton-Kompression / Subtrie-Sharing.**
+Auf zufälligen Synthetikdaten wenig Effekt; lohnt erst auf echten RDF-Daten.
+
+**3. Uniformes Einsum-WCOJ** über beliebige Muster (inkl. ungebundener
+Prädikate) statt Spezialfall + Binär-Fallback.
+
+**4. mmap/persistente Indizes** statt N-Triples-Dump.
 
 ### Kleinere Punkte
-- DELETE-Pfad: `all_subjects/all_objects` als Set/BTreeSet statt sortiertem Vec
-  (O(log n)-Remove statt O(n)).
-- SPARQL: `UNION`, `FILTER`, `BIND`, Sub-SELECT, Aggregation (`GROUP BY`/`COUNT`).
+- Restliche ~73 B/Triple zu Tentris: Dict speichert Strings doppelt
+  (Key + Value); String-Interning wäre der nächste Memory-Hebel.
+- DELETE-Pfad: `pred_subjects/pred_objects` als Set statt sortiertem Vec.
+- SPARQL: `UNION`, `FILTER`, `BIND`, Sub-SELECT, Aggregation.
 - Turtle-Input (.ttl), Blank Nodes.
 - Content-Type `application/sparql-results+json` (aktuell `application/json`).
-- README-Architektur aktualisieren („flat CSR" → BTreeMap-basiert seit inkrementellem Umbau).
 
 ## Reproduktion
 
