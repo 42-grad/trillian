@@ -16,10 +16,11 @@ um den Entwicklungs- und Verbesserungsprozess nachvollziehbar zu tracken.
 | Datum | Commit | Stufe | Peak-RSS | B/Triple | Ingest | INSERT/s | triangle med | chain med | Korrektheit |
 | :-- | :-- | :-- | --: | --: | --: | --: | --: | --: | :-- |
 | 2026-06-20 | `8852869` | Baseline (3 Perm. + Relationen) | 1053 MB | 1104 B | 1807 ms | 6,49M | 4,00 ms | 6,76 ms | alle Rows = Tentris |
-| 2026-06-20 | `c3a8d63` | Etappe 1 (Relationen entfernt) | **906 MB** | **950 B** | **1406 ms** | **10,30M** | 4,32 ms | 7,17 ms | alle Rows = Tentris |
+| 2026-06-20 | `c3a8d63` | Etappe 1 (Relationen entfernt) | 906 MB | 950 B | 1406 ms | 10,30M | 4,32 ms | 7,17 ms | alle Rows = Tentris |
+| 2026-06-20 | `facb611` | Etappe 2 (flache CSR + Delta) | **676 MB** | **709 B** | **1005 ms** | 6,99M | 4,42 ms | 6,69 ms | alle Rows = Tentris |
 
-Referenz Tentris (Forschungsversion, gleicher Lauf): 268 MB RSS / 281 B/Triple
-(metall-Disk-Store 513 MB); triangle ~11 ms, chain ~15 ms median.
+Referenz Tentris (Forschungsversion, gleicher Lauf): ~266 MB RSS / ~279 B/Triple
+(metall-Disk-Store 513 MB); triangle ~11–12 ms, chain ~15 ms median.
 
 ## Korrektheit (jede Stufe identisch zu Tentris)
 
@@ -49,11 +50,22 @@ Listen je Prädikat.
   beim Einfügen.
 - Keine Latenz-Regression, Korrektheit unverändert.
 
+### Etappe 2 — `facb611` — flache CSR-Arenas + Delta-Overlay
+BTreeMap-Permutationen (Millionen Klein-Allokationen) → kompakte flache CSR-Basis
+(wenige große Vektoren) + kleines Delta (`ins`/`del`). `query_two` liefert
+`Cow::Borrowed` ohne Delta-Treffer, sonst gemergt; Delta wird bei Bedarf in die
+Basis gefaltet → Updates bleiben inkrementell.
+- **Memory −25 %** ggü. Etappe 1 (906 → 676 MB, 950 → 709 B/Triple); −36 % ggü.
+  Baseline. Abstand zu Tentris: 3,4× → **2,5×**.
+- **Ingest −29 %** (1406 → 1005 ms).
+- Updates weiter schnell (INSERT 6,99M/s, DELETE 10,55M/s; je 8,2× Tentris).
+- Keine Latenz-Regression (distinct jetzt Gleichstand, optional nur noch 1,1×).
+
 ## Offen (Roadmap, siehe BASELINE.md)
 
-- **Etappe 2 (großer Memory-Hebel):** BTreeMap-Permutationen → flache CSR-Arenas
-  (wenige große Allokationen) + Delta-Overlay für Updates. Ziel: Großteil der
-  verbleibenden 950 B/Triple → Richtung 281 B/Triple.
+- **Quick Win:** `server.rs` hält den geparsten Triple-Puffer (~3M Strings)
+  über die gesamte Laufzeit – der Dict hat die Strings längst kopiert. Vor
+  `serve()` droppen senkt den resident RSS spürbar (geschätzt ~150–200 MB).
 - **Etappe 3:** Singleton-Kompression + Subtrie-Sharing (zahlt v. a. auf echten,
   strukturierten RDF-Daten — auf zufälligen Synthetikdaten wenig Effekt).
-- OPTIONAL in die Engine ziehen (einzige Query-Niederlage: 38 vs. 30 ms).
+- OPTIONAL in die Engine ziehen (einzige Query-Niederlage: 34 vs. 32 ms).
