@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use rustc_hash::FxHashMap;
 
 use super::planner::{ExecutionPlan, GraphPattern, PatternTerm, TriplePattern};
@@ -117,7 +119,7 @@ fn execute_pattern(
         QueryResult::Single(var, values) => {
             let var_name = pattern_var_name(pattern, var);
             let var_idx = var_map[var_name];
-            for &val in values {
+            for &val in values.iter() {
                 let mut binding = prior.clone().unwrap_or_else(|| Binding::new(n_vars));
                 binding.set(var_idx, val);
                 out.push(binding);
@@ -346,7 +348,7 @@ fn leapfrog_candidates(
     binding: &Binding,
     var_map: &FxHashMap<String, usize>,
 ) -> Vec<u32> {
-    let mut slices: Vec<&[u32]> = Vec::new();
+    let mut slices: Vec<Cow<[u32]>> = Vec::new();
 
     for pat in &pattern.patterns {
         if let Some(slice) = pattern_slice_for_var(store, pat, var_name, binding, var_map) {
@@ -354,7 +356,8 @@ fn leapfrog_candidates(
         }
     }
 
-    leapfrog_intersect(&slices)
+    let refs: Vec<&[u32]> = slices.iter().map(|c| c.as_ref()).collect();
+    leapfrog_intersect(&refs)
 }
 
 /// Liefert den sortierten Kandidaten-Slice für eine Variable in einem Muster,
@@ -365,7 +368,7 @@ fn pattern_slice_for_var<'a>(
     var_name: &str,
     binding: &Binding,
     var_map: &FxHashMap<String, usize>,
-) -> Option<&'a [u32]> {
+) -> Option<Cow<'a, [u32]>> {
     // Nur binäre Muster mit gebundenem Prädikat
     let pid = match pat.predicate {
         PatternTerm::Bound(pid) => pid,
@@ -384,7 +387,7 @@ fn pattern_slice_for_var<'a>(
         if let Some(bound_obj) = pat.object.bound_or_resolved(binding, var_map) {
             Some(store.subjects_of(pid, bound_obj))
         } else {
-            Some(store.subjects_with_predicate(pid))
+            Some(Cow::Borrowed(store.subjects_with_predicate(pid)))
         }
     } else if var_at_object {
         // Objekt-Kandidaten; falls Subjekt gebunden, über SPO einschränken,
@@ -392,7 +395,7 @@ fn pattern_slice_for_var<'a>(
         if let Some(bound_sub) = pat.subject.bound_or_resolved(binding, var_map) {
             Some(store.objects_of(bound_sub, pid))
         } else {
-            Some(store.objects_with_predicate(pid))
+            Some(Cow::Borrowed(store.objects_with_predicate(pid)))
         }
     } else {
         None

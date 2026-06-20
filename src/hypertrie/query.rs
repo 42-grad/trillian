@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use rustc_hash::FxHashMap;
 
 use super::dictionary::{Dictionary, TermType};
@@ -24,8 +26,9 @@ pub enum QueryResult<'a> {
     Empty,
     /// `(S, P, O)` – exakte Existenzprüfung.
     Exact(bool),
-    /// Eine freie Variable; der Slice enthält deren Werte.
-    Single(Var, &'a [u32]),
+    /// Eine freie Variable; die Werte werden geliehen (kein Delta) oder als
+    /// gemergte Menge (mit Delta) zurückgegeben.
+    Single(Var, Cow<'a, [u32]>),
     /// Zwei freie Variables; Paare sind materialisiert.
     Double(Var, Var, Vec<(u32, u32)>),
     /// Drei freie Variables; alle Triples materialisiert.
@@ -183,13 +186,13 @@ impl TripleStore {
 
     /// Objekte von (s, p) als sortierter Slice – direkt aus dem SPO-Index.
     #[inline]
-    pub fn objects_of(&self, s: u32, p: u32) -> &[u32] {
+    pub fn objects_of(&self, s: u32, p: u32) -> Cow<'_, [u32]> {
         self.spo.query_two(s, p)
     }
 
     /// Subjekte von (p, o) als sortierter Slice – direkt aus dem POS-Index.
     #[inline]
-    pub fn subjects_of(&self, p: u32, o: u32) -> &[u32] {
+    pub fn subjects_of(&self, p: u32, o: u32) -> Cow<'_, [u32]> {
         self.pos.query_two(p, o)
     }
 
@@ -346,7 +349,7 @@ impl TripleStore {
     pub fn intersect_objects(&self, s1: u32, p1: u32, s2: u32, p2: u32) -> Vec<u32> {
         let a = self.spo.query_two(s1, p1);
         let b = self.spo.query_two(s2, p2);
-        intersect_sorted(a, b)
+        intersect_sorted(&a, &b)
     }
 
     /// Chain-Join: (?X, p1, ?Y) AND (?Y, p2, fixed_o).
@@ -358,9 +361,9 @@ impl TripleStore {
     pub fn join_chain(&self, p1: u32, p2: u32, fixed_o: u32) -> Vec<(u32, u32)> {
         let ys = self.pos.query_two(p2, fixed_o);
         let mut result = Vec::new();
-        for &y in ys {
+        for &y in ys.iter() {
             let xs = self.pos.query_two(p1, y);
-            for &x in xs {
+            for &x in xs.iter() {
                 result.push((x, y));
             }
         }
