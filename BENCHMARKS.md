@@ -73,6 +73,25 @@ Basis gefaltet → Updates bleiben inkrementell.
 - Ingest 1005 → 804 ms; Updates noch schneller (INSERT 9,43M/s, DELETE 15,2M/s).
 - Latenz/Korrektheit unverändert.
 
+### mmap-Persistenz — `6aa59d9` — fairer Vergleich (beide disk-backed)
+Bis hierhin war der Vergleich Äpfel-vs-Birnen: Tentris persistent/mmap, wir
+rein In-RAM. Jetzt hat der Rust-Klon einen **Loader/Server-Split wie Tentris**:
+`server build` baut + persistiert einen Binär-Snapshot, `server load` mappt ihn
+zero-copy. Das Duell misst beide gleich (Loader + mmap-Start).
+
+Fairer Lauf (1M graph dataset):
+- **Ingest+Startup:** Rust 1220 ms (Loader 831 + mmap-Start 148) vs. Tentris
+  6476 ms → **Rust 5,3×** — jetzt legitim (beide bauen + persistieren + mmappen).
+- **Memory:** Rust **310 B/Triple** (296 MB RSS, mmap-backed) vs. Tentris 281 B
+  (268 MB) → **1,10×**, faktisch Gleichstand. Disk: unser Snapshot **35 MB** vs.
+  Tentris' metall-Store **513 MB** → **~15× kleiner**.
+- Latenz: chain 2,2×, triangle 2,6×, star 3,0×, distinct Gleichstand, optional
+  Tentris 1,4×. Updates INSERT 7,3× / DELETE 14× — **aber mit Asterisk:** unsere
+  Updates landen im RAM-Delta (nicht zurück in den Snapshot persistiert),
+  Tentris-Updates sind durabel. Das ist der **letzte** verbleibende
+  Äpfel-vs-Birnen-Punkt.
+- Korrektheit über alle Queries identisch.
+
 ### Executor-Umbau (RowBlock) — `6d15c15` — flache Zeilen-Materialisierung
 `Vec<Vec<u32>>` (eine Allokation pro Zeile) → flache row-major `RowBlock` (ein
 Puffer). Binär-Planer + WCOJ + Projektion/DISTINCT/LIMIT + OPTIONAL-Join

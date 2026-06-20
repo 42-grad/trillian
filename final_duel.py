@@ -510,7 +510,7 @@ def print_report(n_triples, rust_ingest, tentris_ingest, rust, tentris, rust_mem
     print(f"| DELETE (triples/s) | {fmt(rd,'/s',0)} | {fmt(td,'/s',0)} | {winner_higher(rd, td)} |")
 
     print("\n### Memory-Footprint")
-    print("| Metrik | Rust (in-memory) | Tentris (mmap/disk) |")
+    print("| Metrik | Rust (mmap) | Tentris (mmap/disk) |")
     print("| :-- | --: | --: |")
     r_peak = rust_mem.get("peak_rss_kb") if rust_mem else None
     t_peak = tentris_mem.get("peak_rss_kb") if tentris_mem else None
@@ -522,14 +522,14 @@ def print_report(n_triples, rust_ingest, tentris_ingest, rust, tentris, rust_mem
     mbb = lambda b: None if b is None else b / 1024 / 1024
     print(f"| Peak-RSS (VmHWM) | {fmt(mb(r_peak),'MB')} | {fmt(mb(t_peak),'MB')} |")
     print(f"| RSS (VmRSS) | {fmt(mb(r_rss),'MB')} | {fmt(mb(t_rss),'MB')} |")
-    print(f"| Disk-Store | {fmt(mbb(r_disk),'MB')} (.nt-Quelle) | {fmt(mbb(t_disk),'MB')} (metall) |")
+    print(f"| Disk-Store | {fmt(mbb(r_disk),'MB')} (mmap-Snapshot) | {fmt(mbb(t_disk),'MB')} (metall) |")
     if r_peak:
         print(f"| Bytes/Triple (RSS) | {fmt(r_peak * 1024 / n_triples,'B',1)} | {fmt(t_peak * 1024 / n_triples if t_peak else None,'B',1)} |")
     print(
-        "\nHinweis: Tentris ist disk-/mmap-basiert – VmRSS kann den realen "
-        "Footprint unterschätzen; der metall-Store auf Disk ist die ehrlichere "
-        "Größe. Der Rust-Klon hält den Index komplett im RAM (3 Permutationen + "
-        "Prädikat-Relationen), daher ist RSS dort die maßgebliche Größe."
+        "\nHinweis: Beide Systeme sind jetzt disk-backed/mmap. Der Rust-Index "
+        "wird aus dem Snapshot gemappt; resident-RSS umfasst zusätzlich die im "
+        "RAM abgeleitete Statistik + Prädikatlisten. Disk-Store: unser Snapshot "
+        "vs. Tentris' metall-Store."
     )
 
 
@@ -556,7 +556,7 @@ def main() -> None:
 
             # Memory am Ende erfassen (VmHWM = Peak über die gesamte Laufzeit).
             rust_mem = read_proc_status(rust_proc.pid) or {}
-            rust_mem["disk_bytes"] = dir_size_bytes(NT_FILE)
+            rust_mem["disk_bytes"] = dir_size_bytes(PROJECT_ROOT / "rust-snapshot.bin")
             tentris_mem = read_proc_status(tentris_proc.pid) or {}
             tentris_mem["disk_bytes"] = dir_size_bytes(TENTRIS_DATA_DIR)
 
