@@ -73,6 +73,25 @@ Basis gefaltet → Updates bleiben inkrementell.
 - Ingest 1005 → 804 ms; Updates noch schneller (INSERT 9,43M/s, DELETE 15,2M/s).
 - Latenz/Korrektheit unverändert.
 
+### WAL — `c7a0c75` — durable Updates (vollständig fairer Vergleich)
+Letzter Äpfel-vs-Birnen-Punkt geschlossen: Updates werden per Write-Ahead-Log
+(append + fsync) durabel und beim `server load` auf den Snapshot zurückgespielt.
+
+Finaler Lauf (alle Achsen apples-to-apples, beide disk-backed + durabel):
+| Achse | Rust | Tentris | |
+| :-- | --: | --: | :-- |
+| Ingest+Startup | 1207 ms | 6107 ms | Rust 5,1× |
+| chain / triangle / star | 6,7 / 4,1 / 1,5 ms | 14,6 / 11,3 / 3,3 ms | Rust 2,1–2,8× |
+| distinct / optional | 9,0 / 34,3 ms | 11,7 / 27,9 ms | Rust 1,3× / Tentris 1,2× |
+| INSERT / DELETE (durabel) | 7,57M / 13,7M /s | 0,94M / 1,79M /s | Rust 8,0× / 7,6× |
+| Memory (RSS) | 316 B/T (301 MB) | 279 B/T (266 MB) | 1,13× |
+| Disk-Store | 35 MB | 513 MB | Rust ~15× kleiner |
+| Korrektheit | identisch | — | alle Rows = |
+
+Hinweis: Die Update-Zahlen sind nun **durabel** auf beiden Seiten (WAL-fsync
+bzw. metall). Der fsync ist im Bulk-Update (1 Request, 20k Triples) amortisiert
+— bei vielen Einzeltransaktionen wären beide fsync-gebunden.
+
 ### mmap-Persistenz — `6aa59d9` — fairer Vergleich (beide disk-backed)
 Bis hierhin war der Vergleich Äpfel-vs-Birnen: Tentris persistent/mmap, wir
 rein In-RAM. Jetzt hat der Rust-Klon einen **Loader/Server-Split wie Tentris**:
