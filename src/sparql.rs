@@ -16,6 +16,7 @@ use crate::hypertrie::{
     Dictionary, GraphPattern, HybridEngine, PatternTerm, RowBlock, TermType, TriplePattern,
     TripleStore,
 };
+use crate::wal::Wal;
 
 const DEFAULT_CACHE_SIZE: usize = 256;
 
@@ -31,25 +32,24 @@ pub struct AppState {
     pub store: RwLock<TripleStore>,
     pub engine: HybridEngine,
     pub cache: Mutex<LruCache<String, CacheEntry>>,
-    /// Optionaler Persistenz-Pfad. Ist er gesetzt, wird der Store nach jedem
-    /// erfolgreichen `/update` verlustfrei dorthin zurückgeschrieben
-    /// (Write-Through), sodass Änderungen einen Neustart überleben.
-    pub persist_path: Option<std::path::PathBuf>,
+    /// Optionales Write-Ahead-Log. Ist es gesetzt, werden Updates durabel
+    /// (append + fsync) protokolliert, sodass sie einen Neustart überleben.
+    pub wal: Option<Mutex<crate::wal::Wal>>,
 }
 
 impl AppState {
     pub fn new(store: TripleStore) -> Self {
-        Self::with_persistence(store, None)
+        Self::with_wal(store, None)
     }
 
-    pub fn with_persistence(store: TripleStore, persist_path: Option<std::path::PathBuf>) -> Self {
+    pub fn with_wal(store: TripleStore, wal: Option<crate::wal::Wal>) -> Self {
         Self {
             store: RwLock::new(store),
             engine: HybridEngine::new(),
             cache: Mutex::new(LruCache::new(
                 std::num::NonZeroUsize::new(DEFAULT_CACHE_SIZE).unwrap(),
             )),
-            persist_path,
+            wal: wal.map(Mutex::new),
         }
     }
 
@@ -60,18 +60,14 @@ impl AppState {
     }
 }
 
-/// Start the SPARQL HTTP endpoint on the given port.
+/// Start the SPARQL HTTP endpoint on the given port (ohne Durabilität).
 pub async fn serve(store: TripleStore, port: u16) {
-    serve_with_persistence(store, port, None).await
+    serve_durable(store, port, None).await
 }
 
-/// Wie [`serve`], aber mit optionalem Write-Through-Persistenzpfad.
-pub async fn serve_with_persistence(
-    store: TripleStore,
-    port: u16,
-    persist_path: Option<std::path::PathBuf>,
-) {
-    let state = Arc::new(AppState::with_persistence(store, persist_path));
+/// Wie [`serve`], aber mit optionalem Write-Ahead-Log für durable Updates.
+pub async fn serve_durable(store: TripleStore, port: u16, wal: Option<crate::wal::Wal>) {
+    let state = Arc::new(AppState::with_wal(store, wal));
 
     let app = Router::new()
         .route("/sparql", get(sparql_handler).post(sparql_handler))
@@ -230,21 +226,20 @@ pub async fn update_handler(
     }
 
     let mut store = state.store.write().unwrap();
-    match execute_update(&mut store, &update_str) {
+    // WAL für die Dauer des Updates sperren (durabel protokollieren).
+    let mut wal_guard = state.wal.as_ref().map(|m| m.lock().unwrap());
+    match execute_update(&mut store, &update_str, wal_guard.as_deref_mut()) {
         Ok(()) => {
-            // Write-Through-Persistenz: aktualisierten Store zurückschreiben,
-            // solange wir noch den Write-Lock halten (konsistenter Snapshot).
-            if let Some(path) = &state.persist_path {
-                if let Some(path_str) = path.to_str() {
-                    if let Err(e) = store.dump_ntriples(path_str) {
-                        return sparql_error(
-                            &format!("Update applied but persistence failed: {}", e),
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                        );
-                    }
+            // Write-Ahead-Log auf Platte zwingen, BEVOR wir Erfolg melden.
+            if let Some(w) = wal_guard.as_deref_mut() {
+                if let Err(e) = w.sync() {
+                    return sparql_error(
+                        &format!("Update applied but WAL sync failed: {}", e),
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                    );
                 }
             }
-            // Cache invalidieren, da sich die Daten geändert haben
+            drop(wal_guard);
             drop(store);
             state.clear_cache();
             (StatusCode::OK, axum::Json(json!({ "status": "ok" }))).into_response()
@@ -611,13 +606,17 @@ fn execute_count(
 // SPARQL Update Execution
 // ---------------------------------------------------------------------------
 
-fn execute_update(store: &mut TripleStore, update_str: &str) -> Result<(), String> {
+fn execute_update(
+    store: &mut TripleStore,
+    update_str: &str,
+    mut wal: Option<&mut Wal>,
+) -> Result<(), String> {
     let update = SparqlParser::new()
         .parse_update(update_str)
         .map_err(|e| e.to_string())?;
 
     // Alle Inserts/Deletes sammeln und am Ende in einem einzigen
-    // Index-Rebuild anwenden (statt einem Rebuild pro Triple).
+    // Index-Rebuild anwenden; parallel ins WAL protokollieren.
     let mut inserts: Vec<(u32, u32, u32)> = Vec::new();
     let mut deletes: Vec<(u32, u32, u32)> = Vec::new();
 
@@ -626,9 +625,12 @@ fn execute_update(store: &mut TripleStore, update_str: &str) -> Result<(), Strin
             spargebra::GraphUpdateOperation::InsertData { data } => {
                 for quad in data {
                     let (s, p, o) = quad_to_triple_terms(&quad)?;
-                    let sid = store.dict.insert_with_type(&s.value, s.typ);
-                    let pid = store.dict.insert_with_type(&p.value, p.typ);
-                    let oid = store.dict.insert_with_type(&o.value, o.typ);
+                    let sid = insert_term_logged(store, &s, wal.as_deref_mut())?;
+                    let pid = insert_term_logged(store, &p, wal.as_deref_mut())?;
+                    let oid = insert_term_logged(store, &o, wal.as_deref_mut())?;
+                    if let Some(w) = wal.as_deref_mut() {
+                        w.log_op(true, sid, pid, oid).map_err(|e| e.to_string())?;
+                    }
                     inserts.push((sid, pid, oid));
                 }
             }
@@ -638,6 +640,9 @@ fn execute_update(store: &mut TripleStore, update_str: &str) -> Result<(), Strin
                     if let (Some(sid), Some(pid), Some(oid)) =
                         (store.dict.lookup(&s.value), store.dict.lookup(&p.value), store.dict.lookup(&o.value))
                     {
+                        if let Some(w) = wal.as_deref_mut() {
+                            w.log_op(false, sid, pid, oid).map_err(|e| e.to_string())?;
+                        }
                         deletes.push((sid, pid, oid));
                     }
                 }
@@ -648,6 +653,23 @@ fn execute_update(store: &mut TripleStore, update_str: &str) -> Result<(), Strin
 
     store.apply_updates(&inserts, &deletes);
     Ok(())
+}
+
+/// Fügt einen Term ins Dictionary ein und protokolliert ihn im WAL, falls er
+/// neu war (damit der Replay dieselben IDs vergibt).
+fn insert_term_logged(
+    store: &mut TripleStore,
+    t: &ParsedTermRdf,
+    wal: Option<&mut Wal>,
+) -> Result<u32, String> {
+    let before = store.dict.len();
+    let id = store.dict.insert_with_type(&t.value, t.typ.clone());
+    if store.dict.len() > before {
+        if let Some(w) = wal {
+            w.log_term(&t.value, &t.typ).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(id)
 }
 
 fn quad_to_triple_terms(quad: &Quad) -> Result<(ParsedTermRdf, ParsedTermRdf, ParsedTermRdf), String> {

@@ -1,7 +1,8 @@
 use std::time::Instant;
 
 use tentris_clone::hypertrie::TripleStore;
-use tentris_clone::sparql::serve;
+use tentris_clone::sparql::{serve, serve_durable};
+use tentris_clone::wal::Wal;
 
 #[tokio::main]
 async fn main() {
@@ -39,6 +40,9 @@ fn build_snapshot(nt: &str, snapshot: &str) {
         .ingest_ntriples_file(nt)
         .expect("Failed to parse .nt file");
     store.save_snapshot(snapshot).expect("Failed to write snapshot");
+    // Ein frischer Snapshot ist die neue Baseline – ein evtl. altes WAL ist
+    // obsolet und darf nicht auf den neuen Snapshot zurückgespielt werden.
+    let _ = std::fs::remove_file(format!("{}.wal", snapshot));
     println!(
         "Built + persisted {} triples ({} terms) to {} in {} ms",
         n,
@@ -48,18 +52,25 @@ fn build_snapshot(nt: &str, snapshot: &str) {
     );
 }
 
-/// Server: Snapshot per mmap laden und SPARQL-Endpoint starten.
+/// Server: Snapshot per mmap laden, WAL zurückspielen, durabel serven.
 async fn load_and_serve(snapshot: &str, port: u16) {
     println!("Loading snapshot (mmap): {}", snapshot);
     let t0 = Instant::now();
-    let store = TripleStore::load_snapshot(snapshot).expect("Failed to load snapshot");
+    let mut store = TripleStore::load_snapshot(snapshot).expect("Failed to load snapshot");
+
+    // WAL nach dem Snapshot zurückspielen (durable Updates wiederherstellen).
+    let wal_path = format!("{}.wal", snapshot);
+    let replayed = Wal::replay(&wal_path, &mut store).expect("Failed to replay WAL");
+    let wal = Wal::open_append(&wal_path).expect("Failed to open WAL");
+
     println!(
-        "Loaded {} triples, {} unique terms in {} ms",
+        "Loaded {} triples, {} unique terms ({} WAL ops replayed) in {} ms",
         store.triple_count(),
         store.dict.len(),
+        replayed,
         t0.elapsed().as_millis()
     );
-    serve(store, port).await;
+    serve_durable(store, port, Some(wal)).await;
 }
 
 /// Default: N-Triples parsen, Index bauen, serven (ohne Snapshot).
