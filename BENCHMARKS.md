@@ -104,6 +104,25 @@ ungefiltert). Die 3 „ROWCOUNT_DIFF" sind also **kein Bug bei uns, sondern ein
 Feature, das wir haben und der Research-Tentris nicht.** Die 7 BGP-Queries
 bleiben 7/7 identisch.
 
+### ORDER BY + UNION-Verifikation (2026-06-21) — Modifikatoren
+
+14 WatDiv-Queries (q01–q14): die 9 reinen BGP/UNION-Queries (inkl. `q11` gleiche
+Var, `q12` NULL-Alignment) sind **IDENTICAL**. Wie bei FILTER zeigt die
+Research-Tentris, dass sie **ORDER BY und LIMIT am HTTP-Endpoint nicht anwendet**:
+`q13` gleiche Menge aber unsortiert (neuer Status `ORDER_DIFF`, weil der
+Vergleich für ORDER BY jetzt sequenz-sensitiv ist), `q14` (`DESC`+`LIMIT 10`)
+liefert bei uns 10 sortierte, bei Tentris 5862 unsortierte Zeilen. Hard-Numbers
+dieses Laufs: Ingest 2,1 vs 8,9 s (4,2×), q04 25,6 vs 52,2 ms, RAM 212 vs 354 MB
+(204 vs 340 B/Triple), Disk 49 vs 1026 MB (21×).
+
+### WDBench-Vorbereitung (2026-06-21) — Skala 1,26 Mrd. Tripel
+
+Stats-Maps on-demand (−40,7 MB @1M, ~50 GB @1,26 Mrd.) + Property Paths/C2RPQs
+implementiert. Probe auf echten WDBench-Daten: alle 5 Query-Klassen führen aus
+(inkl. paths/c2rpqs), logischer Footprint ~111 B/Triple → **Projektion ~130 GB
+logisch** @1,26 Mrd. (Tentris-Referenz ~340 B → ~400 GB). Voller Duell-Lauf via
+`infra/aws/` (Big-RAM-EC2). Harness: `wdbench_{queries.py,probe.sh,duel.sh}`.
+
 ## Stufen-Notizen
 
 ### Baseline — `8852869`

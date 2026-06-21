@@ -23,11 +23,19 @@ Build a lean, cache-friendly graph database that can run realistic SPARQL-over-H
 - `SELECT` and `ASK`
 - Projection, `DISTINCT`, `LIMIT`, `OFFSET`
 - Basic graph patterns (BGP)
-- `OPTIONAL` (single-level left joins)
+- `OPTIONAL` (left joins), `UNION` (column-aligned with NULL padding)
+- `FILTER`: 3-valued expression evaluator — comparisons (numeric/string/IRI),
+  `=`/`!=`/`sameTerm`, `&&`/`||`/`!`, `BOUND`, arithmetic, `IN`, `IF`, and the
+  functions `STR`/`LANG`/`DATATYPE`/`STRLEN`/`U`-`LCASE`/`CONTAINS`/`STRSTARTS`/
+  `STRENDS`/`isIRI`/`isLiteral`/`isNumeric`/`isBlank`
+- `ORDER BY` (type-aware: numeric before lexical, `ASC`/`DESC`, with `LIMIT`/`DISTINCT`)
+- **Property paths**: `/` `^` `|` `*` `+` `?` and negated property sets `!{…}`
+  (directed set propagation; transitive closure via BFS). Covers WDBench paths +
+  C2RPQs. Blank nodes in query patterns act as non-distinguished variables.
 - `INSERT DATA` and `DELETE DATA` updates
 - IRI, literal (`"x"`, `"x"@en`, `"x"^^<dt>`), and typed-literal constants
 
-Not yet supported: `UNION`, `FILTER`, `BIND`, `ORDER BY`, `GROUP BY`, nested graph patterns.
+Not yet supported: `BIND`, `GROUP BY` / aggregation, sub-`SELECT`, `REGEX` in FILTER.
 
 ## Build
 
@@ -103,14 +111,43 @@ The script creates a dedicated SSH key at `infra/terraform/duel_key`, provisions
 ./infra/terraform/destroy.sh
 ```
 
+## WDBench (Wikidata, 1.26 B triples)
+
+Beyond the 1M synthetic/WatDiv duels, the repo can run the real
+[WDBench](https://github.com/MillenniumDB/WDBench) benchmark (Wikidata Truthy,
+1,257,169,959 triples; query classes: single/multiple BGPs, optionals, property
+paths, C2RPQs — all supported).
+
+- `wdbench_queries.py` — converts the WDBench query logs into runnable `.rq`.
+- `wdbench_probe.sh` — streams slices from the 3.6 GB Figshare dump, measures the
+  memory footprint at growing sizes, projects to the full graph, and runs real
+  sample queries against the engine. Run this first (local or any Linux box) to
+  confirm feasibility — it needs neither Tentris nor a big-RAM machine.
+- `wdbench_duel.sh [stride] [max_per_category]` — full Rust-vs-Tentris comparison
+  per category. Needs both engines resident → a big-RAM host.
+
+Because both engines run resident at once (Rust ~130 GB logical + Tentris
+~400 GB), the full run uses a dedicated **AWS** construct (separate from the
+Hetzner one above):
+
+```bash
+aws configure                       # or AWS_PROFILE / access keys
+./infra/aws/run_aws_duel.sh         # full graph; r6i.24xlarge (768 GB) + 2 TB EBS
+./infra/aws/run_aws_duel.sh 10 50   # smaller real warm-up (stride 10)
+./infra/aws/destroy.sh              # IMPORTANT: the instance bills until destroyed
+```
+
+See [`infra/aws/README.md`](infra/aws/README.md) for sizing and cost knobs.
+
 ## Project Layout
 
 ```
 src/
   hypertrie/
     dictionary.rs   # Term dictionary with types
-    index.rs        # Flat-CSR LayeredIndex + delta overlay
-    stats.rs        # Cardinality statistics
+    index.rs        # Flat-CSR LayeredIndex + delta overlay (+ O(1) count_one/two)
+    stats.rs        # CardEstimator trait — cardinalities on-demand from the index
+                    # (no stored pair-count maps; ~50 GB saved at WDBench scale)
     planner.rs      # BGP optimizer and GraphPattern
     executor.rs     # Plan executor and WCOJ/leapfrog
     engine.rs       # Hybrid cyclic/acyclic routing

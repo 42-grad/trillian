@@ -4,6 +4,14 @@ Stand 2026-06-21. Echtdaten-Benchmark (WatDiv) ist abgeschlossen: Korrektheit
 7/7 identisch zu Tentris, RAM-Parität (336 vs 319 B/Triple), ~21× kleiner auf
 Disk, Ingest 3,9× schneller. Offene Punkte, priorisiert.
 
+**WDBench (Wikidata, 1,26 Mrd. Tripel) — vorbereitet:** Harness steht
+(`wdbench_queries.py`, `wdbench_probe.sh`, `wdbench_duel.sh`). Voraussetzungen
+erledigt: Stats-Maps on-demand (§1) + Property Paths/C2RPQs (§2). Probe auf
+echten WDBench-Daten validiert: alle 5 Query-Klassen führen aus (inkl.
+paths/c2rpqs), logischer Footprint ~111 B/Triple → Projektion **~130 GB
+logisch** @1,26 Mrd. (Obergrenze; Index davon mmap-pageable). Voller Duell-Lauf
+braucht eine Big-RAM-Box (≥256 GB, da Tentris ~340 B/Triple ≈ 400 GB).
+
 ## 0. Profiling-Run (Speed + Memory) — ✅ ERLEDIGT 2026-06-21
 
 Tooling: `server profile <file.nt> <query.rq> [runs]` (Phasen-Timing +
@@ -33,8 +41,12 @@ Zeile/Zelle). Das ist der gesamte „2×-Rückstand" zu Tentris.
       eine Arena). Dict 66,7 → 36,0 MB; logisch 140 → 109 MB (105 B/Triple).
       dhat Heap-Peak 300,8 → 264,8 MB, **Allokations-Blöcke @Peak 711.922 → 212**.
       Remote-Bestätigung (RSS) ausstehend.
-- [ ] **(Memory) Stats-Maps verschlanken**: 2,28M Pair-Count-Einträge (40 MB)
-      für den Planner — on-demand aus dem Index ableiten oder kompakter halten.
+- [x] **(Memory) Stats-Maps verschlanken** — ✅ erledigt. Die 3 Pair-Count-Maps
+      + 2 Degree-Maps (2,28M Einträge / 40,7 MB @1M Tripel) komplett entfernt;
+      Kardinalitäten kommen on-demand aus dem Index (`CardEstimator`-Trait,
+      `LayeredIndex::count_one`/`count_two`, O(1)/O(log n)). Stats-Maps jetzt
+      **0 MB** (memory_report bestätigt); skaliert für WDBench (1,26 Mrd. Tripel,
+      ~50 GB gespart). Plan-Qualität unverändert (Optimizer-Tests grün), 44/44.
 - [ ] DELETE-Pfad: `pred_subjects`/`pred_objects` als `BTreeSet` statt sortiertem
       `Vec` (O(log n)- statt O(n)-Remove).
 - [ ] WAL-Checkpointing / Snapshot-Rotation.
@@ -47,11 +59,22 @@ Zeile/Zelle). Das ist der gesamte „2×-Rückstand" zu Tentris.
       U-LCASE/CONTAINS/STRSTARTS/STRENDS/isIRI/isLiteral/isNumeric/isBlank.
       Wird im WHERE (vor Projektion) und in ASK/`/count` angewandt. 38 Tests grün.
       Offen: REGEX + Custom-Funktionen (derzeit → Ausdrucksfehler ⇒ Zeile fällt raus).
-- [ ] UNION
-- [ ] ORDER BY (inkl. Zusammenspiel mit DISTINCT/LIMIT)
+- [x] **UNION** — ✅ erledigt. Rekursiver WHERE-Evaluator (`eval_where`) wertet
+      beide Zweige aus und richtet die Spalten über die Variablen-Vereinigung mit
+      NULL aus (`union_rows`). Tests: gleiche Var + abweichende Var-Mengen.
+- [x] **ORDER BY** — ✅ erledigt. `OrderKey`/`sort_rows` mit typbewusstem Vergleich
+      (numerisch vor lexikalisch), `DESC()` invertiert, stabil; greift vor
+      LIMIT/OFFSET und nach DISTINCT. Tests: asc IRI, DESC+LIMIT, numerisch, DISTINCT.
 - [ ] Aggregation: GROUP BY, COUNT/SUM/MIN/MAX/AVG
 - [ ] Mehrfache/verschachtelte OPTIONAL, BIND, Sub-SELECT
-- [ ] Property Paths (optional)
+- [x] **Property Paths** — ✅ erledigt. `/` (^, |, *, +, ?, !{…}) als gerichtete
+      Mengen-Propagation (`step_forward`/`step_backward`, transitive Hülle per
+      BFS bis Fixpunkt). Ein gebundener Endpunkt ⇒ Closure nur von dort
+      (effizient); beide Variablen ⇒ Aufzählung über Startknoten. Sequenz `p1/p2`
+      kommt von spargebra als BGP mit Blank-Node-Zwischenknoten ⇒ Blank Nodes in
+      Queries werden jetzt als nicht-distinguierte Variablen (`__bn_*`) behandelt.
+      Schaltet WDBench **Property Paths + C2RPQs** frei. 8 Tests (+/*/?///^/|/
+      both-var/C2RPQ-Join), 52/52 grün.
 
 ## 3. Datenmodell / Kompatibilität
 

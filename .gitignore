@@ -17,8 +17,25 @@ infra/ansible/*.log
 # Ephemeres SSH-Keypair (wird von run_remote_duel.sh generiert) - NIE committen
 infra/terraform/duel_key
 infra/terraform/duel_key.pub
+# AWS-Konstrukt: State, Provider-Cache, Inventory, SSH-Keypair - NIE committen
+infra/aws/terraform/.terraform
+infra/aws/terraform/.terraform.lock.hcl
+infra/aws/terraform/*.tfstate
+infra/aws/terraform/*.tfstate.*
+infra/aws/terraform/terraform.tfvars
+infra/aws/terraform/duel_key
+infra/aws/terraform/duel_key.pub
+infra/aws/ansible/inventory.ini
+infra/aws/ansible/*.log
+infra/aws/wdbench_duel.log
 # .terraform.lock.hcl sollte versioniert werden, daher nicht ignorieren
 watdiv_queries/
 watdiv-tentris-data/
 watdiv_correctness.log
 dhat-heap.json
+
+# WDBench-Daten + generierte Queries (groß / reproduzierbar; *.nt/*.bin schon oben)
+wdbench_data/
+wdbench_qsrc/
+wdbench_queries/
+wdbench_queries_full/
