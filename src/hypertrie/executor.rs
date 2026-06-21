@@ -140,6 +140,26 @@ impl RowBlock {
         self.n_rows = new_rows;
     }
 
+    /// Entfernt Duplikate **ohne** Umsortierung (für DISTINCT nach ORDER BY).
+    pub fn dedup_preserving_order(&mut self) {
+        if self.n_vars == 0 {
+            self.n_rows = self.n_rows.min(1);
+            return;
+        }
+        let mut seen: std::collections::HashSet<Vec<u32>> = std::collections::HashSet::new();
+        let mut new_data: Vec<u32> = Vec::with_capacity(self.data.len());
+        let mut new_rows = 0usize;
+        for i in 0..self.n_rows {
+            let row = self.row(i);
+            if seen.insert(row.to_vec()) {
+                new_data.extend_from_slice(row);
+                new_rows += 1;
+            }
+        }
+        self.data = new_data;
+        self.n_rows = new_rows;
+    }
+
     /// Wendet OFFSET/LIMIT an (in Zeilen).
     pub fn apply_offset_limit(&mut self, offset: usize, limit: Option<usize>) {
         let start = offset.min(self.n_rows);
@@ -336,7 +356,7 @@ impl PatternTerm {
 /// Führt ein Graph-Pattern mit Worst-Case-Optimal Join aus.
 pub fn execute_wcoj(store: &TripleStore, pattern: &GraphPattern) -> RowBlock {
     if !is_wcoj_applicable(pattern, store) {
-        let plan = pattern.optimize(&store.stats);
+        let plan = pattern.optimize(store);
         return execute_plan(store, pattern, &plan);
     }
 

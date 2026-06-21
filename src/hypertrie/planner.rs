@@ -1,4 +1,4 @@
-use super::stats::Stats;
+use super::stats::{estimate_cardinality, CardEstimator};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PatternTerm {
@@ -76,7 +76,7 @@ impl GraphPattern {
     ///    b) unter diesen die niedrigste Kardinalität hat.
     /// 3. Falls keine Verbindung besteht (z. B. Kreuzprodukt), nimm das
     ///    selektivste verbleibende Muster.
-    pub fn optimize(&self, stats: &Stats) -> ExecutionPlan {
+    pub fn optimize<E: CardEstimator + ?Sized>(&self, est: &E) -> ExecutionPlan {
         let n = self.patterns.len();
         if n == 0 {
             return ExecutionPlan { steps: Vec::new() };
@@ -89,7 +89,7 @@ impl GraphPattern {
         let mut best_idx = 0;
         let mut best_cost = usize::MAX;
         for (i, pat) in self.patterns.iter().enumerate() {
-            let cost = stats.estimate_cardinality(&pat.subject, &pat.predicate, &pat.object);
+            let cost = estimate_cardinality(est, &pat.subject, &pat.predicate, &pat.object);
             if cost < best_cost {
                 best_cost = cost;
                 best_idx = i;
@@ -120,7 +120,7 @@ impl GraphPattern {
 
                 let pat = &self.patterns[i];
                 let cost =
-                    stats.estimate_cardinality(&pat.subject, &pat.predicate, &pat.object);
+                    estimate_cardinality(est, &pat.subject, &pat.predicate, &pat.object);
                 if cost < pick_cost {
                     pick_cost = cost;
                     pick = Some(i);
@@ -137,7 +137,7 @@ impl GraphPattern {
                     }
                     let pat = &self.patterns[i];
                     let cost =
-                        stats.estimate_cardinality(&pat.subject, &pat.predicate, &pat.object);
+                        estimate_cardinality(est, &pat.subject, &pat.predicate, &pat.object);
                     if cost < best_cost {
                         best_cost = cost;
                         best = i;
@@ -166,6 +166,7 @@ impl GraphPattern {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hypertrie::stats::Stats;
 
     fn make_pattern() -> GraphPattern {
         GraphPattern {

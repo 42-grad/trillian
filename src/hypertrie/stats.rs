@@ -2,6 +2,70 @@ use rustc_hash::FxHashMap;
 
 use super::planner::PatternTerm;
 
+/// Kardinalitäts-Primitive für den Planner. Wird sowohl von [`Stats`] (Tests,
+/// vorberechnete Maps) als auch vom `TripleStore` (on-demand aus dem Index,
+/// ohne Speicher-fressende Pair-Count-Maps) implementiert.
+pub trait CardEstimator {
+    fn total(&self) -> usize;
+    /// #O für (s, p)
+    fn sp(&self, s: u32, p: u32) -> usize;
+    /// #S für (p, o)
+    fn po(&self, p: u32, o: u32) -> usize;
+    /// #P für (o, s)
+    fn os(&self, o: u32, s: u32) -> usize;
+    /// #Triple mit Subjekt s
+    fn sdeg(&self, s: u32) -> usize;
+    /// #Triple mit Prädikat p
+    fn pdeg(&self, p: u32) -> usize;
+    /// #Triple mit Objekt o
+    fn odeg(&self, o: u32) -> usize;
+}
+
+/// Schätzt die Kardinalität (Anzahl Ergebnisreihen) eines Tripel-Musters über
+/// einen beliebigen [`CardEstimator`].
+pub fn estimate_cardinality<E: CardEstimator + ?Sized>(
+    est: &E,
+    s: &PatternTerm,
+    p: &PatternTerm,
+    o: &PatternTerm,
+) -> usize {
+    use PatternTerm::{Bound, Variable};
+    match (s, p, o) {
+        (Bound(_), Bound(_), Bound(_)) => 1,
+        (Bound(sv), Bound(pv), Variable(_)) => est.sp(*sv, *pv),
+        (Variable(_), Bound(pv), Bound(ov)) => est.po(*pv, *ov),
+        (Bound(sv), Variable(_), Bound(ov)) => est.os(*ov, *sv),
+        (Bound(sv), Variable(_), Variable(_)) => est.sdeg(*sv),
+        (Variable(_), Bound(pv), Variable(_)) => est.pdeg(*pv),
+        (Variable(_), Variable(_), Bound(ov)) => est.odeg(*ov),
+        (Variable(_), Variable(_), Variable(_)) => est.total(),
+    }
+}
+
+impl CardEstimator for Stats {
+    fn total(&self) -> usize {
+        self.total_triples
+    }
+    fn sp(&self, s: u32, p: u32) -> usize {
+        self.spo_pair_count.get(&(s, p)).copied().unwrap_or(0)
+    }
+    fn po(&self, p: u32, o: u32) -> usize {
+        self.pos_pair_count.get(&(p, o)).copied().unwrap_or(0)
+    }
+    fn os(&self, o: u32, s: u32) -> usize {
+        self.osp_pair_count.get(&(o, s)).copied().unwrap_or(0)
+    }
+    fn sdeg(&self, s: u32) -> usize {
+        self.subject_degree.get(&s).copied().unwrap_or(0)
+    }
+    fn pdeg(&self, p: u32) -> usize {
+        self.predicate_degree.get(&p).copied().unwrap_or(0)
+    }
+    fn odeg(&self, o: u32) -> usize {
+        self.object_degree.get(&o).copied().unwrap_or(0)
+    }
+}
+
 /// Statistische Metadaten über den gesamten Triple-Store.
 ///
 /// Alle Kardinalitäten sind exakt (keine Stichproben) und in O(1)

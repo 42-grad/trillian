@@ -28,7 +28,7 @@ impl HybridEngine {
         if has_cycle(pattern) {
             execute_wcoj(store, pattern)
         } else {
-            let plan = pattern.optimize(&store.stats);
+            let plan = pattern.optimize(store);
             execute_plan(store, pattern, &plan)
         }
     }

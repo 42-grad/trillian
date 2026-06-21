@@ -9,7 +9,7 @@ use axum::Router;
 use lru::LruCache;
 use serde_json::{json, Map, Value};
 use tokio_stream::wrappers::ReceiverStream;
-use spargebra::algebra::{Expression, Function};
+use spargebra::algebra::{Expression, Function, PropertyPathExpression as Ppe};
 use spargebra::term::{GroundQuad, GroundTerm, Literal, NamedNode, NamedOrBlankNode, Quad, Term as SparqlTerm};
 use spargebra::{Query as SparqlQuery, SparqlParser};
 
@@ -290,10 +290,9 @@ pub fn profile_query(store: &TripleStore, engine: &HybridEngine, query_str: &str
             eprintln!("profile_query: nur SELECT");
             return;
         };
-        let (bgp, opt, proj, dist, lim, off, filt) = extract_bgp_and_projection(&pattern).unwrap();
+        let m = peel_modifiers(&pattern);
         let t = Instant::now();
-        let result =
-            evaluate_select_with_modifiers(store, engine, bgp, opt, proj, dist, lim, off, filt).unwrap();
+        let result = evaluate_select_with_modifiers(store, engine, &m).unwrap();
         eval.push(t.elapsed().as_secs_f64() * 1000.0);
         rows = result.rows.n_rows();
         let t = Instant::now();
@@ -325,10 +324,8 @@ fn evaluate_select(
         return Err("Only SELECT queries are supported here".to_string());
     };
 
-    let (bgp, optionals, projection, distinct, limit, offset, filters) = extract_bgp_and_projection(&pattern)?;
-    evaluate_select_with_modifiers(
-        store, engine, bgp, optionals, projection, distinct, limit, offset, filters,
-    )
+    let m = peel_modifiers(&pattern);
+    evaluate_select_with_modifiers(store, engine, &m)
 }
 
 fn execute_sparql(
@@ -342,186 +339,584 @@ fn execute_sparql(
 
     match query {
         SparqlQuery::Select { pattern, .. } => {
-            let (bgp, optionals, projection, distinct, limit, offset, filters) =
-                extract_bgp_and_projection(&pattern)?;
-            let result = evaluate_select_with_modifiers(
-                store, engine, bgp, optionals, projection, distinct, limit, offset, filters,
-            )?;
+            let m = peel_modifiers(&pattern);
+            let result = evaluate_select_with_modifiers(store, engine, &m)?;
             Ok(write_sparql_json(&result, store))
         }
         SparqlQuery::Ask { pattern, .. } => {
-            // ASK über den vollen WHERE-Pfad (inkl. OPTIONAL/FILTER) -> ≥1 Lösung?
-            let (bgp, optionals, _, _, _, _, filters) = extract_bgp_and_projection(&pattern)?;
-            let result = evaluate_select_with_modifiers(
-                store, engine, bgp, optionals, None, false, None, None, filters,
-            )?;
+            // ASK über den vollen WHERE-Pfad (inkl. OPTIONAL/FILTER/UNION) -> ≥1 Lösung?
+            let m = peel_modifiers(&pattern);
+            let result = evaluate_select_with_modifiers(store, engine, &m)?;
             Ok(format!("{{\"head\":{{}},\"boolean\":{}}}", result.rows.n_rows() > 0))
         }
         _ => Err("Only SELECT and ASK queries are supported".to_string()),
     }
 }
 
+/// SELECT-Modifier (peeled von der Algebra), plus das innere WHERE-Pattern.
+struct Modifiers<'a> {
+    where_pat: &'a spargebra::algebra::GraphPattern,
+    projection: Option<Vec<String>>,
+    distinct: bool,
+    order_by: Vec<(&'a Expression, bool)>, // (Ausdruck, absteigend?)
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+/// Schält Project/Distinct/Reduced/Slice/OrderBy von der Algebra ab und liefert
+/// das innere WHERE-Pattern (Bgp/Filter/LeftJoin/Join/Union) + die Modifier.
+fn peel_modifiers(pattern: &spargebra::algebra::GraphPattern) -> Modifiers<'_> {
+    use spargebra::algebra::{GraphPattern as GP, OrderExpression};
+    let mut projection = None;
+    let mut distinct = false;
+    let mut order_by = Vec::new();
+    let mut limit = None;
+    let mut offset = None;
+    let mut cur = pattern;
+    loop {
+        match cur {
+            GP::Project { variables, inner } => {
+                projection = Some(variables.iter().map(|v| v.as_str().to_string()).collect());
+                cur = inner;
+            }
+            GP::Distinct { inner } | GP::Reduced { inner } => {
+                distinct = true;
+                cur = inner;
+            }
+            GP::Slice { inner, start, length } => {
+                offset = Some(*start);
+                limit = *length;
+                cur = inner;
+            }
+            GP::OrderBy { inner, expression } => {
+                for oe in expression {
+                    match oe {
+                        OrderExpression::Asc(e) => order_by.push((e, false)),
+                        OrderExpression::Desc(e) => order_by.push((e, true)),
+                    }
+                }
+                cur = inner;
+            }
+            _ => break,
+        }
+    }
+    Modifiers { where_pat: cur, projection, distinct, order_by, limit, offset }
+}
+
+/// Wertet ein WHERE-Pattern rekursiv aus: BGP, FILTER, OPTIONAL (LeftJoin),
+/// Join, UNION. Liefert (Zeilen, Variablen-Reihenfolge).
+fn eval_where(
+    gp: &spargebra::algebra::GraphPattern,
+    store: &TripleStore,
+    engine: &HybridEngine,
+) -> Result<(RowBlock, Vec<String>), String> {
+    use spargebra::algebra::GraphPattern as GP;
+    match gp {
+        GP::Bgp { patterns } => eval_bgp(patterns, store, engine),
+        GP::Filter { expr, inner } => {
+            let (rows, vo) = eval_where(inner, store, engine)?;
+            let mut kept = RowBlock::new(rows.n_vars());
+            for row in rows.rows() {
+                if row_passes(&[expr], row, &vo, store) {
+                    kept.push_row(row);
+                }
+            }
+            Ok((kept, vo))
+        }
+        GP::LeftJoin { left, right, .. } => {
+            let (lr, lvo) = eval_where(left, store, engine)?;
+            let (rr, rvo) = eval_where(right, store, engine)?;
+            Ok(hash_join(lr, &lvo, rr, &rvo, true))
+        }
+        GP::Join { left, right } => {
+            let (lr, lvo) = eval_where(left, store, engine)?;
+            let (rr, rvo) = eval_where(right, store, engine)?;
+            Ok(hash_join(lr, &lvo, rr, &rvo, false))
+        }
+        GP::Union { left, right } => {
+            let (lr, lvo) = eval_where(left, store, engine)?;
+            let (rr, rvo) = eval_where(right, store, engine)?;
+            Ok(union_rows(lr, &lvo, rr, &rvo))
+        }
+        GP::Path {
+            subject,
+            path,
+            object,
+        } => eval_path(store, subject, path, object),
+        _ => Err(
+            "Unsupported WHERE pattern (only BGP/FILTER/OPTIONAL/UNION/Join/Path)".to_string(),
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Property Paths (SPARQL 1.1): /, ^, |, *, +, ?, !{…}
+// ---------------------------------------------------------------------------
+//
+// Evaluierung als gerichtete Mengen-Propagation: ausgehend von einer bekannten
+// Knotenmenge liefert `step_forward`/`step_backward` die über den Pfad
+// erreichbaren Knoten. `*`/`+` sind transitive Hüllen (BFS bis Fixpunkt).
+// Bei genau einem gebundenen Endpunkt ist das effizient (Closure nur vom
+// gebundenen Knoten aus); bei zwei Variablen wird über alle Startknoten
+// aufgezählt (korrekt, aber potenziell teuer – für `*` mit beiden Variablen
+// die degenerierte Identitätsmenge über alle Knoten).
+
+use rustc_hash::FxHashSet;
+
+enum PathEnd {
+    Bound(u32),
+    Var(String),
+}
+
+fn resolve_path_end(tp: &spargebra::term::TermPattern, dict: &Dictionary) -> Option<PathEnd> {
+    match tp {
+        spargebra::term::TermPattern::Variable(v) => Some(PathEnd::Var(v.as_str().to_string())),
+        spargebra::term::TermPattern::NamedNode(nn) => dict.lookup(nn.as_str()).map(PathEnd::Bound),
+        spargebra::term::TermPattern::Literal(lit) => dict.lookup(lit.value()).map(PathEnd::Bound),
+        spargebra::term::TermPattern::BlankNode(_) => None,
+    }
+}
+
+/// Über `path` von `from` aus erreichbare Knoten (vorwärts).
+fn step_forward(store: &TripleStore, path: &Ppe, from: &FxHashSet<u32>) -> FxHashSet<u32> {
+    let mut out = FxHashSet::default();
+    match path {
+        Ppe::NamedNode(nn) => {
+            if let Some(pid) = store.dict.lookup(nn.as_str()) {
+                for &s in from {
+                    out.extend(store.objects_of(s, pid).iter().copied());
+                }
+            }
+        }
+        Ppe::Reverse(e) => return step_backward(store, e, from),
+        Ppe::Sequence(a, b) => {
+            let mid = step_forward(store, a, from);
+            return step_forward(store, b, &mid);
+        }
+        Ppe::Alternative(a, b) => {
+            out = step_forward(store, a, from);
+            out.extend(step_forward(store, b, from));
+        }
+        Ppe::ZeroOrMore(e) => return closure(store, e, from, true, true),
+        Ppe::OneOrMore(e) => return closure(store, e, from, false, true),
+        Ppe::ZeroOrOne(e) => {
+            out = from.clone();
+            out.extend(step_forward(store, e, from));
+        }
+        Ppe::NegatedPropertySet(nns) => {
+            let exclude: FxHashSet<u32> =
+                nns.iter().filter_map(|n| store.dict.lookup(n.as_str())).collect();
+            for &s in from {
+                for (pid, o) in store.po_pairs_of(s) {
+                    if !exclude.contains(&pid) {
+                        out.insert(o);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Über `path` zu `from` führende Knoten (rückwärts).
+fn step_backward(store: &TripleStore, path: &Ppe, from: &FxHashSet<u32>) -> FxHashSet<u32> {
+    let mut out = FxHashSet::default();
+    match path {
+        Ppe::NamedNode(nn) => {
+            if let Some(pid) = store.dict.lookup(nn.as_str()) {
+                for &o in from {
+                    out.extend(store.subjects_of(pid, o).iter().copied());
+                }
+            }
+        }
+        Ppe::Reverse(e) => return step_forward(store, e, from),
+        Ppe::Sequence(a, b) => {
+            // rückwärts: erst b^-1, dann a^-1
+            let mid = step_backward(store, b, from);
+            return step_backward(store, a, &mid);
+        }
+        Ppe::Alternative(a, b) => {
+            out = step_backward(store, a, from);
+            out.extend(step_backward(store, b, from));
+        }
+        Ppe::ZeroOrMore(e) => return closure(store, e, from, true, false),
+        Ppe::OneOrMore(e) => return closure(store, e, from, false, false),
+        Ppe::ZeroOrOne(e) => {
+            out = from.clone();
+            out.extend(step_backward(store, e, from));
+        }
+        Ppe::NegatedPropertySet(nns) => {
+            let exclude: FxHashSet<u32> =
+                nns.iter().filter_map(|n| store.dict.lookup(n.as_str())).collect();
+            for &o in from {
+                for (pid, s) in store.sp_pairs_of(o) {
+                    if !exclude.contains(&pid) {
+                        out.insert(s);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Transitive Hülle (BFS bis Fixpunkt). `reflexive` schließt die Startmenge
+/// ein (`*` vs `+`). `forward` wählt die Richtung.
+fn closure(
+    store: &TripleStore,
+    e: &Ppe,
+    from: &FxHashSet<u32>,
+    reflexive: bool,
+    forward: bool,
+) -> FxHashSet<u32> {
+    let mut result: FxHashSet<u32> = if reflexive { from.clone() } else { FxHashSet::default() };
+    let mut frontier: FxHashSet<u32> = from.clone();
+    loop {
+        let next = if forward {
+            step_forward(store, e, &frontier)
+        } else {
+            step_backward(store, e, &frontier)
+        };
+        let fresh: FxHashSet<u32> = next.into_iter().filter(|n| !result.contains(n)).collect();
+        if fresh.is_empty() {
+            break;
+        }
+        for &n in &fresh {
+            result.insert(n);
+        }
+        frontier = fresh;
+    }
+    result
+}
+
+fn eval_path(
+    store: &TripleStore,
+    subject: &spargebra::term::TermPattern,
+    path: &Ppe,
+    object: &spargebra::term::TermPattern,
+) -> Result<(RowBlock, Vec<String>), String> {
+    let s_end = resolve_path_end(subject, &store.dict);
+    let o_end = resolve_path_end(object, &store.dict);
+
+    // Variablennamen für leere/Ergebnis-Spalten ableiten.
+    let s_var = match subject {
+        spargebra::term::TermPattern::Variable(v) => Some(v.as_str().to_string()),
+        _ => None,
+    };
+    let o_var = match object {
+        spargebra::term::TermPattern::Variable(v) => Some(v.as_str().to_string()),
+        _ => None,
+    };
+
+    // Unbekannte Konstante auf einer Seite -> leere Lösung (mit Variablenspalten).
+    if (s_var.is_none() && s_end.is_none()) || (o_var.is_none() && o_end.is_none()) {
+        let mut vo = Vec::new();
+        if let Some(v) = &s_var {
+            vo.push(v.clone());
+        }
+        if let Some(v) = &o_var {
+            if Some(v) != s_var.as_ref() {
+                vo.push(v.clone());
+            }
+        }
+        return Ok((RowBlock::new(vo.len()), vo));
+    }
+
+    match (s_end, o_end) {
+        // Subjekt gebunden, Objekt Variable: Vorwärts-Closure.
+        (Some(PathEnd::Bound(s)), Some(PathEnd::Var(ov))) => {
+            let mut from = FxHashSet::default();
+            from.insert(s);
+            let ends = step_forward(store, path, &from);
+            let mut rows = RowBlock::new(1);
+            for o in ends {
+                rows.push_row(&[o]);
+            }
+            Ok((rows, vec![ov]))
+        }
+        // Objekt gebunden, Subjekt Variable: Rückwärts-Closure.
+        (Some(PathEnd::Var(sv)), Some(PathEnd::Bound(o))) => {
+            let mut from = FxHashSet::default();
+            from.insert(o);
+            let starts = step_backward(store, path, &from);
+            let mut rows = RowBlock::new(1);
+            for s in starts {
+                rows.push_row(&[s]);
+            }
+            Ok((rows, vec![sv]))
+        }
+        // Beide gebunden: Existenzprüfung (0 Variablen, 1 leere Zeile bei Treffer).
+        (Some(PathEnd::Bound(s)), Some(PathEnd::Bound(o))) => {
+            let mut from = FxHashSet::default();
+            from.insert(s);
+            let ends = step_forward(store, path, &from);
+            let mut rows = RowBlock::new(0);
+            if ends.contains(&o) {
+                rows.push_row(&[]);
+            }
+            Ok((rows, Vec::new()))
+        }
+        // Beide Variablen: über alle Startknoten aufzählen.
+        (Some(PathEnd::Var(sv)), Some(PathEnd::Var(ov))) => {
+            let same = sv == ov;
+            // Startkandidaten: distinkte Subjekte; für reflexive Pfade zusätzlich
+            // Objekte (Identität (x,x) gilt für jeden Knoten).
+            let needs_all_nodes = path_is_reflexive(path);
+            let mut starts = store.distinct_subjects();
+            if needs_all_nodes {
+                starts.extend(store.distinct_objects());
+                starts.sort_unstable();
+                starts.dedup();
+            }
+            let rows_vars = if same { vec![sv] } else { vec![sv, ov] };
+            let mut rows = RowBlock::new(rows_vars.len());
+            for s in starts {
+                let mut from = FxHashSet::default();
+                from.insert(s);
+                let ends = step_forward(store, path, &from);
+                for o in ends {
+                    if same {
+                        if o == s {
+                            rows.push_row(&[s]);
+                        }
+                    } else {
+                        rows.push_row(&[s, o]);
+                    }
+                }
+            }
+            Ok((rows, rows_vars))
+        }
+        // unreachable: None-Fälle oben behandelt
+        _ => Ok((RowBlock::new(0), Vec::new())),
+    }
+}
+
+/// Ob ein Pfad die leere (reflexive) Sequenz enthält (`*` oder `?` an der Wurzel).
+fn path_is_reflexive(path: &Ppe) -> bool {
+    matches!(path, Ppe::ZeroOrMore(_) | Ppe::ZeroOrOne(_))
+}
+
+fn eval_bgp(
+    patterns: &[spargebra::term::TriplePattern],
+    store: &TripleStore,
+    engine: &HybridEngine,
+) -> Result<(RowBlock, Vec<String>), String> {
+    match translate_bgp(patterns, &store.dict)? {
+        Some(internal) => {
+            let vo: Vec<String> = internal.variable_order().into_iter().cloned().collect();
+            Ok((engine.execute(store, &internal), vo))
+        }
+        None => {
+            // Unbekannte Konstante -> leere Lösung mit den Pattern-Variablen.
+            let vo = variables_in_bgp(patterns);
+            Ok((RowBlock::new(vo.len()), vo))
+        }
+    }
+}
+
+/// Hash-Join zweier Ergebnis-Blöcke auf den gemeinsamen Variablen.
+/// `left_outer = true` behält linke Zeilen ohne Match (NULL-aufgefüllt).
+fn hash_join(
+    left: RowBlock,
+    lvo: &[String],
+    right: RowBlock,
+    rvo: &[String],
+    left_outer: bool,
+) -> (RowBlock, Vec<String>) {
+    const NULL_ID: u32 = u32::MAX;
+    let mut shared: Vec<(usize, usize)> = Vec::new(); // (left_pos, right_pos)
+    let mut new_positions: Vec<usize> = Vec::new();
+    let mut new_vars: Vec<String> = Vec::new();
+    for (rp, v) in rvo.iter().enumerate() {
+        if let Some(lp) = lvo.iter().position(|x| x == v) {
+            shared.push((lp, rp));
+        } else {
+            new_positions.push(rp);
+            new_vars.push(v.clone());
+        }
+    }
+    let mut new_var_order = lvo.to_vec();
+    new_var_order.extend(new_vars.iter().cloned());
+    let new_arity = new_vars.len();
+
+    // Rechte Seite nach Join-Schlüssel indizieren (neue Spalten flach).
+    let mut index: rustc_hash::FxHashMap<Vec<u32>, Vec<u32>> = rustc_hash::FxHashMap::default();
+    for rrow in right.rows() {
+        let key: Vec<u32> = shared.iter().map(|&(_, rp)| rrow[rp]).collect();
+        let bucket = index.entry(key).or_default();
+        for &p in &new_positions {
+            bucket.push(rrow[p]);
+        }
+    }
+
+    let mut out = RowBlock::new(new_var_order.len());
+    for row in left.rows() {
+        let key: Vec<u32> = shared.iter().map(|&(lp, _)| row[lp]).collect();
+        match index.get(&key) {
+            Some(flat) if !flat.is_empty() => {
+                if new_arity == 0 {
+                    out.push_row_padded(row, NULL_ID); // Match, aber keine neuen Spalten
+                } else {
+                    for chunk in flat.chunks(new_arity) {
+                        out.push_row_concat(row, chunk);
+                    }
+                }
+            }
+            _ => {
+                if left_outer {
+                    out.push_row_padded(row, NULL_ID);
+                }
+            }
+        }
+    }
+    (out, new_var_order)
+}
+
+/// UNION zweier Ergebnis-Blöcke: gemeinsame Variablenmenge, fehlende -> NULL.
+fn union_rows(
+    left: RowBlock,
+    lvo: &[String],
+    right: RowBlock,
+    rvo: &[String],
+) -> (RowBlock, Vec<String>) {
+    const NULL_ID: u32 = u32::MAX;
+    let mut vo = lvo.to_vec();
+    for v in rvo {
+        if !vo.contains(v) {
+            vo.push(v.clone());
+        }
+    }
+    // Spaltenabbildung Quelle -> Ziel.
+    let map_cols = |src_vo: &[String]| -> Vec<Option<usize>> {
+        vo.iter()
+            .map(|v| src_vo.iter().position(|x| x == v))
+            .collect()
+    };
+    let lmap = map_cols(lvo);
+    let rmap = map_cols(rvo);
+    let mut out = RowBlock::new(vo.len());
+    let emit = |src: &RowBlock, map: &[Option<usize>], out: &mut RowBlock| {
+        let mut buf = vec![NULL_ID; map.len()];
+        for row in src.rows() {
+            for (i, m) in map.iter().enumerate() {
+                buf[i] = m.map(|c| row[c]).unwrap_or(NULL_ID);
+            }
+            out.push_row(&buf);
+        }
+    };
+    emit(&left, &lmap, &mut out);
+    emit(&right, &rmap, &mut out);
+    (out, vo)
+}
+
+/// Sortier-Schlüssel für ORDER BY (SPARQL-nahe Gesamtordnung).
+#[derive(PartialEq)]
+enum OrderKey {
+    Unbound,
+    Num(f64),
+    Iri(String),
+    Str(String),
+}
+
+fn order_key(expr: &Expression, row: &[u32], vo: &[String], store: &TripleStore) -> OrderKey {
+    match eval(expr, row, vo, store) {
+        Ok(Fv::Num(n)) => OrderKey::Num(n),
+        Ok(Fv::Bool(b)) => OrderKey::Num(if b { 1.0 } else { 0.0 }),
+        Ok(Fv::Iri(s)) => OrderKey::Iri(s),
+        Ok(Fv::Str(s)) | Ok(Fv::Lang(s, _)) | Ok(Fv::Typed(s, _)) => OrderKey::Str(s),
+        Err(()) => OrderKey::Unbound,
+    }
+}
+
+fn cmp_key(a: &OrderKey, b: &OrderKey) -> std::cmp::Ordering {
+    use OrderKey::*;
+    fn rank(k: &OrderKey) -> u8 {
+        match k {
+            Unbound => 0,
+            Num(_) => 1,
+            Iri(_) => 2,
+            Str(_) => 3,
+        }
+    }
+    match (a, b) {
+        (Num(x), Num(y)) => x.total_cmp(y),
+        (Iri(x), Iri(y)) | (Str(x), Str(y)) => x.cmp(y),
+        _ => rank(a).cmp(&rank(b)),
+    }
+}
+
+fn sort_rows(
+    rows: &mut RowBlock,
+    vo: &[String],
+    order_by: &[(&Expression, bool)],
+    store: &TripleStore,
+) {
+    let n = rows.n_rows();
+    let keys: Vec<Vec<OrderKey>> = (0..n)
+        .map(|i| order_by.iter().map(|(e, _)| order_key(e, rows.row(i), vo, store)).collect())
+        .collect();
+    let mut idx: Vec<usize> = (0..n).collect();
+    idx.sort_by(|&a, &b| {
+        for (c, (_, desc)) in order_by.iter().enumerate() {
+            let ord = cmp_key(&keys[a][c], &keys[b][c]);
+            let ord = if *desc { ord.reverse() } else { ord };
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+    let mut sorted = RowBlock::new(rows.n_vars());
+    for &i in &idx {
+        sorted.push_row(rows.row(i));
+    }
+    *rows = sorted;
+}
+
 fn evaluate_select_with_modifiers(
     store: &TripleStore,
     engine: &HybridEngine,
-    bgp: &[spargebra::term::TriplePattern],
-    optionals: Vec<&Vec<spargebra::term::TriplePattern>>,
-    projection: Option<Vec<String>>,
-    distinct: bool,
-    limit: Option<usize>,
-    offset: Option<usize>,
-    filters: Vec<&Expression>,
+    m: &Modifiers,
 ) -> Result<SelectResult, String> {
-    let internal = match translate_bgp(bgp, &store.dict)? {
-        Some(pat) => pat,
-        None => {
-            // Unbekannte Konstante im BGP -> leere Lösung. var_order = vars,
-            // damit die Projektion (sparql_json) konsistent auflösen kann.
-            let vars = projection.unwrap_or_default();
-            return Ok(SelectResult {
-                rows: RowBlock::new(vars.len()),
-                var_order: vars.clone(),
-                vars,
-            });
-        }
-    };
+    let (mut rows, var_order) = eval_where(m.where_pat, store, engine)?;
 
-    let mut rows = engine.execute(store, &internal);
-    let mut var_order: Vec<String> = internal.variable_order().into_iter().cloned().collect();
-
-    // Sequentielle LEFT JOINs über alle OPTIONAL-Gruppen.
-    for opt_bgp in optionals {
-        let (new_rows, new_var_order) = left_join(store, engine, &var_order, rows, opt_bgp)?;
-        rows = new_rows;
-        var_order = new_var_order;
+    // ORDER BY (auf den vollen Bindings, vor der Projektion).
+    if !m.order_by.is_empty() {
+        sort_rows(&mut rows, &var_order, &m.order_by, store);
     }
 
-    // FILTER anwenden (auf die vollen Bindings, vor der Projektion).
-    if !filters.is_empty() {
-        let mut kept = RowBlock::new(rows.n_vars());
-        for row in rows.rows() {
-            if row_passes(&filters, row, &var_order, store) {
-                kept.push_row(row);
-            }
-        }
-        rows = kept;
-    }
-
-    let vars = projection.unwrap_or_else(|| var_order.clone());
-
-    // Spaltenindizes der projizierten Variablen in der Roh-Zeile bestimmen.
+    // SELECT * : alle Variablen außer internen Blank-Node-Platzhaltern (__bn_),
+    // die nur aus expandierten Sequenz-Pfaden stammen und nicht ausgegeben werden.
+    let vars = m.projection.clone().unwrap_or_else(|| {
+        var_order
+            .iter()
+            .filter(|v| !v.starts_with("__bn_"))
+            .cloned()
+            .collect()
+    });
     let mut var_indices = Vec::with_capacity(vars.len());
     for var in &vars {
         match var_order.iter().position(|v| v == var) {
             Some(pos) => var_indices.push(pos),
             None => {
-                return Err(format!(
-                    "SELECT variable ?{} does not appear in pattern",
-                    var
-                ))
+                return Err(format!("SELECT variable ?{} does not appear in pattern", var))
             }
         }
     }
 
-    // Projektion VOR DISTINCT/OFFSET/LIMIT – das ist die korrekte
-    // SPARQL-Auswertungsreihenfolge (Projektion → DISTINCT → OFFSET/LIMIT).
     let mut rows = rows.project(&var_indices);
     let var_order = vars.clone();
 
-    if distinct {
-        rows.sort_distinct();
-    }
-    rows.apply_offset_limit(offset.unwrap_or(0), limit);
-
-    Ok(SelectResult {
-        vars,
-        rows,
-        var_order,
-    })
-}
-
-fn left_join(
-    store: &TripleStore,
-    engine: &HybridEngine,
-    left_var_order: &[String],
-    left_rows: RowBlock,
-    opt_bgp: &[spargebra::term::TriplePattern],
-) -> Result<(RowBlock, Vec<String>), String> {
-    const NULL_ID: u32 = u32::MAX;
-
-    let opt_internal_full = match translate_bgp(opt_bgp, &store.dict)? {
-        Some(pat) => pat,
-        None => {
-            // OPTIONAL enthält unbekannte Konstante -> alle OPTIONAL-Variablen
-            // bleiben ungebunden (NULL).
-            let opt_vars: Vec<String> = variables_in_bgp(opt_bgp)
-                .into_iter()
-                .filter(|v| !left_var_order.contains(v))
-                .collect();
-            let mut new_var_order = left_var_order.to_vec();
-            new_var_order.extend(opt_vars.iter().cloned());
-            let mut out = RowBlock::new(new_var_order.len());
-            for row in left_rows.rows() {
-                out.push_row_padded(row, NULL_ID);
-            }
-            return Ok((out, new_var_order));
-        }
-    };
-
-    let opt_var_order: Vec<String> = opt_internal_full
-        .variable_order()
-        .into_iter()
-        .cloned()
-        .collect();
-
-    // Gemeinsame Variablen (Join-Schlüssel) und neue Variablen bestimmen.
-    // shared: (Position in der linken Zeile, Position in der OPTIONAL-Zeile),
-    // in OPTIONAL-Reihenfolge, damit linker und rechter Schlüssel gleich geordnet sind.
-    let mut shared: Vec<(usize, usize)> = Vec::new();
-    let mut new_positions: Vec<usize> = Vec::new();
-    let mut new_vars: Vec<String> = Vec::new();
-    for (opt_pos, v) in opt_var_order.iter().enumerate() {
-        if let Some(left_pos) = left_var_order.iter().position(|lv| lv == v) {
-            shared.push((left_pos, opt_pos));
+    if m.distinct {
+        if m.order_by.is_empty() {
+            rows.sort_distinct();
         } else {
-            new_positions.push(opt_pos);
-            new_vars.push(v.clone());
+            rows.dedup_preserving_order(); // Sortierung der ORDER BY beibehalten
         }
     }
-    let mut new_var_order = left_var_order.to_vec();
-    new_var_order.extend(new_vars.iter().cloned());
-    let new_arity = new_vars.len();
+    rows.apply_offset_limit(m.offset.unwrap_or(0), m.limit);
 
-    // OPTIONAL-Muster **einmal** ausführen und nach den Join-Schlüsselwerten
-    // indizieren (klassischer Hash-Left-Join). Die neuen Spalten je Schlüssel
-    // liegen flach hintereinander (new_arity Spalten pro Match).
-    let opt_rows = engine.execute(store, &opt_internal_full);
-    let mut index: rustc_hash::FxHashMap<Vec<u32>, Vec<u32>> = rustc_hash::FxHashMap::default();
-    for orow in opt_rows.rows() {
-        let key: Vec<u32> = shared.iter().map(|&(_, op)| orow[op]).collect();
-        let bucket = index.entry(key).or_default();
-        for &p in &new_positions {
-            bucket.push(orow[p]);
-        }
-    }
-
-    let mut out = RowBlock::new(new_var_order.len());
-    for row in left_rows.rows() {
-        let key: Vec<u32> = shared.iter().map(|&(lp, _)| row[lp]).collect();
-        match index.get(&key) {
-            Some(flat) if new_arity > 0 && !flat.is_empty() => {
-                for chunk in flat.chunks(new_arity) {
-                    out.push_row_concat(row, chunk);
-                }
-            }
-            _ => {
-                // Kein Match (oder OPTIONAL ohne neue Variablen) -> NULL-Auffüllung.
-                out.push_row_padded(row, NULL_ID);
-            }
-        }
-    }
-
-    Ok((out, new_var_order))
+    Ok(SelectResult { vars, rows, var_order })
 }
 
 fn variables_in_bgp(bgp: &[spargebra::term::TriplePattern]) -> Vec<String> {
@@ -674,18 +1069,13 @@ fn execute_count(
 
     match query {
         SparqlQuery::Select { pattern, .. } => {
-            let (bgp, optionals, projection, distinct, limit, offset, filters) =
-                extract_bgp_and_projection(&pattern)?;
-            let result = evaluate_select_with_modifiers(
-                store, engine, bgp, optionals, projection, distinct, limit, offset, filters,
-            )?;
+            let m = peel_modifiers(&pattern);
+            let result = evaluate_select_with_modifiers(store, engine, &m)?;
             Ok(json!({ "count": result.rows.n_rows() }))
         }
         SparqlQuery::Ask { pattern, .. } => {
-            let (bgp, optionals, _, _, _, _, filters) = extract_bgp_and_projection(&pattern)?;
-            let result = evaluate_select_with_modifiers(
-                store, engine, bgp, optionals, None, false, None, None, filters,
-            )?;
+            let m = peel_modifiers(&pattern);
+            let result = evaluate_select_with_modifiers(store, engine, &m)?;
             Ok(json!({ "boolean": result.rows.n_rows() > 0 }))
         }
         _ => Err("Only SELECT and ASK queries are supported for /count".to_string()),
@@ -1100,99 +1490,6 @@ fn row_passes(filters: &[&Expression], row: &[u32], vars: &[String], store: &Tri
         .all(|f| ebv(f, row, vars, store) == Ok(true))
 }
 
-fn extract_bgp_and_projection(
-    pattern: &spargebra::algebra::GraphPattern,
-) -> Result<
-    (
-        &Vec<spargebra::term::TriplePattern>,
-        Vec<&Vec<spargebra::term::TriplePattern>>,
-        Option<Vec<String>>,
-        bool,
-        Option<usize>,
-        Option<usize>,
-        Vec<&Expression>,
-    ),
-    String,
-> {
-    fn extract_bgp(
-        pattern: &spargebra::algebra::GraphPattern,
-    ) -> Result<&Vec<spargebra::term::TriplePattern>, String> {
-        match pattern {
-            spargebra::algebra::GraphPattern::Bgp { patterns } => Ok(patterns),
-            spargebra::algebra::GraphPattern::Project { inner, .. }
-            | spargebra::algebra::GraphPattern::Distinct { inner }
-            | spargebra::algebra::GraphPattern::Reduced { inner }
-            | spargebra::algebra::GraphPattern::Slice { inner, .. } => extract_bgp(inner),
-            _ => Err("Unsupported graph pattern (nested OPTIONAL/UNION not supported here)".to_string()),
-        }
-    }
-
-    fn walk<'a>(
-        pattern: &'a spargebra::algebra::GraphPattern,
-        projection: &mut Option<Vec<String>>,
-        distinct: &mut bool,
-        limit: &mut Option<usize>,
-        offset: &mut Option<usize>,
-        optionals: &mut Vec<&'a Vec<spargebra::term::TriplePattern>>,
-        filters: &mut Vec<&'a Expression>,
-    ) -> &'a Vec<spargebra::term::TriplePattern> {
-        match pattern {
-            spargebra::algebra::GraphPattern::Filter { expr, inner } => {
-                filters.push(expr);
-                walk(inner, projection, distinct, limit, offset, optionals, filters)
-            }
-            spargebra::algebra::GraphPattern::Project { variables, inner } => {
-                *projection = Some(variables.iter().map(|v| v.as_str().to_string()).collect());
-                walk(inner, projection, distinct, limit, offset, optionals, filters)
-            }
-            spargebra::algebra::GraphPattern::Distinct { inner }
-            | spargebra::algebra::GraphPattern::Reduced { inner } => {
-                *distinct = true;
-                walk(inner, projection, distinct, limit, offset, optionals, filters)
-            }
-            spargebra::algebra::GraphPattern::Slice {
-                inner,
-                start,
-                length,
-            } => {
-                *offset = Some(*start);
-                *limit = *length;
-                walk(inner, projection, distinct, limit, offset, optionals, filters)
-            }
-            spargebra::algebra::GraphPattern::LeftJoin { left, right, .. } => {
-                let mandatory = walk(left, projection, distinct, limit, offset, optionals, filters);
-                if let Ok(opt_bgp) = extract_bgp(right) {
-                    optionals.push(opt_bgp);
-                }
-                mandatory
-            }
-            spargebra::algebra::GraphPattern::Bgp { patterns } => patterns,
-            _ => {
-                // Fallback: treat unsupported pattern as empty BGP.
-                static EMPTY: Vec<spargebra::term::TriplePattern> = Vec::new();
-                &EMPTY
-            }
-        }
-    }
-
-    let mut projection = None;
-    let mut distinct = false;
-    let mut limit = None;
-    let mut offset = None;
-    let mut optionals = Vec::new();
-    let mut filters = Vec::new();
-    let mandatory = walk(
-        pattern,
-        &mut projection,
-        &mut distinct,
-        &mut limit,
-        &mut offset,
-        &mut optionals,
-        &mut filters,
-    );
-    Ok((mandatory, optionals, projection, distinct, limit, offset, filters))
-}
-
 fn translate_bgp(
     bgp: &[spargebra::term::TriplePattern],
     dict: &Dictionary,
@@ -1266,9 +1563,13 @@ fn translate_term_pattern(
                 None => Ok(TranslationResult::UnknownConstant),
             }
         }
-        spargebra::term::TermPattern::BlankNode(_) => {
-            Err("Blank nodes in SPARQL queries are not supported".to_string())
-        }
+        // Blank Nodes in Query-Mustern wirken wie nicht-distinguierte Variablen
+        // (und sind genau das, was spargebra für expandierte Sequenz-Pfade
+        // `p1/p2` als Zwischenknoten einsetzt). Mit stabilem internen Namen
+        // mappen, sodass dasselbe `_:b` über mehrere Tripel hinweg joint.
+        spargebra::term::TermPattern::BlankNode(bn) => Ok(TranslationResult::Term(
+            PatternTerm::Variable(format!("__bn_{}", bn.as_str())),
+        )),
     }
 }
 
@@ -1469,6 +1770,271 @@ mod tests {
         assert_eq!(rows.len(), 2);
         for r in rows {
             assert_ne!(r["b"]["value"], "http://example.org/charlie");
+        }
+    }
+
+    fn values_of<'a>(rows: &'a [Value], var: &str) -> Vec<&'a str> {
+        rows.iter()
+            .map(|r| {
+                r.get(var)
+                    .and_then(|v| v.get("value"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn order_by_ascending_on_iri() {
+        let store = test_store(); // knows objects: bob, charlie, alice
+        let engine = HybridEngine::new();
+        let query =
+            "SELECT ?b WHERE { ?a <http://example.org/knows> ?b } ORDER BY ?b";
+        let result: Value =
+            serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
+        let rows = result["results"]["bindings"].as_array().unwrap();
+        assert_eq!(
+            values_of(rows, "b"),
+            vec![
+                "http://example.org/alice",
+                "http://example.org/bob",
+                "http://example.org/charlie",
+            ]
+        );
+    }
+
+    #[test]
+    fn order_by_desc_with_limit() {
+        let store = test_store();
+        let engine = HybridEngine::new();
+        let query = "SELECT ?b WHERE { ?a <http://example.org/knows> ?b } \
+                     ORDER BY DESC(?b) LIMIT 2";
+        let result: Value =
+            serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
+        let rows = result["results"]["bindings"].as_array().unwrap();
+        assert_eq!(
+            values_of(rows, "b"),
+            vec!["http://example.org/charlie", "http://example.org/bob"]
+        );
+    }
+
+    #[test]
+    fn order_by_numeric_not_lexical() {
+        // 9 < 25 < 100 numerisch; lexikalisch wäre es "100" < "25" < "9".
+        let mut store = TripleStore::new();
+        let dt = "http://www.w3.org/2001/XMLSchema#integer";
+        let s = store.dict.insert("http://example.org/x");
+        let age = store.dict.insert("http://example.org/age");
+        for v in ["100", "9", "25"] {
+            let o = store.dict.insert_with_type(v, TermType::literal_datatype(dt));
+            store.insert_triple(s, age, o);
+        }
+        let engine = HybridEngine::new();
+        let query =
+            "SELECT ?a WHERE { ?s <http://example.org/age> ?a } ORDER BY ?a";
+        let result: Value =
+            serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
+        let rows = result["results"]["bindings"].as_array().unwrap();
+        assert_eq!(values_of(rows, "a"), vec!["9", "25", "100"]);
+    }
+
+    #[test]
+    fn order_by_with_distinct() {
+        let store = test_store();
+        let engine = HybridEngine::new();
+        // DISTINCT ?p -> {knows, age}; ORDER BY ?p sortiert die zwei Prädikate.
+        let query =
+            "SELECT DISTINCT ?p WHERE { ?s ?p ?o } ORDER BY ?p";
+        let result: Value =
+            serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
+        let rows = result["results"]["bindings"].as_array().unwrap();
+        assert_eq!(
+            values_of(rows, "p"),
+            vec!["http://example.org/age", "http://example.org/knows"]
+        );
+    }
+
+    #[test]
+    fn union_combines_branches_same_var() {
+        let store = test_store();
+        let engine = HybridEngine::new();
+        // Branch 1: knows-Objekte (bob, charlie, alice); Branch 2: age-Objekt (25).
+        let query = "SELECT ?o WHERE { \
+                     { ?s <http://example.org/knows> ?o } UNION \
+                     { ?s <http://example.org/age> ?o } }";
+        let result: Value =
+            serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
+        let mut vals = values_of(result["results"]["bindings"].as_array().unwrap(), "o");
+        vals.sort();
+        assert_eq!(
+            vals,
+            vec![
+                "25",
+                "http://example.org/alice",
+                "http://example.org/bob",
+                "http://example.org/charlie",
+            ]
+        );
+    }
+
+    #[test]
+    fn union_aligns_differing_vars_with_null() {
+        let store = test_store();
+        let engine = HybridEngine::new();
+        // Branch 1 bindet nur ?a, Branch 2 nur ?b -> Spalten müssen mit NULL ausgerichtet werden.
+        let query = "SELECT ?a ?b WHERE { \
+                     { ?a <http://example.org/knows> <http://example.org/bob> } UNION \
+                     { ?b <http://example.org/knows> <http://example.org/alice> } }";
+        let result: Value =
+            serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
+        let rows = result["results"]["bindings"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        // Eine Zeile hat a=alice (b NULL), die andere b=charlie (a NULL).
+        let a_only = rows.iter().any(|r| {
+            r.get("a").and_then(|v| v.get("value")).and_then(|v| v.as_str())
+                == Some("http://example.org/alice")
+                && (r.get("b").is_none() || r["b"].is_null())
+        });
+        let b_only = rows.iter().any(|r| {
+            r.get("b").and_then(|v| v.get("value")).and_then(|v| v.as_str())
+                == Some("http://example.org/charlie")
+                && (r.get("a").is_none() || r["a"].is_null())
+        });
+        assert!(a_only, "Zeile mit nur ?a=alice fehlt");
+        assert!(b_only, "Zeile mit nur ?b=charlie fehlt");
+    }
+
+    fn path_store() -> TripleStore {
+        // Kette alice -> bob -> carol -> dave (knows) + alice likes eve.
+        let mut store = TripleStore::new();
+        let k = "http://example.org/knows";
+        let l = "http://example.org/likes";
+        let e = "http://example.org/";
+        store.ingest_str_triples(&[
+            (&format!("{e}alice"), k, &format!("{e}bob")),
+            (&format!("{e}bob"), k, &format!("{e}carol")),
+            (&format!("{e}carol"), k, &format!("{e}dave")),
+            (&format!("{e}alice"), l, &format!("{e}eve")),
+        ]);
+        store
+    }
+
+    fn obj_values(query: &str) -> Vec<String> {
+        let store = path_store();
+        let engine = HybridEngine::new();
+        let result: Value =
+            serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
+        let rows = result["results"]["bindings"].as_array().unwrap();
+        let mut vals: Vec<String> = rows
+            .iter()
+            .filter_map(|r| {
+                r.get("o")
+                    .and_then(|v| v.get("value"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim_start_matches("http://example.org/").to_string())
+            })
+            .collect();
+        vals.sort();
+        vals
+    }
+
+    #[test]
+    fn path_one_or_more() {
+        // alice knows+ ?o -> bob, carol, dave (transitive Hülle, ohne alice).
+        assert_eq!(
+            obj_values("SELECT ?o WHERE { <http://example.org/alice> <http://example.org/knows>+ ?o }"),
+            vec!["bob", "carol", "dave"]
+        );
+    }
+
+    #[test]
+    fn path_zero_or_more_includes_self() {
+        // alice knows* ?o -> alice (0 Schritte), bob, carol, dave.
+        assert_eq!(
+            obj_values("SELECT ?o WHERE { <http://example.org/alice> <http://example.org/knows>* ?o }"),
+            vec!["alice", "bob", "carol", "dave"]
+        );
+    }
+
+    #[test]
+    fn path_zero_or_one() {
+        // alice knows? ?o -> alice (0) + bob (1).
+        assert_eq!(
+            obj_values("SELECT ?o WHERE { <http://example.org/alice> <http://example.org/knows>? ?o }"),
+            vec!["alice", "bob"]
+        );
+    }
+
+    #[test]
+    fn path_sequence() {
+        // alice knows/knows ?o -> carol (2 Schritte).
+        assert_eq!(
+            obj_values("SELECT ?o WHERE { <http://example.org/alice> <http://example.org/knows>/<http://example.org/knows> ?o }"),
+            vec!["carol"]
+        );
+    }
+
+    #[test]
+    fn path_alternative() {
+        // alice (knows|likes) ?o -> bob, eve.
+        assert_eq!(
+            obj_values("SELECT ?o WHERE { <http://example.org/alice> (<http://example.org/knows>|<http://example.org/likes>) ?o }"),
+            vec!["bob", "eve"]
+        );
+    }
+
+    #[test]
+    fn path_inverse() {
+        // bob ^knows ?s -> wer kennt bob = alice (über ?o-Spalte ausgewertet? nein: ?s).
+        let store = path_store();
+        let engine = HybridEngine::new();
+        let q = "SELECT ?s WHERE { <http://example.org/bob> ^<http://example.org/knows> ?s }";
+        let result: Value =
+            serde_json::from_str(&execute_sparql(&store, &engine, q).unwrap()).unwrap();
+        let rows = result["results"]["bindings"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["s"]["value"], "http://example.org/alice");
+    }
+
+    #[test]
+    fn path_both_variables_transitive() {
+        // ?s knows+ ?o -> alle erreichbaren Paare: (alice,{bob,carol,dave}),
+        // (bob,{carol,dave}), (carol,{dave}) = 6 Paare.
+        let store = path_store();
+        let engine = HybridEngine::new();
+        let q = "SELECT ?s ?o WHERE { ?s <http://example.org/knows>+ ?o }";
+        let result: Value =
+            serde_json::from_str(&execute_sparql(&store, &engine, q).unwrap()).unwrap();
+        let rows = result["results"]["bindings"].as_array().unwrap();
+        assert_eq!(rows.len(), 6, "6 transitiv erreichbare (s,o)-Paare");
+    }
+
+    #[test]
+    fn path_in_c2rpq_join() {
+        // C2RPQ-Form: Pfad join BGP. Alle Tripel in EINEM Ingest, da
+        // ingest_str_triples die Indizes jeweils neu baut (nicht anhängt).
+        let mut store = TripleStore::new();
+        let k = "http://example.org/knows";
+        let l = "http://example.org/likes";
+        let e = "http://example.org/";
+        store.ingest_str_triples(&[
+            (&format!("{e}alice"), k, &format!("{e}bob")),
+            (&format!("{e}bob"), k, &format!("{e}carol")),
+            (&format!("{e}carol"), k, &format!("{e}dave")),
+            (&format!("{e}alice"), l, &format!("{e}eve")),
+            (&format!("{e}carol"), l, &format!("{e}zed")),
+        ]);
+        let engine = HybridEngine::new();
+        // ?s knows+ ?mid . ?mid likes ?z  -> ?mid muss carol sein (carol likes zed),
+        // erreichbar von alice und bob -> 2 Treffer.
+        let q = "SELECT ?s ?z WHERE { ?s <http://example.org/knows>+ ?mid . \
+                 ?mid <http://example.org/likes> ?z }";
+        let result: Value =
+            serde_json::from_str(&execute_sparql(&store, &engine, q).unwrap()).unwrap();
+        let rows = result["results"]["bindings"].as_array().unwrap();
+        assert_eq!(rows.len(), 2, "alice/bob knows+ carol; carol likes zed");
+        for r in rows {
+            assert_eq!(r["z"]["value"], "http://example.org/zed");
         }
     }
 

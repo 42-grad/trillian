@@ -196,6 +196,21 @@ impl FlatCsr {
         self.query_two(first, second).binary_search(&third).is_ok()
     }
 
+    /// Anzahl `third`-Werte unter `first` über alle `second` (O(log n) Suche,
+    /// O(1) Summe via CSR-Offsets). 0, falls `first` fehlt.
+    #[inline]
+    fn count_one(&self, first: u32) -> usize {
+        let keys = self.keys();
+        let Ok(i) = keys.binary_search(&first) else {
+            return 0;
+        };
+        let key_off = self.key_off();
+        let l1_off = self.l1_off();
+        let l1_start = key_off[i] as usize;
+        let l1_end = key_off[i + 1] as usize;
+        l1_off[l1_end] as usize - l1_off[l1_start] as usize
+    }
+
     fn all_triples(&self) -> Vec<(u32, u32, u32)> {
         let keys = self.keys();
         let key_off = self.key_off();
@@ -349,6 +364,41 @@ impl LayeredIndex {
         let del = del.map(|v| v.as_slice()).unwrap_or(&[]);
         let ins = ins.map(|v| v.as_slice()).unwrap_or(&[]);
         Cow::Owned(merge_union_minus(base, ins, del))
+    }
+
+    /// Distinkte `first`-Werte (Basis-Schlüssel + Delta). Für Property-Paths
+    /// (Startkandidaten) und Aufzählungen.
+    pub fn first_keys(&self) -> Vec<u32> {
+        let mut ks: Vec<u32> = self.base.keys().to_vec();
+        if !self.ins.is_empty() {
+            for &(f, _) in self.ins.keys() {
+                ks.push(f);
+            }
+            ks.sort_unstable();
+            ks.dedup();
+        }
+        ks
+    }
+
+    /// Anzahl `third`-Werte unter `(first, second)` ohne Materialisierung im
+    /// Delta-freien Fall (dann nur Slice-Länge der Basis).
+    #[inline]
+    pub fn count_two(&self, first: u32, second: u32) -> usize {
+        self.query_two(first, second).len()
+    }
+
+    /// Anzahl Triple unter `first` (Basis + Delta-Inserts; gelöschte werden
+    /// für diese **Heuristik** nicht abgezogen). Exakt im Delta-freien Fall.
+    pub fn count_one(&self, first: u32) -> usize {
+        let mut c = self.base.count_one(first);
+        if !self.ins.is_empty() {
+            for (&(f, _s), thirds) in &self.ins {
+                if f == first {
+                    c += thirds.len();
+                }
+            }
+        }
+        c
     }
 
     /// Abfrage `(first, ?second, ?third)`: materialisierte `(second, third)`-Paare.

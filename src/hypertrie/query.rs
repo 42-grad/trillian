@@ -5,7 +5,7 @@ use rustc_hash::FxHashMap;
 use super::dictionary::{Dictionary, TermType};
 use super::export::ParsedTriple;
 use super::index::{intersect_sorted, FlatCsr, LayeredIndex, U32Arena};
-use super::stats::Stats;
+use super::stats::CardEstimator;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Var {
@@ -50,7 +50,6 @@ pub enum QueryResult<'a> {
 /// je Prädikat – hier als `pred_subjects`/`pred_objects` gehalten.
 pub struct TripleStore {
     pub dict: Dictionary,
-    pub stats: Stats,
     /// p -> sortierte, distinkte Subjekte mit Prädikat p (für WCOJ-Kandidaten).
     pred_subjects: FxHashMap<u32, Vec<u32>>,
     /// p -> sortierte, distinkte Objekte mit Prädikat p.
@@ -64,7 +63,6 @@ impl TripleStore {
     pub fn new() -> Self {
         Self {
             dict: Dictionary::new(),
-            stats: Stats::default(),
             pred_subjects: FxHashMap::default(),
             pred_objects: FxHashMap::default(),
             spo: LayeredIndex::empty(),
@@ -186,7 +184,6 @@ impl TripleStore {
             self.osp.insert(o, s, p);
             sorted_insert(self.pred_subjects.entry(p).or_default(), s);
             sorted_insert(self.pred_objects.entry(p).or_default(), o);
-            self.stats.add_triple(s, p, o);
         }
         is_new
     }
@@ -220,7 +217,6 @@ impl TripleStore {
                     }
                 }
             }
-            self.stats.remove_triple(s, p, o);
         }
         existed
     }
@@ -255,6 +251,32 @@ impl TripleStore {
     #[inline]
     pub fn has_predicate(&self, p: u32) -> bool {
         self.pred_subjects.contains_key(&p)
+    }
+
+    // --- Property-Path-Zugriffe ------------------------------------------
+
+    /// Alle `(p, o)`-Paare des Subjekts s (für negierte Property-Sets vorwärts).
+    #[inline]
+    pub fn po_pairs_of(&self, s: u32) -> Vec<(u32, u32)> {
+        self.spo.query_one_pairs(s)
+    }
+
+    /// Alle `(s, p)`-Paare des Objekts o (für negierte Property-Sets rückwärts).
+    #[inline]
+    pub fn sp_pairs_of(&self, o: u32) -> Vec<(u32, u32)> {
+        self.osp.query_one_pairs(o)
+    }
+
+    /// Distinkte Subjekte (SPO-Schlüssel) – Startkandidaten für Pfade.
+    #[inline]
+    pub fn distinct_subjects(&self) -> Vec<u32> {
+        self.spo.first_keys()
+    }
+
+    /// Distinkte Objekte (OSP-Schlüssel).
+    #[inline]
+    pub fn distinct_objects(&self) -> Vec<u32> {
+        self.osp.first_keys()
     }
 
     /// Schreibt den gesamten Store verlustfrei als N-Triples-Datei.
@@ -301,9 +323,10 @@ impl TripleStore {
         self.rebuild_aux();
     }
 
-    /// Leitet Prädikat-Schlüssellisten und Statistik aus den (bereits
-    /// gebauten/gemappten) Permutationen ab. Genutzt nach Bulk-Load **und**
-    /// nach dem Laden eines mmap-Snapshots.
+    /// Leitet die Prädikat-Schlüssellisten aus den (bereits gebauten/gemappten)
+    /// Permutationen ab. Genutzt nach Bulk-Load **und** nach dem Laden eines
+    /// mmap-Snapshots. Kardinalitäten kommen on-demand aus dem Index
+    /// ([`CardEstimator`]), daher keine vorberechneten Stats-Maps mehr.
     fn rebuild_aux(&mut self) {
         // Prädikat-Schlüssellisten (distinkte Subjekte/Objekte je Prädikat)
         // in O(n) ableiten – die Sortierung erlaubt last()-Deduplikation.
@@ -323,12 +346,6 @@ impl TripleStore {
                 objs.push(o);
             }
         }
-
-        // Statistik aus den deduplizierten Index-Inhalten ableiten.
-        self.stats = Stats::default();
-        for (s, p, o) in self.spo.all_triples() {
-            self.stats.add_triple(s, p, o);
-        }
     }
 
     /// Druckt eine logische Speicher-Aufschlüsselung (Komponenten in MB).
@@ -343,17 +360,12 @@ impl TripleStore {
             .map(|v| v.len() * 4)
             .sum::<usize>()
             + self.pred_objects.values().map(|v| v.len() * 4).sum::<usize>();
-        let stats = self.stats.approx_bytes();
-        let total = perm + dict + pred + stats;
+        let total = perm + dict + pred;
         println!("=== Memory-Report (logisch, {} Triples) ===", self.triple_count());
         println!("  3 Permutationen (SPO/POS/OSP): {:.1} MB", mb(perm));
         println!("  Dictionary (interniert + Typen):  {:.1} MB", mb(dict));
         println!("  Prädikat-Listen:                 {:.1} MB", mb(pred));
-        println!(
-            "  Stats-Maps ({} Einträge):        {:.1} MB",
-            self.stats.entry_count(),
-            mb(stats)
-        );
+        println!("  Stats-Maps:                       0.0 MB (on-demand aus Index)");
         println!("  Summe (logisch):                 {:.1} MB", mb(total));
         println!(
             "  Bytes/Triple (logisch):          {:.0} B",
@@ -553,6 +565,33 @@ impl TripleStore {
             }
         }
         result
+    }
+}
+
+/// Kardinalitäts-Schätzung on-demand aus den drei Permutationen – ersetzt die
+/// früheren vorberechneten Stats-Maps (die mit der Tripelzahl wuchsen und bei
+/// WDBench-Skala zig GB belegt hätten). Alle Counts sind O(log n) bzw. O(1).
+impl CardEstimator for TripleStore {
+    fn total(&self) -> usize {
+        self.spo.len()
+    }
+    fn sp(&self, s: u32, p: u32) -> usize {
+        self.spo.count_two(s, p)
+    }
+    fn po(&self, p: u32, o: u32) -> usize {
+        self.pos.count_two(p, o)
+    }
+    fn os(&self, o: u32, s: u32) -> usize {
+        self.osp.count_two(o, s)
+    }
+    fn sdeg(&self, s: u32) -> usize {
+        self.spo.count_one(s)
+    }
+    fn pdeg(&self, p: u32) -> usize {
+        self.pos.count_one(p)
+    }
+    fn odeg(&self, o: u32) -> usize {
+        self.osp.count_one(o)
     }
 }
 
