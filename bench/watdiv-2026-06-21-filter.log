@@ -1,0 +1,45 @@
+[watdiv] Datensatz: 1091646 Tripel (echte WatDiv-Daten)
+10 Queries -> /opt/tentris_clone/watdiv_queries
+  q01_entity: SELECT ?p ?o WHERE { <http://db.uwaterloo.ca/~galuc/wsdbm/User10152> ?p ?o }
+  q02_values: SELECT ?o WHERE { <http://db.uwaterloo.ca/~galuc/wsdbm/User10152> <http://db.uwaterloo.ca/
+  q03_inverse: SELECT ?s WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://db.uwaterlo
+  q04_star: SELECT ?s ?y WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://db.uwate
+  q05_path: SELECT ?mid ?o WHERE { <http://db.uwaterloo.ca/~galuc/wsdbm/User10003> <http://db.uwaterlo
+  q06_twostar: SELECT ?a ?b WHERE { <http://db.uwaterloo.ca/~galuc/wsdbm/User10152> <http://db.uwaterloo.
+  q07_ask: ASK { <http://db.uwaterloo.ca/~galuc/wsdbm/City0> <http://www.geonames.org/ontology#parent
+  q08_filter_neq: SELECT ?s WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://db.uwaterlo
+  q09_filter_strstarts: SELECT ?s ?o WHERE { ?s <http://purl.org/goodrelations/price> ?o FILTER(STRSTARTS(STR(?o),
+  q10_filter_num: SELECT ?s ?o WHERE { ?s <http://purl.org/goodrelations/price> ?o FILTER(?o > 5000) }
+[watdiv] Baue Rust-Server + Snapshot...
+[watdiv] Tentris-Ingest...
+[watdiv] Vergleiche (Korrektheit + Latenz + Updates + Footprint)...
+### Ingest / Startup (echte Daten)
+  Rust 1951 ms | Tentris 8518 ms | Rust 4.4x
+
+### Korrektheit + Latenz
+Query                  Status            Rows      Rust med/p95   Tentris med/p95
+--------------------------------------------------------------------------------------------
+q01_entity.rq          IDENTICAL           22    0.46/  0.62 ms     0.58/  0.72 ms
+q02_values.rq          IDENTICAL            6    0.45/  0.50 ms     0.60/  0.69 ms
+q03_inverse.rq         IDENTICAL         5862    3.16/  5.87 ms     7.89/  9.31 ms
+q04_star.rq            IDENTICAL        18995   25.43/ 27.37 ms    49.89/ 60.92 ms
+q05_path.rq            IDENTICAL           55    0.45/  0.52 ms     0.69/  0.87 ms
+q06_twostar.rq         IDENTICAL           72    0.47/  0.55 ms     0.73/  1.12 ms
+q07_ask.rq             IDENTICAL                 0.34/  0.43 ms     0.49/  0.60 ms
+q08_filter_neq.rq      ROWCOUNT_DIFF             2.79/  3.09 ms     5.81/  8.32 ms  <- rust=5861 tentris=5862; only_rust=[]; only_tentris=[(('s', ('uri', 'http://db.uwaterloo.ca/~galuc/wsdbm/User10036')),)]
+q09_filter_strstarts.rq ROWCOUNT_DIFF             2.22/  2.37 ms    52.37/ 58.26 ms  <- rust=2663 tentris=23868; only_rust=[]; only_tentris=[(('o', ('lit', '549', 'http://www.w3.org/2001/XMLSchema#string', None)), ('s', ('uri', 'http://db.uwaterloo.ca/~galuc/wsdbm/Purchase134656'))), (('o', ('lit', '549', 'http://www.w3.org/2001/XMLSchema#string', None)), ('s', ('uri', 'http://db.uwaterloo.ca/~galuc/wsdbm/Purchase88769')))]
+q10_filter_num.rq      ROWCOUNT_DIFF             0.42/  0.48 ms    45.07/ 55.79 ms  <- rust=0 tentris=23868; only_rust=[]; only_tentris=[(('o', ('lit', '549', 'http://www.w3.org/2001/XMLSchema#string', None)), ('s', ('uri', 'http://db.uwaterloo.ca/~galuc/wsdbm/Purchase134656'))), (('o', ('lit', '549', 'http://www.w3.org/2001/XMLSchema#string', None)), ('s', ('uri', 'http://db.uwaterloo.ca/~galuc/wsdbm/Purchase88769')))]
+--------------------------------------------------------------------------------------------
+Korrektheit: 7/10 IDENTICAL  IDENTICAL=7 ROWCOUNT_DIFF=3
+
+### Update-Throughput (durabel)
+  Rust     INSERT 34478 /s | DELETE 27326 /s
+  Tentris  INSERT n/a | DELETE n/a  (INSERT HTTP 404: )
+
+### Memory-Footprint (echte Daten)
+  Peak-RSS:  Rust 212.02 MB | Tentris 348.98 MB
+  RSS:       Rust 212.02 MB | Tentris 348.98 MB
+  Disk:      Rust 48.63 MB (Snapshot) | Tentris 1025.94 MB (metall)
+  Bytes/Triple (RSS): Rust 203.7 B | Tentris 335.2 B
+
+=== STDERR ===

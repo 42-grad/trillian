@@ -90,6 +90,20 @@ Performance: durchweg sub-ms bis wenige ms, gemischt — Rust bei kleinen
 Lookups/Pfaden leicht vorn, Tentris beim großen rdf:type-Scan (5862 Zeilen)
 schneller. Kein systematischer Verlierer.
 
+### FILTER-Verifikation (2026-06-21) — Fähigkeitsvorsprung
+
+Drei FILTER-Queries (IRI-Ungleichheit, STRSTARTS, numerischer Vergleich) gegen
+Tentris. Befund: **die Tentris-Research-Version implementiert FILTER nicht** —
+sie liefert für alle drei die **ungefilterte** BGP-Menge zurück (q09/q10:
+23868 = alle Preis-Triples, inkl. Werten, die das FILTER ausschließen müsste;
+q08: 5862 statt 5861). Das deckt sich mit der README (nur BGP + OPTIONAL).
+
+Unser FILTER ist korrekt (5861 / 2663 / 0; durch Unit-Tests + Self-Compare
+10/10 belegt) — und dabei schneller (q09 2,2 ms gefiltert vs. Tentris 52 ms
+ungefiltert). Die 3 „ROWCOUNT_DIFF" sind also **kein Bug bei uns, sondern ein
+Feature, das wir haben und der Research-Tentris nicht.** Die 7 BGP-Queries
+bleiben 7/7 identisch.
+
 ## Stufen-Notizen
 
 ### Baseline — `8852869`
