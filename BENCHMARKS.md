@@ -72,8 +72,11 @@ Ergebnisse (gleiche Wurzel wie OPTIONAL).
 | **Disk-Store** | **48,6 MB** | 1026 MB | **Rust ~21× kleiner** |
 | INSERT/DELETE (durabel) | 33,7k / 27,9k /s | n/a¹ | — |
 
-¹ Tentris lehnte den 20k-Bulk-`INSERT DATA` ab (HTTP ≠ 200); Diagnose-Ausgabe
-nachgerüstet. Rust-Update ist durabel (WAL+fsync) und parse-gebunden bei 20k/Request.
+¹ Tentris-`/update` liefert **HTTP 404** — der gebaute Research-Server hat
+keinen Update-Endpoint. Damit ist Update-Durchsatz gegen Tentris **nicht**
+vergleichbar; die früheren synthetischen „Tentris ~1M/s"-Zahlen waren
+404-Artefakte (Durchsatz wurde auch bei Fehlerstatus berechnet). Unser Update
+ist durabel (WAL+fsync), parse-gebunden bei 20k/Request.
 
 **ASK – Repräsentationsunterschied, kein Engine-Fehler:** Tentris' Research-
 Endpoint serialisiert `ASK` **nicht** spec-konform als `{"boolean":true}`,
