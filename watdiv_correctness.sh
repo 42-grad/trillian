@@ -26,7 +26,10 @@ log() { echo "[watdiv] $*"; }
 # --- 1. WatDiv-Generator bauen (mit Fixes für modernes Boost/C++17) ---------
 if [ ! -x "${WD}/bin/Release/watdiv" ]; then
     log "Baue WatDiv-Generator..."
-    command -v apt-get >/dev/null && sudo apt-get install -y libboost-date-time-dev >/dev/null 2>&1 || true
+    if ! ldconfig -p 2>/dev/null | grep -q libboost_date_time; then
+        log "Installiere libboost-date-time-dev..."
+        (apt-get install -y libboost-date-time-dev || sudo apt-get install -y libboost-date-time-dev) >/dev/null 2>&1 || true
+    fi
     mkdir -p "${WD}"
     curl -sL -o /tmp/watdiv_v06.tar https://dsg.uwaterloo.ca/watdiv/watdiv_v06.tar
     tar -xf /tmp/watdiv_v06.tar -C "${WD}" --strip-components=1

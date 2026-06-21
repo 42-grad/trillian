@@ -86,8 +86,12 @@ echo "[run_remote_duel] Hole Ergebnisse vom Server..."
 scp -i "$SSH_PRIVATE_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     "root@$SERVER_IP:/opt/tentris_clone/duel_output.log" \
     "${SCRIPT_DIR}/duel_output.log"
+# WatDiv-Korrektheits-/Perf-Log (echte Daten) ebenfalls holen (falls vorhanden).
+scp -i "$SSH_PRIVATE_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    "root@$SERVER_IP:/opt/tentris_clone/watdiv_correctness.log" \
+    "${SCRIPT_DIR}/watdiv_correctness.log" 2>/dev/null || true
 
-echo "[run_remote_duel] Fertig! Ergebnisse in: ${SCRIPT_DIR}/duel_output.log"
+echo "[run_remote_duel] Fertig! Ergebnisse in: ${SCRIPT_DIR}/duel_output.log + watdiv_correctness.log"
 echo ""
 echo "Zum Aufräumen (Server löschen):"
 echo "  ./infra/terraform/destroy.sh"

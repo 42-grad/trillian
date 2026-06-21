@@ -15,3 +15,22 @@
     content: "{{ duel_output.stdout }}\n\n=== STDERR ===\n{{ duel_output.stderr }}"
     dest: "{{ project_dir }}/duel_output.log"
     mode: '0644'
+
+- name: Run WatDiv real-data correctness + perf comparison
+  shell: |
+    . $HOME/.cargo/env
+    ./watdiv_correctness.sh 10
+  args:
+    chdir: "{{ project_dir }}"
+    executable: /bin/bash
+  environment:
+    PATH: "{{ ansible_env.PATH }}:/root/.cargo/bin:/root/.local/bin"
+  register: watdiv_output
+  timeout: 3600
+  ignore_errors: yes
+
+- name: Save WatDiv correctness output to log file
+  copy:
+    content: "{{ watdiv_output.stdout | default('') }}\n\n=== STDERR ===\n{{ watdiv_output.stderr | default('') }}"
+    dest: "{{ project_dir }}/watdiv_correctness.log"
+    mode: '0644'
