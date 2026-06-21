@@ -16,6 +16,7 @@ Klassifikation: IDENTICAL / ROWCOUNT_DIFF / BINDING_DIFF / RUST_ERR / TENTRIS_ER
 Mit --perf wird zusätzlich die Warm-Median-Latenz beider Seiten gemessen.
 """
 
+import argparse
 import http.client
 import json
 import statistics
@@ -166,52 +167,151 @@ def compare(query: str, rust, tentris, rust_raw: bytes, tentris_raw: bytes):
     return kind, detail
 
 
-def warm_median_ms(url: str, query: str, runs: int) -> float:
+def latencies(url: str, query: str, runs: int):
     lat = []
     for _ in range(runs):
         t0 = time.perf_counter()
         http_get_sparql(url, query)
         lat.append((time.perf_counter() - t0) * 1000)
-    return statistics.median(lat)
+    lat.sort()
+    median = statistics.median(lat)
+    p95 = lat[max(0, int(len(lat) * 0.95) - 1)]
+    return median, p95
+
+
+def http_post(url: str, data: str, ctype: str):
+    parts = urlsplit(url)
+    conn = http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=300)
+    conn.request("POST", parts.path, body=data.encode("utf-8"), headers={"Content-Type": ctype})
+    resp = conn.getresponse()
+    body = resp.read()
+    conn.close()
+    return resp.status, body
+
+
+def build_update(verb: str, k: int, base: int = 90_000_000) -> str:
+    ns = "http://bench.local/"
+    lines = [f"<{ns}e{base + i}> <{ns}p> <{ns}e{base + i + 1}> ." for i in range(k)]
+    return f"{verb} {{ " + "\n".join(lines) + " }"
+
+
+def read_proc_status(pid):
+    """VmHWM (Peak) und VmRSS in KB aus /proc/<pid>/status (Linux)."""
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            text = f.read()
+    except OSError:
+        return None
+    out = {}
+    for line in text.splitlines():
+        if line.startswith("VmHWM:"):
+            out["peak_kb"] = int(line.split()[1])
+        elif line.startswith("VmRSS:"):
+            out["rss_kb"] = int(line.split()[1])
+    return out or None
+
+
+def dir_size(path: str) -> int:
+    p = Path(path)
+    if not p.exists():
+        return 0
+    if p.is_file():
+        return p.stat().st_size
+    return sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+
+
+def fmt(v, unit, prec=2):
+    return "n/a" if v is None else f"{v:.{prec}f} {unit}"
 
 
 def main():
-    if len(sys.argv) < 4:
-        print("usage: correctness_duel.py <rust_url> <tentris_url> <query_dir> [--perf N]")
-        sys.exit(1)
-    rust_url, tentris_url, query_dir = sys.argv[1], sys.argv[2], sys.argv[3]
-    perf_runs = 0
-    if "--perf" in sys.argv:
-        perf_runs = int(sys.argv[sys.argv.index("--perf") + 1])
+    ap = argparse.ArgumentParser()
+    ap.add_argument("rust_url")
+    ap.add_argument("tentris_url")
+    ap.add_argument("query_dir")
+    ap.add_argument("--perf", type=int, default=0, help="Warm-Durchläufe je Query (Median/p95)")
+    ap.add_argument("--update", type=int, default=0, help="Triples für Update-Throughput")
+    ap.add_argument("--triples", type=int, default=0, help="Datensatzgröße (für Bytes/Triple)")
+    ap.add_argument("--rust-pid", type=int)
+    ap.add_argument("--tentris-pid", type=int)
+    ap.add_argument("--rust-disk")
+    ap.add_argument("--tentris-disk")
+    ap.add_argument("--ingest-rust", type=float, help="Rust Loader+Startup in ms")
+    ap.add_argument("--ingest-tentris", type=float, help="Tentris Loader+Startup in ms")
+    args = ap.parse_args()
 
-    queries = sorted(Path(query_dir).glob("*.rq")) + sorted(Path(query_dir).glob("*.sparql"))
+    queries = sorted(Path(args.query_dir).glob("*.rq")) + sorted(Path(args.query_dir).glob("*.sparql"))
     if not queries:
-        print(f"Keine Queries in {query_dir}")
+        print(f"Keine Queries in {args.query_dir}")
         sys.exit(1)
 
+    # --- Ingest / Startup ---
+    if args.ingest_rust is not None or args.ingest_tentris is not None:
+        print("### Ingest / Startup (echte Daten)")
+        ir, it = args.ingest_rust, args.ingest_tentris
+        winner = "—"
+        if ir and it:
+            winner = f"Rust {it/ir:.1f}x" if ir < it else f"Tentris {ir/it:.1f}x"
+        print(f"  Rust {fmt(ir,'ms',0)} | Tentris {fmt(it,'ms',0)} | {winner}\n")
+
+    # --- Korrektheit + Latenz ---
+    print("### Korrektheit + Latenz")
+    print(f"{'Query':<22} {'Status':<14} {'Rows':>7}  {'Rust med/p95':>16}  {'Tentris med/p95':>16}")
+    print("-" * 92)
     counts = Counter()
-    print(f"{'Query':<24} {'Status':<14} Detail")
-    print("-" * 100)
     for qf in queries:
         query = qf.read_text()
-        _, rust, rust_raw = http_get_sparql(rust_url, query)
-        _, tentris, tentris_raw = http_get_sparql(tentris_url, query)
+        _, rust, rust_raw = http_get_sparql(args.rust_url, query)
+        _, tentris, tentris_raw = http_get_sparql(args.tentris_url, query)
         status, detail = compare(query, rust, tentris, rust_raw, tentris_raw)
         counts[status] += 1
-        perf = ""
-        if perf_runs and status == "IDENTICAL":
-            rm = warm_median_ms(rust_url, query, perf_runs)
-            tm = warm_median_ms(tentris_url, query, perf_runs)
-            perf = f"  [rust {rm:.2f} ms | tentris {tm:.2f} ms]"
-        print(f"{qf.name:<24} {status:<14} {detail}{perf}")
-
-    print("-" * 100)
+        rows = ""
+        m = detail.split()[0] if detail and detail[0].isdigit() else ""
+        rows = m
+        lat = ""
+        if args.perf:
+            rmed, rp95 = latencies(args.rust_url, query, args.perf)
+            tmed, tp95 = latencies(args.tentris_url, query, args.perf)
+            lat = f"  {rmed:6.2f}/{rp95:6.2f} ms   {tmed:6.2f}/{tp95:6.2f} ms"
+        extra = "" if status == "IDENTICAL" else f"  <- {detail}"
+        print(f"{qf.name:<22} {status:<14} {rows:>7}{lat}{extra}")
     total = sum(counts.values())
     ident = counts.get("IDENTICAL", 0)
-    print(f"\nSUMMARY: {ident}/{total} IDENTICAL")
-    for k, v in sorted(counts.items()):
-        print(f"  {k}: {v}")
-    # Exit-Code != 0, wenn nicht alles identisch (für CI/Skripte).
+    print("-" * 92)
+    print(f"Korrektheit: {ident}/{total} IDENTICAL  " + " ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+
+    # --- Update-Throughput (durabel) ---
+    if args.update:
+        print("\n### Update-Throughput (durabel)")
+        k = args.update
+        for label, url in (("Rust", args.rust_url), ("Tentris", args.tentris_url)):
+            upd_url = url.replace("/sparql", "/update")
+            t0 = time.perf_counter()
+            st, _ = http_post(upd_url, build_update("INSERT DATA", k), "application/sparql-update")
+            ins = k / (time.perf_counter() - t0) if st in (200, 204) else None
+            t0 = time.perf_counter()
+            st, _ = http_post(upd_url, build_update("DELETE DATA", k), "application/sparql-update")
+            dele = k / (time.perf_counter() - t0) if st in (200, 204) else None
+            print(f"  {label:<8} INSERT {fmt(ins,'/s',0)} | DELETE {fmt(dele,'/s',0)}")
+
+    # --- Memory-Footprint ---
+    if args.rust_pid or args.tentris_pid:
+        print("\n### Memory-Footprint (echte Daten)")
+        rm = read_proc_status(args.rust_pid) if args.rust_pid else None
+        tm = read_proc_status(args.tentris_pid) if args.tentris_pid else None
+        mb = lambda kb: None if kb is None else kb / 1024
+        r_rss = rm.get("rss_kb") if rm else None
+        t_rss = tm.get("rss_kb") if tm else None
+        print(f"  Peak-RSS:  Rust {fmt(mb(rm.get('peak_kb') if rm else None),'MB')} | Tentris {fmt(mb(tm.get('peak_kb') if tm else None),'MB')}")
+        print(f"  RSS:       Rust {fmt(mb(r_rss),'MB')} | Tentris {fmt(mb(t_rss),'MB')}")
+        if args.rust_disk or args.tentris_disk:
+            rd = dir_size(args.rust_disk) / 1024 / 1024 if args.rust_disk else None
+            td = dir_size(args.tentris_disk) / 1024 / 1024 if args.tentris_disk else None
+            print(f"  Disk:      Rust {fmt(rd,'MB')} (Snapshot) | Tentris {fmt(td,'MB')} (metall)")
+        if args.triples and (r_rss or t_rss):
+            bpt = lambda kb: None if kb is None else kb * 1024 / args.triples
+            print(f"  Bytes/Triple (RSS): Rust {fmt(bpt(r_rss),'B',1)} | Tentris {fmt(bpt(t_rss),'B',1)}")
+
     sys.exit(0 if ident == total else 2)
 
 

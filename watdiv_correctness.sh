@@ -40,14 +40,21 @@ log "Datensatz: $(wc -l < "${NT}") Tripel (echte WatDiv-Daten)"
 # --- 3. Reale BGP-Queries aus den Daten erzeugen ----------------------------
 python3 "${ROOT}/watdiv_queries.py" "${NT}" "${QDIR}"
 
-# --- 4. Rust-Clone: Snapshot bauen + Server starten -------------------------
+now_ms() { date +%s%3N; }
+wait_port() { for _ in $(seq 1 300); do (echo > "/dev/tcp/localhost/$1") 2>/dev/null && return 0; sleep 1; done; return 1; }
+TRIPLES="$(wc -l < "${NT}" | tr -d ' ')"
+
+# --- 4. Rust-Clone: Loader (build+persist) + mmap-Server (gemessen) ---------
 log "Baue Rust-Server + Snapshot..."
 ( cd "${ROOT}" && cargo build --release --bin server >/dev/null 2>&1 )
+R_T0=$(now_ms)
 "${ROOT}/target/release/server" build "${NT}" "${SNAP}" >/dev/null
 "${ROOT}/target/release/server" load "${SNAP}" "${RUST_PORT}" >/tmp/rust_srv.log 2>&1 &
 RUST_PID=$!
+wait_port "${RUST_PORT}" || { log "Rust-Server nicht bereit"; kill "${RUST_PID}" 2>/dev/null || true; exit 1; }
+RUST_INGEST_MS=$(( $(now_ms) - R_T0 ))
 
-# --- 5. Tentris: laden + Server starten -------------------------------------
+# --- 5. Tentris: Loader + Server (gemessen) ---------------------------------
 LOADER="$(find "${ROOT}/third_party/tentris/build" -name tentris_loader -type f | head -1)"
 SERVER="$(find "${ROOT}/third_party/tentris/build" -name tentris_server -type f | head -1)"
 if [ -z "${LOADER}" ] || [ -z "${SERVER}" ]; then
@@ -57,26 +64,24 @@ if [ -z "${LOADER}" ] || [ -z "${SERVER}" ]; then
 fi
 log "Tentris-Ingest..."
 rm -rf "${TDATA}"; mkdir -p "${TDATA}"
+T_T0=$(now_ms)
 "${LOADER}" -f "${NT}" -s "${TDATA}" >/tmp/tentris_load.log 2>&1
 "${SERVER}" -s "${TDATA}" -p "${TENTRIS_PORT}" >/tmp/tentris_srv.log 2>&1 &
 TENTRIS_PID=$!
+wait_port "${TENTRIS_PORT}" || { log "Tentris-Server nicht bereit"; exit 1; }
+TENTRIS_INGEST_MS=$(( $(now_ms) - T_T0 ))
 
 cleanup() { kill "${RUST_PID}" "${TENTRIS_PID}" 2>/dev/null || true; }
 trap cleanup EXIT
 
-# --- 6. Auf beide Ports warten ----------------------------------------------
-for port in "${RUST_PORT}" "${TENTRIS_PORT}"; do
-    for _ in $(seq 1 180); do
-        if (echo > "/dev/tcp/localhost/${port}") 2>/dev/null; then break; fi
-        sleep 1
-    done
-done
-
-# --- 7. Korrektheit + Performance vergleichen -------------------------------
-log "Vergleiche Binding-Mengen (Rust :${RUST_PORT} vs Tentris :${TENTRIS_PORT})..."
-# Der Vergleich ist ein Report (kein Gate) -> Exit-Code nicht propagieren,
-# damit die Ansible-Task nicht fälschlich als "failed" markiert wird.
+# --- 6. Vollständiger Vergleich: Korrektheit + Latenz + Updates + Memory ----
+log "Vergleiche (Korrektheit + Latenz + Updates + Footprint)..."
+# Report, kein Gate -> Exit-Code nicht propagieren.
 python3 "${ROOT}/correctness_duel.py" \
     "http://localhost:${RUST_PORT}/sparql" \
     "http://localhost:${TENTRIS_PORT}/sparql" \
-    "${QDIR}" --perf 50 || true
+    "${QDIR}" \
+    --perf 50 --update 20000 --triples "${TRIPLES}" \
+    --rust-pid "${RUST_PID}" --tentris-pid "${TENTRIS_PID}" \
+    --rust-disk "${SNAP}" --tentris-disk "${TDATA}" \
+    --ingest-rust "${RUST_INGEST_MS}" --ingest-tentris "${TENTRIS_INGEST_MS}" || true
