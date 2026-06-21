@@ -1,6 +1,6 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::executor::{execute_plan, execute_wcoj, RowBlock};
+use super::executor::{RowBlock, execute_plan, execute_wcoj};
 use super::planner::GraphPattern;
 use super::query::TripleStore;
 
@@ -51,12 +51,8 @@ fn has_cycle(pattern: &GraphPattern) -> bool {
         // Clique zwischen allen Variablen im Muster
         for (i, v1) in vars.iter().enumerate() {
             for v2 in vars.iter().skip(i + 1) {
-                adj.entry((*v1).clone())
-                    .or_default()
-                    .push((*v2).clone());
-                adj.entry((*v2).clone())
-                    .or_default()
-                    .push((*v1).clone());
+                adj.entry((*v1).clone()).or_default().push((*v2).clone());
+                adj.entry((*v2).clone()).or_default().push((*v1).clone());
             }
         }
     }
@@ -64,10 +60,8 @@ fn has_cycle(pattern: &GraphPattern) -> bool {
     let mut visited: FxHashSet<String> = FxHashSet::default();
 
     for start in adj.keys() {
-        if !visited.contains(start) {
-            if dfs_cycle(start, None, &adj, &mut visited) {
-                return true;
-            }
+        if !visited.contains(start) && dfs_cycle(start, None, &adj, &mut visited) {
+            return true;
         }
     }
 

@@ -4,7 +4,7 @@ use rustc_hash::FxHashMap;
 
 use super::dictionary::{Dictionary, TermType};
 use super::export::ParsedTriple;
-use super::index::{intersect_sorted, FlatCsr, LayeredIndex, U32Arena};
+use super::index::{FlatCsr, LayeredIndex, U32Arena, intersect_sorted};
 use super::stats::CardEstimator;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,9 +75,15 @@ impl TripleStore {
     pub fn ingest(&mut self, triples: &[ParsedTriple]) {
         let mut id_triples = Vec::with_capacity(triples.len());
         for t in triples {
-            let sid = self.dict.insert_with_type(&t.subject.value, t.subject.typ.clone());
-            let pid = self.dict.insert_with_type(&t.predicate.value, t.predicate.typ.clone());
-            let oid = self.dict.insert_with_type(&t.object.value, t.object.typ.clone());
+            let sid = self
+                .dict
+                .insert_with_type(&t.subject.value, t.subject.typ.clone());
+            let pid = self
+                .dict
+                .insert_with_type(&t.predicate.value, t.predicate.typ.clone());
+            let oid = self
+                .dict
+                .insert_with_type(&t.object.value, t.object.typ.clone());
             id_triples.push((sid, pid, oid));
         }
         self.build_indexes(id_triples);
@@ -88,9 +94,15 @@ impl TripleStore {
     pub fn ingest_owned(&mut self, triples: Vec<ParsedTriple>) {
         let mut id_triples = Vec::with_capacity(triples.len());
         for t in &triples {
-            let sid = self.dict.insert_with_type(&t.subject.value, t.subject.typ.clone());
-            let pid = self.dict.insert_with_type(&t.predicate.value, t.predicate.typ.clone());
-            let oid = self.dict.insert_with_type(&t.object.value, t.object.typ.clone());
+            let sid = self
+                .dict
+                .insert_with_type(&t.subject.value, t.subject.typ.clone());
+            let pid = self
+                .dict
+                .insert_with_type(&t.predicate.value, t.predicate.typ.clone());
+            let oid = self
+                .dict
+                .insert_with_type(&t.object.value, t.object.typ.clone());
             id_triples.push((sid, pid, oid));
         }
         drop(triples); // Parse-Puffer (Strings) freigeben
@@ -116,7 +128,9 @@ impl TripleStore {
             }
             if let Some(t) = super::export::parse_triple_line(line) {
                 let sid = self.dict.insert_with_type(&t.subject.value, t.subject.typ);
-                let pid = self.dict.insert_with_type(&t.predicate.value, t.predicate.typ);
+                let pid = self
+                    .dict
+                    .insert_with_type(&t.predicate.value, t.predicate.typ);
                 let oid = self.dict.insert_with_type(&t.object.value, t.object.typ);
                 id_triples.push((sid, pid, oid));
             }
@@ -199,22 +213,22 @@ impl TripleStore {
 
             // s verliert seinen Eintrag in pred_subjects[p] nur, wenn (s,p)
             // kein Objekt mehr hat.
-            if self.spo.query_two(s, p).is_empty() {
-                if let Some(subs) = self.pred_subjects.get_mut(&p) {
-                    sorted_remove(subs, s);
-                    if subs.is_empty() {
-                        self.pred_subjects.remove(&p);
-                    }
+            if self.spo.query_two(s, p).is_empty()
+                && let Some(subs) = self.pred_subjects.get_mut(&p)
+            {
+                sorted_remove(subs, s);
+                if subs.is_empty() {
+                    self.pred_subjects.remove(&p);
                 }
             }
             // o verliert seinen Eintrag in pred_objects[p] nur, wenn (p,o)
             // kein Subjekt mehr hat.
-            if self.pos.query_two(p, o).is_empty() {
-                if let Some(objs) = self.pred_objects.get_mut(&p) {
-                    sorted_remove(objs, o);
-                    if objs.is_empty() {
-                        self.pred_objects.remove(&p);
-                    }
+            if self.pos.query_two(p, o).is_empty()
+                && let Some(objs) = self.pred_objects.get_mut(&p)
+            {
+                sorted_remove(objs, o);
+                if objs.is_empty() {
+                    self.pred_objects.remove(&p);
                 }
             }
         }
@@ -359,9 +373,16 @@ impl TripleStore {
             .values()
             .map(|v| v.len() * 4)
             .sum::<usize>()
-            + self.pred_objects.values().map(|v| v.len() * 4).sum::<usize>();
+            + self
+                .pred_objects
+                .values()
+                .map(|v| v.len() * 4)
+                .sum::<usize>();
         let total = perm + dict + pred;
-        println!("=== Memory-Report (logisch, {} Triples) ===", self.triple_count());
+        println!(
+            "=== Memory-Report (logisch, {} Triples) ===",
+            self.triple_count()
+        );
         println!("  3 Permutationen (SPO/POS/OSP): {:.1} MB", mb(perm));
         println!("  Dictionary (interniert + Typen):  {:.1} MB", mb(dict));
         println!("  Prädikat-Listen:                 {:.1} MB", mb(pred));
@@ -406,7 +427,7 @@ impl TripleStore {
         for a in &arrays {
             buf.extend_from_slice(&(a.len() as u32).to_le_bytes());
         }
-        while buf.len() % 8 != 0 {
+        while !buf.len().is_multiple_of(8) {
             buf.push(0);
         }
         let arrays_off = buf.len() as u64;
@@ -718,11 +739,18 @@ mod tests {
             "http://example.org/bob",
         )]);
         // Ein Literal mit Sprach-Tag und eines mit Datentyp einfügen.
-        let s = store.dict.insert_with_type("http://example.org/alice", super::super::dictionary::TermType::Iri);
-        let name = store.dict.insert_with_type("http://example.org/name", super::super::dictionary::TermType::Iri);
-        let lit = store
-            .dict
-            .insert_with_type("Alice", super::super::dictionary::TermType::literal_lang("en"));
+        let s = store.dict.insert_with_type(
+            "http://example.org/alice",
+            super::super::dictionary::TermType::Iri,
+        );
+        let name = store.dict.insert_with_type(
+            "http://example.org/name",
+            super::super::dictionary::TermType::Iri,
+        );
+        let lit = store.dict.insert_with_type(
+            "Alice",
+            super::super::dictionary::TermType::literal_lang("en"),
+        );
         store.insert_triple(s, name, lit);
 
         let path = std::env::temp_dir().join("trillian_roundtrip.nt");
@@ -747,16 +775,29 @@ mod tests {
     fn snapshot_mmap_roundtrip() {
         let mut store = TripleStore::new();
         store.ingest_str_triples(&[
-            ("http://example.org/a", "http://example.org/p", "http://example.org/b"),
-            ("http://example.org/a", "http://example.org/p", "http://example.org/c"),
-            ("http://example.org/b", "http://example.org/q", "http://example.org/c"),
+            (
+                "http://example.org/a",
+                "http://example.org/p",
+                "http://example.org/b",
+            ),
+            (
+                "http://example.org/a",
+                "http://example.org/p",
+                "http://example.org/c",
+            ),
+            (
+                "http://example.org/b",
+                "http://example.org/q",
+                "http://example.org/c",
+            ),
         ]);
         // ein typisiertes Literal mit aufnehmen
         let s = store.dict.insert("http://example.org/a");
         let name = store.dict.insert("http://example.org/name");
-        let lit = store
-            .dict
-            .insert_with_type("Alice", super::super::dictionary::TermType::literal_lang("en"));
+        let lit = store.dict.insert_with_type(
+            "Alice",
+            super::super::dictionary::TermType::literal_lang("en"),
+        );
         store.insert_triple(s, name, lit);
 
         let path = std::env::temp_dir().join("trillian_snapshot.bin");
@@ -769,7 +810,8 @@ mod tests {
         // Query über den gemappten Index
         let p = loaded.dict.lookup("http://example.org/p").unwrap();
         let a = loaded.dict.lookup("http://example.org/a").unwrap();
-        if let QueryResult::Single(Var::O, objs) = loaded.query(Term::Bound(a), Term::Bound(p), Term::Wildcard)
+        if let QueryResult::Single(Var::O, objs) =
+            loaded.query(Term::Bound(a), Term::Bound(p), Term::Wildcard)
         {
             assert_eq!(objs.len(), 2); // b, c
         } else {

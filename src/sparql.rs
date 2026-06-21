@@ -1,17 +1,19 @@
 use std::sync::{Arc, Mutex, RwLock};
 
-use axum::body::{Bytes, Body};
+use axum::Router;
+use axum::body::{Body, Bytes};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::Router;
 use lru::LruCache;
-use serde_json::{json, Map, Value};
-use tokio_stream::wrappers::ReceiverStream;
+use serde_json::{Map, Value, json};
 use spargebra::algebra::{Expression, Function, PropertyPathExpression as Ppe};
-use spargebra::term::{GroundQuad, GroundTerm, Literal, NamedNode, NamedOrBlankNode, Quad, Term as SparqlTerm};
+use spargebra::term::{
+    GroundQuad, GroundTerm, Literal, NamedNode, NamedOrBlankNode, Quad, Term as SparqlTerm,
+};
 use spargebra::{Query as SparqlQuery, SparqlParser};
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::hypertrie::{
     Dictionary, GraphPattern, HybridEngine, PatternTerm, RowBlock, TermType, TriplePattern,
@@ -97,15 +99,18 @@ pub async fn sparql_handler(
 ) -> Response {
     let query_str = normalize_query(params.query, body);
     if query_str.is_empty() {
-        return sparql_error("Missing query parameter or empty body", StatusCode::BAD_REQUEST);
+        return sparql_error(
+            "Missing query parameter or empty body",
+            StatusCode::BAD_REQUEST,
+        );
     }
 
     // Cache-Lookup (fertiger JSON-Body).
     {
-        if let Ok(cache) = state.cache.lock() {
-            if let Some(body) = cache.peek(&query_str) {
-                return json_response(body.clone());
-            }
+        if let Ok(cache) = state.cache.lock()
+            && let Some(body) = cache.peek(&query_str)
+        {
+            return json_response(body.clone());
         }
     }
 
@@ -128,7 +133,10 @@ pub async fn stream_handler(
 ) -> Response {
     let query_str = normalize_query(params.query, body);
     if query_str.is_empty() {
-        return sparql_error("Missing query parameter or empty body", StatusCode::BAD_REQUEST);
+        return sparql_error(
+            "Missing query parameter or empty body",
+            StatusCode::BAD_REQUEST,
+        );
     }
 
     // Stream materialisiert die Ergebnisse intern, sendet sie aber als NDJSON
@@ -138,7 +146,7 @@ pub async fn stream_handler(
 
     tokio::task::spawn_blocking(move || {
         let store = state.store.read().unwrap();
-        let result = evaluate_select(&*store, &state.engine, &query_str);
+        let result = evaluate_select(&store, &state.engine, &query_str);
         match result {
             Ok(select) => {
                 let var_order = select.var_order;
@@ -192,7 +200,10 @@ pub async fn count_handler(
 ) -> Response {
     let query_str = normalize_query(params.query, body);
     if query_str.is_empty() {
-        return sparql_error("Missing query parameter or empty body", StatusCode::BAD_REQUEST);
+        return sparql_error(
+            "Missing query parameter or empty body",
+            StatusCode::BAD_REQUEST,
+        );
     }
 
     let store = state.store.read().unwrap();
@@ -214,7 +225,10 @@ pub async fn update_handler(
         .unwrap_or_else(|| body.trim().to_string());
 
     if update_str.is_empty() {
-        return sparql_error("Missing update parameter or empty body", StatusCode::BAD_REQUEST);
+        return sparql_error(
+            "Missing update parameter or empty body",
+            StatusCode::BAD_REQUEST,
+        );
     }
 
     let mut store = state.store.write().unwrap();
@@ -223,13 +237,13 @@ pub async fn update_handler(
     match execute_update(&mut store, &update_str, wal_guard.as_deref_mut()) {
         Ok(()) => {
             // Write-Ahead-Log auf Platte zwingen, BEVOR wir Erfolg melden.
-            if let Some(w) = wal_guard.as_deref_mut() {
-                if let Err(e) = w.sync() {
-                    return sparql_error(
-                        &format!("Update applied but WAL sync failed: {}", e),
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                    );
-                }
+            if let Some(w) = wal_guard.as_deref_mut()
+                && let Err(e) = w.sync()
+            {
+                return sparql_error(
+                    &format!("Update applied but WAL sync failed: {}", e),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                );
             }
             drop(wal_guard);
             drop(store);
@@ -347,7 +361,10 @@ fn execute_sparql(
             // ASK über den vollen WHERE-Pfad (inkl. OPTIONAL/FILTER/UNION) -> ≥1 Lösung?
             let m = peel_modifiers(&pattern);
             let result = evaluate_select_with_modifiers(store, engine, &m)?;
-            Ok(format!("{{\"head\":{{}},\"boolean\":{}}}", result.rows.n_rows() > 0))
+            Ok(format!(
+                "{{\"head\":{{}},\"boolean\":{}}}",
+                result.rows.n_rows() > 0
+            ))
         }
         _ => Err("Only SELECT and ASK queries are supported".to_string()),
     }
@@ -383,7 +400,11 @@ fn peel_modifiers(pattern: &spargebra::algebra::GraphPattern) -> Modifiers<'_> {
                 distinct = true;
                 cur = inner;
             }
-            GP::Slice { inner, start, length } => {
+            GP::Slice {
+                inner,
+                start,
+                length,
+            } => {
                 offset = Some(*start);
                 limit = *length;
                 cur = inner;
@@ -400,7 +421,14 @@ fn peel_modifiers(pattern: &spargebra::algebra::GraphPattern) -> Modifiers<'_> {
             _ => break,
         }
     }
-    Modifiers { where_pat: cur, projection, distinct, order_by, limit, offset }
+    Modifiers {
+        where_pat: cur,
+        projection,
+        distinct,
+        order_by,
+        limit,
+        offset,
+    }
 }
 
 /// Wertet ein WHERE-Pattern rekursiv aus: BGP, FILTER, OPTIONAL (LeftJoin),
@@ -443,9 +471,9 @@ fn eval_where(
             path,
             object,
         } => eval_path(store, subject, path, object),
-        _ => Err(
-            "Unsupported WHERE pattern (only BGP/FILTER/OPTIONAL/UNION/Join/Path)".to_string(),
-        ),
+        _ => {
+            Err("Unsupported WHERE pattern (only BGP/FILTER/OPTIONAL/UNION/Join/Path)".to_string())
+        }
     }
 }
 
@@ -504,8 +532,10 @@ fn step_forward(store: &TripleStore, path: &Ppe, from: &FxHashSet<u32>) -> FxHas
             out.extend(step_forward(store, e, from));
         }
         Ppe::NegatedPropertySet(nns) => {
-            let exclude: FxHashSet<u32> =
-                nns.iter().filter_map(|n| store.dict.lookup(n.as_str())).collect();
+            let exclude: FxHashSet<u32> = nns
+                .iter()
+                .filter_map(|n| store.dict.lookup(n.as_str()))
+                .collect();
             for &s in from {
                 for (pid, o) in store.po_pairs_of(s) {
                     if !exclude.contains(&pid) {
@@ -546,8 +576,10 @@ fn step_backward(store: &TripleStore, path: &Ppe, from: &FxHashSet<u32>) -> FxHa
             out.extend(step_backward(store, e, from));
         }
         Ppe::NegatedPropertySet(nns) => {
-            let exclude: FxHashSet<u32> =
-                nns.iter().filter_map(|n| store.dict.lookup(n.as_str())).collect();
+            let exclude: FxHashSet<u32> = nns
+                .iter()
+                .filter_map(|n| store.dict.lookup(n.as_str()))
+                .collect();
             for &o in from {
                 for (pid, s) in store.sp_pairs_of(o) {
                     if !exclude.contains(&pid) {
@@ -569,7 +601,11 @@ fn closure(
     reflexive: bool,
     forward: bool,
 ) -> FxHashSet<u32> {
-    let mut result: FxHashSet<u32> = if reflexive { from.clone() } else { FxHashSet::default() };
+    let mut result: FxHashSet<u32> = if reflexive {
+        from.clone()
+    } else {
+        FxHashSet::default()
+    };
     let mut frontier: FxHashSet<u32> = from.clone();
     loop {
         let next = if forward {
@@ -614,10 +650,10 @@ fn eval_path(
         if let Some(v) = &s_var {
             vo.push(v.clone());
         }
-        if let Some(v) = &o_var {
-            if Some(v) != s_var.as_ref() {
-                vo.push(v.clone());
-            }
+        if let Some(v) = &o_var
+            && Some(v) != s_var.as_ref()
+        {
+            vo.push(v.clone());
         }
         return Ok((RowBlock::new(vo.len()), vo));
     }
@@ -853,7 +889,12 @@ fn sort_rows(
 ) {
     let n = rows.n_rows();
     let keys: Vec<Vec<OrderKey>> = (0..n)
-        .map(|i| order_by.iter().map(|(e, _)| order_key(e, rows.row(i), vo, store)).collect())
+        .map(|i| {
+            order_by
+                .iter()
+                .map(|(e, _)| order_key(e, rows.row(i), vo, store))
+                .collect()
+        })
         .collect();
     let mut idx: Vec<usize> = (0..n).collect();
     idx.sort_by(|&a, &b| {
@@ -899,7 +940,10 @@ fn evaluate_select_with_modifiers(
         match var_order.iter().position(|v| v == var) {
             Some(pos) => var_indices.push(pos),
             None => {
-                return Err(format!("SELECT variable ?{} does not appear in pattern", var))
+                return Err(format!(
+                    "SELECT variable ?{} does not appear in pattern",
+                    var
+                ));
             }
         }
     }
@@ -916,7 +960,11 @@ fn evaluate_select_with_modifiers(
     }
     rows.apply_offset_limit(m.offset.unwrap_or(0), m.limit);
 
-    Ok(SelectResult { vars, rows, var_order })
+    Ok(SelectResult {
+        vars,
+        rows,
+        var_order,
+    })
 }
 
 fn variables_in_bgp(bgp: &[spargebra::term::TriplePattern]) -> Vec<String> {
@@ -955,7 +1003,6 @@ fn term_pattern_variables(tp: &spargebra::term::TermPattern) -> Vec<String> {
         _ => Vec::new(),
     }
 }
-
 
 /// Hängt einen JSON-String-Literal (mit Escaping) an den Puffer an.
 fn append_json_str(out: &mut String, s: &str) {
@@ -1117,9 +1164,11 @@ fn execute_update(
             spargebra::GraphUpdateOperation::DeleteData { data } => {
                 for quad in data {
                     let (s, p, o) = ground_quad_to_triple_terms(&quad)?;
-                    if let (Some(sid), Some(pid), Some(oid)) =
-                        (store.dict.lookup(&s.value), store.dict.lookup(&p.value), store.dict.lookup(&o.value))
-                    {
+                    if let (Some(sid), Some(pid), Some(oid)) = (
+                        store.dict.lookup(&s.value),
+                        store.dict.lookup(&p.value),
+                        store.dict.lookup(&o.value),
+                    ) {
                         if let Some(w) = wal.as_deref_mut() {
                             w.log_op(false, sid, pid, oid).map_err(|e| e.to_string())?;
                         }
@@ -1144,15 +1193,17 @@ fn insert_term_logged(
 ) -> Result<u32, String> {
     let before = store.dict.len();
     let id = store.dict.insert_with_type(&t.value, t.typ.clone());
-    if store.dict.len() > before {
-        if let Some(w) = wal {
-            w.log_term(&t.value, &t.typ).map_err(|e| e.to_string())?;
-        }
+    if store.dict.len() > before
+        && let Some(w) = wal
+    {
+        w.log_term(&t.value, &t.typ).map_err(|e| e.to_string())?;
     }
     Ok(id)
 }
 
-fn quad_to_triple_terms(quad: &Quad) -> Result<(ParsedTermRdf, ParsedTermRdf, ParsedTermRdf), String> {
+fn quad_to_triple_terms(
+    quad: &Quad,
+) -> Result<(ParsedTermRdf, ParsedTermRdf, ParsedTermRdf), String> {
     let s = named_or_blank_node_to_parsed(&quad.subject)?;
     let p = named_node_to_parsed(&quad.predicate);
     let o = sparql_term_to_parsed(&quad.object)?;
@@ -1176,7 +1227,9 @@ struct ParsedTermRdf {
 fn named_or_blank_node_to_parsed(node: &NamedOrBlankNode) -> Result<ParsedTermRdf, String> {
     match node {
         NamedOrBlankNode::NamedNode(nn) => Ok(named_node_to_parsed(nn)),
-        NamedOrBlankNode::BlankNode(_) => Err("Blank nodes in updates are not supported".to_string()),
+        NamedOrBlankNode::BlankNode(_) => {
+            Err("Blank nodes in updates are not supported".to_string())
+        }
     }
 }
 
@@ -1226,20 +1279,32 @@ const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
 #[derive(Debug, Clone)]
 enum Fv {
     Iri(String),
-    Str(String),          // einfaches Literal / xsd:string
-    Num(f64),             // numerischer Datentyp
+    Str(String), // einfaches Literal / xsd:string
+    Num(f64),    // numerischer Datentyp
     Bool(bool),
-    Lang(String, String), // (Lexikal, Sprach-Tag)
-    Typed(String, String),// (Lexikal, Datatype-IRI) – nicht numerisch/string
+    Lang(String, String),  // (Lexikal, Sprach-Tag)
+    Typed(String, String), // (Lexikal, Datatype-IRI) – nicht numerisch/string
 }
 
 fn is_numeric_dt(dt: &str) -> bool {
     matches!(
         dt.strip_prefix(XSD),
         Some(
-            "integer" | "decimal" | "double" | "float" | "int" | "long" | "short"
-                | "byte" | "nonNegativeInteger" | "positiveInteger" | "nonPositiveInteger"
-                | "negativeInteger" | "unsignedInt" | "unsignedLong" | "unsignedShort"
+            "integer"
+                | "decimal"
+                | "double"
+                | "float"
+                | "int"
+                | "long"
+                | "short"
+                | "byte"
+                | "nonNegativeInteger"
+                | "positiveInteger"
+                | "nonPositiveInteger"
+                | "negativeInteger"
+                | "unsignedInt"
+                | "unsignedLong"
+                | "unsignedShort"
                 | "unsignedByte"
         )
     )
@@ -1265,7 +1330,9 @@ fn term_to_fv(id: u32, store: &TripleStore) -> Option<Fv> {
     let v = store.dict.resolve(id)?;
     match store.dict.resolve_type(id)? {
         TermType::Iri | TermType::BlankNode => Some(Fv::Iri(v.to_string())),
-        TermType::Literal { datatype, lang } => Some(classify(v, datatype.as_deref(), lang.as_deref())),
+        TermType::Literal { datatype, lang } => {
+            Some(classify(v, datatype.as_deref(), lang.as_deref()))
+        }
     }
 }
 
@@ -1283,7 +1350,7 @@ fn as_num(fv: &Fv) -> Option<f64> {
 }
 
 /// Lexikalischer Vergleichs-String (für =/< auf Strings).
-fn as_str<'a>(fv: &'a Fv) -> Option<&'a str> {
+fn as_str(fv: &Fv) -> Option<&str> {
     match fv {
         Fv::Str(s) | Fv::Lang(s, _) | Fv::Typed(s, _) => Some(s),
         Fv::Iri(s) => Some(s),
@@ -1360,10 +1427,16 @@ fn eval(expr: &Expression, row: &[u32], vars: &[String], store: &TripleStore) ->
             let (x, y) = (eval(a, row, vars, store)?, eval(b, row, vars, store)?);
             Ok(Fv::Bool(fv_equal(&x, &y).unwrap_or(false)))
         }
-        Expression::Greater(a, b) => cmp_op(a, b, row, vars, store, |o| o == std::cmp::Ordering::Greater),
-        Expression::GreaterOrEqual(a, b) => cmp_op(a, b, row, vars, store, |o| o != std::cmp::Ordering::Less),
+        Expression::Greater(a, b) => {
+            cmp_op(a, b, row, vars, store, |o| o == std::cmp::Ordering::Greater)
+        }
+        Expression::GreaterOrEqual(a, b) => {
+            cmp_op(a, b, row, vars, store, |o| o != std::cmp::Ordering::Less)
+        }
         Expression::Less(a, b) => cmp_op(a, b, row, vars, store, |o| o == std::cmp::Ordering::Less),
-        Expression::LessOrEqual(a, b) => cmp_op(a, b, row, vars, store, |o| o != std::cmp::Ordering::Greater),
+        Expression::LessOrEqual(a, b) => {
+            cmp_op(a, b, row, vars, store, |o| o != std::cmp::Ordering::Greater)
+        }
         Expression::Add(a, b) => num_op(a, b, row, vars, store, |x, y| x + y),
         Expression::Subtract(a, b) => num_op(a, b, row, vars, store, |x, y| x - y),
         Expression::Multiply(a, b) => num_op(a, b, row, vars, store, |x, y| x * y),
@@ -1377,10 +1450,10 @@ fn eval(expr: &Expression, row: &[u32], vars: &[String], store: &TripleStore) ->
         Expression::In(e, list) => {
             let x = eval(e, row, vars, store)?;
             for item in list {
-                if let Ok(y) = eval(item, row, vars, store) {
-                    if fv_equal(&x, &y) == Some(true) {
-                        return Ok(Fv::Bool(true));
-                    }
+                if let Ok(y) = eval(item, row, vars, store)
+                    && fv_equal(&x, &y) == Some(true)
+                {
+                    return Ok(Fv::Bool(true));
                 }
             }
             Ok(Fv::Bool(false))
@@ -1485,9 +1558,7 @@ fn ebv(expr: &Expression, row: &[u32], vars: &[String], store: &TripleStore) -> 
 
 /// Behält eine Zeile, wenn **alle** FILTER-Ausdrücke EBV true ergeben.
 fn row_passes(filters: &[&Expression], row: &[u32], vars: &[String], store: &TripleStore) -> bool {
-    filters
-        .iter()
-        .all(|f| ebv(f, row, vars, store) == Ok(true))
+    filters.iter().all(|f| ebv(f, row, vars, store) == Ok(true))
 }
 
 fn translate_bgp(
@@ -1612,10 +1683,22 @@ mod tests {
     fn test_store() -> TripleStore {
         let mut store = TripleStore::new();
         store.ingest_str_triples(&[
-            ("http://example.org/alice", "http://example.org/knows", "http://example.org/bob"),
-            ("http://example.org/bob", "http://example.org/knows", "http://example.org/charlie"),
+            (
+                "http://example.org/alice",
+                "http://example.org/knows",
+                "http://example.org/bob",
+            ),
+            (
+                "http://example.org/bob",
+                "http://example.org/knows",
+                "http://example.org/charlie",
+            ),
             ("http://example.org/bob", "http://example.org/age", "25"),
-            ("http://example.org/charlie", "http://example.org/knows", "http://example.org/alice"),
+            (
+                "http://example.org/charlie",
+                "http://example.org/knows",
+                "http://example.org/alice",
+            ),
         ]);
         store
     }
@@ -1625,13 +1708,19 @@ mod tests {
         let store = test_store();
         let engine = HybridEngine::new();
         let query = "SELECT ?a ?b ?age WHERE { ?a <http://example.org/knows> ?b . OPTIONAL { ?b <http://example.org/age> ?age } }";
-        let result: Value = serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
+        let result: Value =
+            serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
         let rows = result["results"]["bindings"].as_array().unwrap();
         // alice->bob has age 25; charlie->alice has no age
         assert_eq!(rows.len(), 3);
         let ages: Vec<Option<i64>> = rows
             .iter()
-            .map(|r| r.get("age").and_then(|v| v.get("value")).and_then(|v| v.as_str()).map(|s| s.parse().unwrap()))
+            .map(|r| {
+                r.get("age")
+                    .and_then(|v| v.get("value"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.parse().unwrap())
+            })
             .collect();
         assert!(ages.contains(&Some(25)));
         assert!(ages.contains(&None));
@@ -1643,7 +1732,8 @@ mod tests {
         let engine = HybridEngine::new();
         // <…/zzz> kommt im Store nicht vor -> leere Lösung, kein Panic.
         let query = "SELECT ?p ?o WHERE { <http://example.org/zzz> ?p ?o }";
-        let result: Value = serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
+        let result: Value =
+            serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
         assert_eq!(result["results"]["bindings"].as_array().unwrap().len(), 0);
         // Head-Variablen bleiben erhalten.
         let head: Vec<&str> = result["head"]["vars"]
@@ -1661,14 +1751,23 @@ mod tests {
         // Ausgabezeilen expandieren; carol (kein Alter) bleibt eine NULL-Zeile.
         let mut store = TripleStore::new();
         store.ingest_str_triples(&[
-            ("http://example.org/alice", "http://example.org/knows", "http://example.org/bob"),
-            ("http://example.org/alice", "http://example.org/knows", "http://example.org/carol"),
+            (
+                "http://example.org/alice",
+                "http://example.org/knows",
+                "http://example.org/bob",
+            ),
+            (
+                "http://example.org/alice",
+                "http://example.org/knows",
+                "http://example.org/carol",
+            ),
             ("http://example.org/bob", "http://example.org/age", "25"),
             ("http://example.org/bob", "http://example.org/age", "26"),
         ]);
         let engine = HybridEngine::new();
         let query = "SELECT ?b ?age WHERE { ?a <http://example.org/knows> ?b . OPTIONAL { ?b <http://example.org/age> ?age } }";
-        let result: Value = serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
+        let result: Value =
+            serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
         let rows = result["results"]["bindings"].as_array().unwrap();
         // bob×{25,26} = 2 Zeilen + carol×NULL = 1 Zeile.
         assert_eq!(rows.len(), 3);
@@ -1691,7 +1790,8 @@ mod tests {
         let store = test_store();
         let engine = HybridEngine::new();
         let query = "SELECT ?a ?c WHERE { ?a <http://example.org/knows> ?b . OPTIONAL { ?b <http://example.org/unknown> ?c } }";
-        let result: Value = serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
+        let result: Value =
+            serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
         let rows = result["results"]["bindings"].as_array().unwrap();
         assert_eq!(rows.len(), 3);
         for row in rows {
@@ -1707,9 +1807,14 @@ mod tests {
         let store = test_store();
         let engine = HybridEngine::new();
         let query = "SELECT DISTINCT ?p WHERE { ?s ?p ?o }";
-        let result: Value = serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
+        let result: Value =
+            serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
         let rows = result["results"]["bindings"].as_array().unwrap();
-        assert_eq!(rows.len(), 2, "DISTINCT ?p should dedup on the projected column");
+        assert_eq!(
+            rows.len(),
+            2,
+            "DISTINCT ?p should dedup on the projected column"
+        );
     }
 
     #[test]
@@ -1717,7 +1822,8 @@ mod tests {
         let store = test_store();
         let engine = HybridEngine::new();
         let query = "SELECT DISTINCT ?p WHERE { ?s ?p ?o } LIMIT 1";
-        let result: Value = serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
+        let result: Value =
+            serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
         let rows = result["results"]["bindings"].as_array().unwrap();
         assert_eq!(rows.len(), 1);
     }
@@ -1729,13 +1835,16 @@ mod tests {
         let alice = store.dict.insert("http://example.org/alice");
         let bob = store.dict.insert("http://example.org/bob");
         let age = store.dict.insert("http://example.org/age");
-        let v30 = store.dict.insert_with_type("30", TermType::literal_datatype(dt));
-        let v25 = store.dict.insert_with_type("25", TermType::literal_datatype(dt));
+        let v30 = store
+            .dict
+            .insert_with_type("30", TermType::literal_datatype(dt));
+        let v25 = store
+            .dict
+            .insert_with_type("25", TermType::literal_datatype(dt));
         store.insert_triple(alice, age, v30);
         store.insert_triple(bob, age, v25);
         let engine = HybridEngine::new();
-        let query =
-            "SELECT ?p ?a WHERE { ?p <http://example.org/age> ?a FILTER(?a > 26) }";
+        let query = "SELECT ?p ?a WHERE { ?p <http://example.org/age> ?a FILTER(?a > 26) }";
         let result: Value =
             serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
         let rows = result["results"]["bindings"].as_array().unwrap();
@@ -1788,8 +1897,7 @@ mod tests {
     fn order_by_ascending_on_iri() {
         let store = test_store(); // knows objects: bob, charlie, alice
         let engine = HybridEngine::new();
-        let query =
-            "SELECT ?b WHERE { ?a <http://example.org/knows> ?b } ORDER BY ?b";
+        let query = "SELECT ?b WHERE { ?a <http://example.org/knows> ?b } ORDER BY ?b";
         let result: Value =
             serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
         let rows = result["results"]["bindings"].as_array().unwrap();
@@ -1826,12 +1934,13 @@ mod tests {
         let s = store.dict.insert("http://example.org/x");
         let age = store.dict.insert("http://example.org/age");
         for v in ["100", "9", "25"] {
-            let o = store.dict.insert_with_type(v, TermType::literal_datatype(dt));
+            let o = store
+                .dict
+                .insert_with_type(v, TermType::literal_datatype(dt));
             store.insert_triple(s, age, o);
         }
         let engine = HybridEngine::new();
-        let query =
-            "SELECT ?a WHERE { ?s <http://example.org/age> ?a } ORDER BY ?a";
+        let query = "SELECT ?a WHERE { ?s <http://example.org/age> ?a } ORDER BY ?a";
         let result: Value =
             serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
         let rows = result["results"]["bindings"].as_array().unwrap();
@@ -1843,8 +1952,7 @@ mod tests {
         let store = test_store();
         let engine = HybridEngine::new();
         // DISTINCT ?p -> {knows, age}; ORDER BY ?p sortiert die zwei Prädikate.
-        let query =
-            "SELECT DISTINCT ?p WHERE { ?s ?p ?o } ORDER BY ?p";
+        let query = "SELECT DISTINCT ?p WHERE { ?s ?p ?o } ORDER BY ?p";
         let result: Value =
             serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
         let rows = result["results"]["bindings"].as_array().unwrap();
@@ -1891,12 +1999,16 @@ mod tests {
         assert_eq!(rows.len(), 2);
         // Eine Zeile hat a=alice (b NULL), die andere b=charlie (a NULL).
         let a_only = rows.iter().any(|r| {
-            r.get("a").and_then(|v| v.get("value")).and_then(|v| v.as_str())
+            r.get("a")
+                .and_then(|v| v.get("value"))
+                .and_then(|v| v.as_str())
                 == Some("http://example.org/alice")
                 && (r.get("b").is_none() || r["b"].is_null())
         });
         let b_only = rows.iter().any(|r| {
-            r.get("b").and_then(|v| v.get("value")).and_then(|v| v.as_str())
+            r.get("b")
+                .and_then(|v| v.get("value"))
+                .and_then(|v| v.as_str())
                 == Some("http://example.org/charlie")
                 && (r.get("a").is_none() || r["a"].is_null())
         });
@@ -1942,7 +2054,9 @@ mod tests {
     fn path_one_or_more() {
         // alice knows+ ?o -> bob, carol, dave (transitive Hülle, ohne alice).
         assert_eq!(
-            obj_values("SELECT ?o WHERE { <http://example.org/alice> <http://example.org/knows>+ ?o }"),
+            obj_values(
+                "SELECT ?o WHERE { <http://example.org/alice> <http://example.org/knows>+ ?o }"
+            ),
             vec!["bob", "carol", "dave"]
         );
     }
@@ -1951,7 +2065,9 @@ mod tests {
     fn path_zero_or_more_includes_self() {
         // alice knows* ?o -> alice (0 Schritte), bob, carol, dave.
         assert_eq!(
-            obj_values("SELECT ?o WHERE { <http://example.org/alice> <http://example.org/knows>* ?o }"),
+            obj_values(
+                "SELECT ?o WHERE { <http://example.org/alice> <http://example.org/knows>* ?o }"
+            ),
             vec!["alice", "bob", "carol", "dave"]
         );
     }
@@ -1960,7 +2076,9 @@ mod tests {
     fn path_zero_or_one() {
         // alice knows? ?o -> alice (0) + bob (1).
         assert_eq!(
-            obj_values("SELECT ?o WHERE { <http://example.org/alice> <http://example.org/knows>? ?o }"),
+            obj_values(
+                "SELECT ?o WHERE { <http://example.org/alice> <http://example.org/knows>? ?o }"
+            ),
             vec!["alice", "bob"]
         );
     }
@@ -1969,7 +2087,9 @@ mod tests {
     fn path_sequence() {
         // alice knows/knows ?o -> carol (2 Schritte).
         assert_eq!(
-            obj_values("SELECT ?o WHERE { <http://example.org/alice> <http://example.org/knows>/<http://example.org/knows> ?o }"),
+            obj_values(
+                "SELECT ?o WHERE { <http://example.org/alice> <http://example.org/knows>/<http://example.org/knows> ?o }"
+            ),
             vec!["carol"]
         );
     }
@@ -1978,7 +2098,9 @@ mod tests {
     fn path_alternative() {
         // alice (knows|likes) ?o -> bob, eve.
         assert_eq!(
-            obj_values("SELECT ?o WHERE { <http://example.org/alice> (<http://example.org/knows>|<http://example.org/likes>) ?o }"),
+            obj_values(
+                "SELECT ?o WHERE { <http://example.org/alice> (<http://example.org/knows>|<http://example.org/likes>) ?o }"
+            ),
             vec!["bob", "eve"]
         );
     }

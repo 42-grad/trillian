@@ -482,7 +482,12 @@ fn leaf_has(map: &FxHashMap<(u32, u32), Vec<u32>>, first: u32, second: u32, thir
 }
 
 #[inline]
-fn insert_into_leaf(map: &mut FxHashMap<(u32, u32), Vec<u32>>, first: u32, second: u32, third: u32) {
+fn insert_into_leaf(
+    map: &mut FxHashMap<(u32, u32), Vec<u32>>,
+    first: u32,
+    second: u32,
+    third: u32,
+) {
     let leaf = map.entry((first, second)).or_default();
     if let Err(pos) = leaf.binary_search(&third) {
         leaf.insert(pos, third);
@@ -491,15 +496,20 @@ fn insert_into_leaf(map: &mut FxHashMap<(u32, u32), Vec<u32>>, first: u32, secon
 
 /// Entfernt `third` aus dem Delta-Leaf; gibt `true` zurück, wenn es da war.
 #[inline]
-fn remove_from_leaf(map: &mut FxHashMap<(u32, u32), Vec<u32>>, first: u32, second: u32, third: u32) -> bool {
-    if let Some(leaf) = map.get_mut(&(first, second)) {
-        if let Ok(pos) = leaf.binary_search(&third) {
-            leaf.remove(pos);
-            if leaf.is_empty() {
-                map.remove(&(first, second));
-            }
-            return true;
+fn remove_from_leaf(
+    map: &mut FxHashMap<(u32, u32), Vec<u32>>,
+    first: u32,
+    second: u32,
+    third: u32,
+) -> bool {
+    if let Some(leaf) = map.get_mut(&(first, second))
+        && let Ok(pos) = leaf.binary_search(&third)
+    {
+        leaf.remove(pos);
+        if leaf.is_empty() {
+            map.remove(&(first, second));
         }
+        return true;
     }
     false
 }

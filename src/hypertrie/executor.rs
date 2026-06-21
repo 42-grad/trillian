@@ -127,10 +127,10 @@ impl RowBlock {
         let mut new_rows = 0usize;
         let mut prev: Option<usize> = None;
         for &i in &idx {
-            if let Some(p) = prev {
-                if self.row(p) == self.row(i) {
-                    continue;
-                }
+            if let Some(p) = prev
+                && self.row(p) == self.row(i)
+            {
+                continue;
             }
             new_data.extend_from_slice(self.row(i));
             new_rows += 1;
@@ -196,11 +196,7 @@ impl<'a> Iterator for RowIter<'a> {
 // ---------------------------------------------------------------------------
 
 /// Führt einen `ExecutionPlan` für ein `GraphPattern` aus.
-pub fn execute_plan(
-    store: &TripleStore,
-    pattern: &GraphPattern,
-    plan: &ExecutionPlan,
-) -> RowBlock {
+pub fn execute_plan(store: &TripleStore, pattern: &GraphPattern, plan: &ExecutionPlan) -> RowBlock {
     let mut var_map: FxHashMap<String, usize> = FxHashMap::default();
     for pat in &pattern.patterns {
         collect_vars(&pat.subject, &mut var_map);
@@ -237,11 +233,11 @@ pub fn execute_plan(
 }
 
 fn collect_vars(term: &PatternTerm, var_map: &mut FxHashMap<String, usize>) {
-    if let PatternTerm::Variable(name) = term {
-        if !var_map.contains_key(name) {
-            let id = var_map.len();
-            var_map.insert(name.clone(), id);
-        }
+    if let PatternTerm::Variable(name) = term
+        && !var_map.contains_key(name)
+    {
+        let id = var_map.len();
+        var_map.insert(name.clone(), id);
     }
 }
 
@@ -285,13 +281,21 @@ fn extend_pattern(
         }
 
         QueryResult::All(triples) => {
-            let s_idx = pattern.subject.as_variable().and_then(|n| var_map.get(n)).copied();
+            let s_idx = pattern
+                .subject
+                .as_variable()
+                .and_then(|n| var_map.get(n))
+                .copied();
             let p_idx = pattern
                 .predicate
                 .as_variable()
                 .and_then(|n| var_map.get(n))
                 .copied();
-            let o_idx = pattern.object.as_variable().and_then(|n| var_map.get(n)).copied();
+            let o_idx = pattern
+                .object
+                .as_variable()
+                .and_then(|n| var_map.get(n))
+                .copied();
 
             for (s, p, o) in triples {
                 let start = out.push_from_prior(prior);
@@ -388,7 +392,8 @@ pub fn execute_wcoj(store: &TripleStore, pattern: &GraphPattern) -> RowBlock {
 fn is_wcoj_applicable(pattern: &GraphPattern, store: &TripleStore) -> bool {
     pattern.patterns.iter().all(|pat| {
         // Genau ein gebundenes Prädikat und zwei Variablen an Subjekt/Objekt
-        let pred_bound = matches!(pat.predicate, PatternTerm::Bound(pid) if store.has_predicate(pid));
+        let pred_bound =
+            matches!(pat.predicate, PatternTerm::Bound(pid) if store.has_predicate(pid));
         let two_vars = [pat.subject.is_variable(), pat.object.is_variable()]
             .iter()
             .filter(|&&x| x)
@@ -600,11 +605,7 @@ impl PatternTerm {
             PatternTerm::Variable(name) => {
                 let idx = *var_map.get(name)?;
                 let v = binding[idx];
-                if v != UNBOUND {
-                    Some(v)
-                } else {
-                    None
-                }
+                if v != UNBOUND { Some(v) } else { None }
             }
         }
     }

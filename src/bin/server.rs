@@ -21,18 +21,28 @@ async fn main() {
     //   server <file.nt> [port]                 -> parsen + bauen + serven (Default)
     match args.get(1).map(|s| s.as_str()) {
         Some("build") => {
-            let nt = args.get(2).expect("usage: server build <file.nt> <snapshot.bin>");
-            let snap = args.get(3).expect("usage: server build <file.nt> <snapshot.bin>");
+            let nt = args
+                .get(2)
+                .expect("usage: server build <file.nt> <snapshot.bin>");
+            let snap = args
+                .get(3)
+                .expect("usage: server build <file.nt> <snapshot.bin>");
             build_snapshot(nt, snap);
         }
         Some("load") => {
-            let snap = args.get(2).expect("usage: server load <snapshot.bin> [port]");
+            let snap = args
+                .get(2)
+                .expect("usage: server load <snapshot.bin> [port]");
             let port = args.get(3).and_then(|p| p.parse().ok()).unwrap_or(9080);
             load_and_serve(snap, port).await;
         }
         Some("profile") => {
-            let nt = args.get(2).expect("usage: server profile <file.nt> <query.rq> [runs]");
-            let qf = args.get(3).expect("usage: server profile <file.nt> <query.rq> [runs]");
+            let nt = args
+                .get(2)
+                .expect("usage: server profile <file.nt> <query.rq> [runs]");
+            let qf = args
+                .get(3)
+                .expect("usage: server profile <file.nt> <query.rq> [runs]");
             let runs = args.get(4).and_then(|r| r.parse().ok()).unwrap_or(50);
             profile(nt, qf, runs);
         }
@@ -52,7 +62,9 @@ fn build_snapshot(nt: &str, snapshot: &str) {
     let n = store
         .ingest_ntriples_file(nt)
         .expect("Failed to parse .nt file");
-    store.save_snapshot(snapshot).expect("Failed to write snapshot");
+    store
+        .save_snapshot(snapshot)
+        .expect("Failed to write snapshot");
     // Ein frischer Snapshot ist die neue Baseline – ein evtl. altes WAL ist
     // obsolet und darf nicht auf den neuen Snapshot zurückgespielt werden.
     let _ = std::fs::remove_file(format!("{}.wal", snapshot));
@@ -91,7 +103,9 @@ async fn load_and_serve(snapshot: &str, port: u16) {
 fn profile(nt: &str, query_file: &str, runs: usize) {
     let mut store = TripleStore::new();
     let t0 = Instant::now();
-    let n = store.ingest_ntriples_file(nt).expect("Failed to parse .nt file");
+    let n = store
+        .ingest_ntriples_file(nt)
+        .expect("Failed to parse .nt file");
     println!(
         "Geladen (in-RAM): {} Triples, {} Terme in {} ms\n",
         n,
