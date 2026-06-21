@@ -1,4 +1,4 @@
-use super::stats::{estimate_cardinality, CardEstimator};
+use super::stats::{CardEstimator, estimate_cardinality};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PatternTerm {
@@ -105,22 +105,21 @@ impl GraphPattern {
             let mut pick = None;
             let mut pick_cost = usize::MAX;
 
-            for i in 0..n {
-                if planned[i] {
+            for (i, &is_planned) in planned.iter().enumerate().take(n) {
+                if is_planned {
                     continue;
                 }
 
-                let connected = steps.iter().any(|step| {
-                    self.patterns_share_variables(i, step.pattern_index)
-                });
+                let connected = steps
+                    .iter()
+                    .any(|step| self.patterns_share_variables(i, step.pattern_index));
 
                 if !connected {
                     continue;
                 }
 
                 let pat = &self.patterns[i];
-                let cost =
-                    estimate_cardinality(est, &pat.subject, &pat.predicate, &pat.object);
+                let cost = estimate_cardinality(est, &pat.subject, &pat.predicate, &pat.object);
                 if cost < pick_cost {
                     pick_cost = cost;
                     pick = Some(i);
@@ -131,13 +130,12 @@ impl GraphPattern {
             let idx = pick.unwrap_or_else(|| {
                 let mut best = 0;
                 let mut best_cost = usize::MAX;
-                for i in 0..n {
-                    if planned[i] {
+                for (i, &is_planned) in planned.iter().enumerate().take(n) {
+                    if is_planned {
                         continue;
                     }
                     let pat = &self.patterns[i];
-                    let cost =
-                        estimate_cardinality(est, &pat.subject, &pat.predicate, &pat.object);
+                    let cost = estimate_cardinality(est, &pat.subject, &pat.predicate, &pat.object);
                     if cost < best_cost {
                         best_cost = cost;
                         best = i;

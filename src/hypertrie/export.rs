@@ -106,7 +106,13 @@ fn parse_term(s: &str) -> Option<(ParsedTerm, &str)> {
 fn parse_iri(s: &str) -> Option<(ParsedTerm, &str)> {
     let end = s.find('>')?;
     let iri = s[1..end].to_string();
-    Some((ParsedTerm { value: iri, typ: TermType::Iri }, &s[end + 1..]))
+    Some((
+        ParsedTerm {
+            value: iri,
+            typ: TermType::Iri,
+        },
+        &s[end + 1..],
+    ))
 }
 
 fn parse_literal(s: &str) -> Option<(ParsedTerm, &str)> {
@@ -117,15 +123,21 @@ fn parse_literal(s: &str) -> Option<(ParsedTerm, &str)> {
         let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
         let lang = rest[1..end].to_string();
         (TermType::literal_lang(lang), &rest[end..])
-    } else if rest.starts_with("^^") {
-        let rest = skip_whitespace(&rest[2..]);
+    } else if let Some(stripped) = rest.strip_prefix("^^") {
+        let rest = skip_whitespace(stripped);
         let (dt_term, rest) = parse_iri(rest)?;
         (TermType::literal_datatype(dt_term.value), rest)
     } else {
         (TermType::literal_plain(), rest)
     };
 
-    Some((ParsedTerm { value: lexical, typ }, rest))
+    Some((
+        ParsedTerm {
+            value: lexical,
+            typ,
+        },
+        rest,
+    ))
 }
 
 fn parse_quoted_string(s: &str) -> Option<(String, &str)> {
@@ -241,7 +253,13 @@ mod tests {
         let line = r#"<http://example.org/s> <http://example.org/p> "hello world" ."#;
         let t = parse_triple_line(line).unwrap();
         assert_eq!(t.object.value, "hello world");
-        assert!(matches!(t.object.typ, TermType::Literal { datatype: None, lang: None }));
+        assert!(matches!(
+            t.object.typ,
+            TermType::Literal {
+                datatype: None,
+                lang: None
+            }
+        ));
     }
 
     #[test]
@@ -249,7 +267,13 @@ mod tests {
         let line = r#"<http://example.org/s> <http://example.org/p> "hello"@en ."#;
         let t = parse_triple_line(line).unwrap();
         assert_eq!(t.object.value, "hello");
-        assert!(matches!(t.object.typ, TermType::Literal { datatype: None, lang: Some(_) }));
+        assert!(matches!(
+            t.object.typ,
+            TermType::Literal {
+                datatype: None,
+                lang: Some(_)
+            }
+        ));
     }
 
     #[test]
@@ -257,7 +281,13 @@ mod tests {
         let line = r#"<http://example.org/s> <http://example.org/p> "30"^^<http://www.w3.org/2001/XMLSchema#integer> ."#;
         let t = parse_triple_line(line).unwrap();
         assert_eq!(t.object.value, "30");
-        assert!(matches!(t.object.typ, TermType::Literal { datatype: Some(_), lang: None }));
+        assert!(matches!(
+            t.object.typ,
+            TermType::Literal {
+                datatype: Some(_),
+                lang: None
+            }
+        ));
     }
 
     #[test]

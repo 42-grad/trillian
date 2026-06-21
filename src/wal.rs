@@ -109,13 +109,19 @@ fn write_type<W: Write>(w: &mut W, typ: &TermType) -> std::io::Result<()> {
     match typ {
         TermType::Iri => w.write_all(&[0]),
         TermType::BlankNode => w.write_all(&[1]),
-        TermType::Literal { datatype: None, lang: None } => w.write_all(&[2]),
+        TermType::Literal {
+            datatype: None,
+            lang: None,
+        } => w.write_all(&[2]),
         TermType::Literal { lang: Some(l), .. } => {
             w.write_all(&[3])?;
             w.write_all(&(l.len() as u32).to_le_bytes())?;
             w.write_all(l.as_bytes())
         }
-        TermType::Literal { datatype: Some(d), lang: None } => {
+        TermType::Literal {
+            datatype: Some(d),
+            lang: None,
+        } => {
             w.write_all(&[4])?;
             w.write_all(&(d.len() as u32).to_le_bytes())?;
             w.write_all(d.as_bytes())

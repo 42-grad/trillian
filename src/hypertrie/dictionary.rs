@@ -129,13 +129,19 @@ impl Dictionary {
             match t {
                 TermType::Iri => buf.push(0),
                 TermType::BlankNode => buf.push(1),
-                TermType::Literal { datatype: None, lang: None } => buf.push(2),
+                TermType::Literal {
+                    datatype: None,
+                    lang: None,
+                } => buf.push(2),
                 TermType::Literal { lang: Some(l), .. } => {
                     buf.push(3);
                     buf.extend_from_slice(&(l.len() as u32).to_le_bytes());
                     buf.extend_from_slice(l.as_bytes());
                 }
-                TermType::Literal { datatype: Some(d), lang: None } => {
+                TermType::Literal {
+                    datatype: Some(d),
+                    lang: None,
+                } => {
                     buf.push(4);
                     buf.extend_from_slice(&(d.len() as u32).to_le_bytes());
                     buf.extend_from_slice(d.as_bytes());
@@ -167,13 +173,17 @@ impl Dictionary {
                 2 => TermType::literal_plain(),
                 3 => {
                     let llen = read_u32(bytes, &mut p) as usize;
-                    let l = std::str::from_utf8(&bytes[p..p + llen]).unwrap().to_string();
+                    let l = std::str::from_utf8(&bytes[p..p + llen])
+                        .unwrap()
+                        .to_string();
                     p += llen;
                     TermType::literal_lang(l)
                 }
                 4 => {
                     let dlen = read_u32(bytes, &mut p) as usize;
-                    let d = std::str::from_utf8(&bytes[p..p + dlen]).unwrap().to_string();
+                    let d = std::str::from_utf8(&bytes[p..p + dlen])
+                        .unwrap()
+                        .to_string();
                     p += dlen;
                     TermType::literal_datatype(d)
                 }
