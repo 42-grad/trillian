@@ -36,10 +36,39 @@ log() { echo "[wdbench] $*"; }
 now_ms() { date +%s%3N; }
 wait_port() { for _ in $(seq 1 600); do (echo > "/dev/tcp/localhost/$1") 2>/dev/null && return 0; sleep 1; done; return 1; }
 
-# --- 1. Daten holen (einmalig dekomprimieren) -------------------------------
-if [ ! -f "${FULL}" ]; then
-    log "Lade + dekomprimiere WDBench-Dump (3.6 GB -> ~ vielfaches als .nt)..."
-    curl -sL "${DATA_URL}" | tar -xjOf - > "${FULL}"
+# --- 1. Daten holen ---------------------------------------------------------
+# Robust: Archiv erst resumebar auf Platte laden (ein einzelner gestreamter
+# curl|tar bricht bei 3,6 GB leicht ab -> "bzip2: ends unexpectedly"), dann
+# atomar dekomprimieren (FULL existiert nur bei vollständigem Erfolg).
+ARCHIVE="${DATADIR}/wdbench.tar.bz2"
+EXPECTED_MD5="d36e25716044787359c0be53c11e40d8"   # Figshare computed_md5
+# Parallel-Dekompressor bevorzugen (lbzip2/pbzip2 nutzen alle Kerne -> Minuten
+# statt ~40 min single-threaded bzip2).
+if command -v lbzip2 >/dev/null 2>&1; then BZCAT="lbzip2 -dc";
+elif command -v pbzip2 >/dev/null 2>&1; then BZCAT="pbzip2 -dc";
+else BZCAT="bzip2 -dc"; fi
+md5of() { md5sum "$1" 2>/dev/null | awk '{print $1}'; }
+if [ ! -s "${FULL}" ]; then
+    # Archiv nur laden, wenn nicht schon korrekt vorhanden (MD5-verifiziert).
+    if [ ! -s "${ARCHIVE}" ] || [ "$(md5of "${ARCHIVE}")" != "${EXPECTED_MD5}" ]; then
+        log "Lade WDBench-Dump (3.6 GB)..."
+        rm -f "${ARCHIVE}"
+        curl -L --fail --retry 6 --retry-delay 5 -o "${ARCHIVE}" "${DATA_URL}"
+        [ "$(md5of "${ARCHIVE}")" = "${EXPECTED_MD5}" ] \
+            && log "MD5 ok." || log "WARN: MD5 weicht ab (Quelle?)."
+    else
+        log "Archiv bereits vorhanden + MD5 ok."
+    fi
+    # Best-effort: die offizielle WDBench-.tar.bz2 dekomprimiert mit Standard-
+    # bzip2/lbzip2 nicht restlos (Fehler gegen Stream-Ende). Wir behalten die
+    # gültige Teilausgabe (alle Blöcke vor dem Fehler sind korrekt) statt
+    # abzubrechen -> stride/Queries laufen auf dem dekomprimierten Anteil.
+    log "Dekomprimiere (${BZCAT%% *}, best-effort) -> ${FULL}..."
+    set +e
+    ${BZCAT} "${ARCHIVE}" 2>"${DATADIR}/decompress.err" | tar -xO > "${FULL}.partial"
+    set -e
+    log "Dekomprimiert: $(wc -l < "${FULL}.partial") Zeilen (best-effort)."
+    mv "${FULL}.partial" "${FULL}"
 fi
 if [ "${STRIDE}" = "1" ]; then
     NT="${FULL}"
@@ -57,7 +86,12 @@ python3 "${ROOT}/wdbench_queries.py" "${QSRC}" "${QDIR}" "${MAXQ}"
 
 # --- 3. Rust-Clone: build + mmap-load (gemessen) ----------------------------
 log "Baue Rust-Server + Snapshot..."
-( cd "${ROOT}" && cargo build --release --bin server >/dev/null 2>&1 )
+# cargo liegt je nach User unter /root oder ~/.cargo; PATH absichern (sudo erbt
+# es nicht zwingend). Nur bauen, wenn das Binary fehlt -> sonst vorhandenes nutzen.
+export PATH="${PATH}:/root/.cargo/bin:${HOME:-/root}/.cargo/bin"
+if [ ! -x "${ROOT}/target/release/server" ]; then
+    ( cd "${ROOT}" && cargo build --release --bin server >/dev/null 2>&1 )
+fi
 R_T0=$(now_ms)
 "${ROOT}/target/release/server" build "${NT}" "${SNAP}" >/dev/null
 "${ROOT}/target/release/server" load "${SNAP}" "${RUST_PORT}" >/tmp/rust_srv.log 2>&1 &

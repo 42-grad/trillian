@@ -20,6 +20,7 @@
       - rsync
       - default-jdk
       - cmake
+      - lbzip2
     state: present
 
 - name: Install Conan
