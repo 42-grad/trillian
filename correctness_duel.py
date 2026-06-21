@@ -99,21 +99,46 @@ def canon_rows(result: dict):
     return rows
 
 
-def compare(rust: dict, tentris: dict):
+def snippet(raw: bytes) -> str:
+    return (raw or b"").decode("utf-8", "replace").strip().replace("\n", " ")[:140]
+
+
+def ask_value(parsed, raw: bytes):
+    """Liest einen ASK-Wahrheitswert robust – auch wenn der Endpoint statt
+    `{"boolean": true}` ein nacktes `true`/`"true"` (text/boolean) liefert."""
+    if isinstance(parsed, dict) and "boolean" in parsed:
+        return bool(parsed["boolean"])
+    s = (raw or b"").decode("utf-8", "replace").strip().strip('"').lower()
+    if s in ("true", "false"):
+        return s == "true"
+    return None
+
+
+def compare(query: str, rust, tentris, rust_raw: bytes, tentris_raw: bytes):
     """Liefert (status, detail)."""
-    if rust is not None and "error" in rust:
+    if isinstance(rust, dict) and "error" in rust:
         return "RUST_ERR", rust.get("error", "")
-    if tentris is not None and "error" in tentris:
+    if isinstance(tentris, dict) and "error" in tentris:
         return "TENTRIS_ERR", tentris.get("error", "")
-    # ASK
-    if rust is not None and "boolean" in rust:
-        rb = rust.get("boolean")
-        tb = tentris.get("boolean") if tentris else None
-        return ("IDENTICAL" if rb == tb else "BINDING_DIFF", f"ask rust={rb} tentris={tb}")
+    # ASK (robust gegen abweichende Boolean-Repräsentationen)
+    is_ask = query.lstrip().upper().startswith("ASK") or (
+        isinstance(rust, dict) and "boolean" in rust
+    )
+    if is_ask:
+        rb = ask_value(rust, rust_raw)
+        tb = ask_value(tentris, tentris_raw)
+        if rb is not None and rb == tb:
+            return "IDENTICAL", f"ask={rb}"
+        return "BINDING_DIFF", (
+            f"ask rust={rb} tentris={tb}; tentris_raw={snippet(tentris_raw)}"
+        )
     rr = canon_rows(rust)
     tr = canon_rows(tentris)
     if rr is None or tr is None:
-        return "PARSE_ERR", f"rust_parsed={rr is not None} tentris_parsed={tr is not None}"
+        return "PARSE_ERR", (
+            f"rust_parsed={rr is not None} tentris_parsed={tr is not None}; "
+            f"rust_raw={snippet(rust_raw)}; tentris_raw={snippet(tentris_raw)}"
+        )
     n_r = sum(rr.values())
     n_t = sum(tr.values())
     if rr == tr:
@@ -161,9 +186,9 @@ def main():
     print("-" * 100)
     for qf in queries:
         query = qf.read_text()
-        _, rust, _ = http_get_sparql(rust_url, query)
-        _, tentris, _ = http_get_sparql(tentris_url, query)
-        status, detail = compare(rust, tentris)
+        _, rust, rust_raw = http_get_sparql(rust_url, query)
+        _, tentris, tentris_raw = http_get_sparql(tentris_url, query)
+        status, detail = compare(query, rust, tentris, rust_raw, tentris_raw)
         counts[status] += 1
         perf = ""
         if perf_runs and status == "IDENTICAL":

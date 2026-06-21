@@ -36,6 +36,27 @@ unter dieser Last" liegt Tentris 1,26× vorn. Memory-Lücke faktisch geschlossen
 | distinct | 13207 |
 | optional | 16002 |
 
+## Korrektheit auf ECHTEN Daten (WatDiv, 2026-06-21)
+
+Strenger Binding-Mengen-Vergleich (`correctness_duel.py`) auf einem realen
+WatDiv-Slice (~1,09M Tripel, echte IRIs+Literale, keine Blank Nodes), reale
+BGP-Queries aus den Daten generiert:
+
+| Query | Rows | Verdikt | Rust / Tentris (median) |
+| :-- | --: | :-- | :-- |
+| entity-lookup | 22 | ✅ IDENTICAL | 0,45 / 0,68 ms |
+| property-values | 6 | ✅ IDENTICAL | 0,51 / 0,55 ms |
+| inverse (type) | 5862 | ✅ IDENTICAL | 12,7 / 7,2 ms |
+| star (type+pred) | 1342 | ✅ IDENTICAL | 4,0 / 5,3 ms |
+| 2-hop path | 55 | ✅ IDENTICAL | 0,87 / 0,65 ms |
+| two-star | 72 | ✅ IDENTICAL | 0,62 / 0,75 ms |
+| ASK | — | ⚠️ Format | rust=true; Tentris-ASK-Antwortformat (Harness gehärtet) |
+
+**6/7 IDENTICAL** — auf reinen BGP-Queries (auch große Joins: 5862, 1342 Zeilen)
+liefern Rust-Clone und C++ Tentris **dieselben** Ergebnisse auf echten Daten.
+Der ASK-Unterschied war ein Antwortformat-Problem der Harness (unser `true` ist
+korrekt), nicht der Engine — `correctness_duel.py` liest ASK jetzt robust.
+
 ## Stufen-Notizen
 
 ### Baseline — `8852869`

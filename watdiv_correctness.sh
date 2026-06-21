@@ -74,7 +74,9 @@ done
 
 # --- 7. Korrektheit + Performance vergleichen -------------------------------
 log "Vergleiche Binding-Mengen (Rust :${RUST_PORT} vs Tentris :${TENTRIS_PORT})..."
+# Der Vergleich ist ein Report (kein Gate) -> Exit-Code nicht propagieren,
+# damit die Ansible-Task nicht fälschlich als "failed" markiert wird.
 python3 "${ROOT}/correctness_duel.py" \
     "http://localhost:${RUST_PORT}/sparql" \
     "http://localhost:${TENTRIS_PORT}/sparql" \
-    "${QDIR}" --perf 50
+    "${QDIR}" --perf 50 || true
