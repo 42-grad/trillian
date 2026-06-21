@@ -104,10 +104,18 @@ def snippet(raw: bytes) -> str:
 
 
 def ask_value(parsed, raw: bytes):
-    """Liest einen ASK-Wahrheitswert robust – auch wenn der Endpoint statt
-    `{"boolean": true}` ein nacktes `true`/`"true"` (text/boolean) liefert."""
-    if isinstance(parsed, dict) and "boolean" in parsed:
-        return bool(parsed["boolean"])
+    """Liest einen ASK-Wahrheitswert robust über verschiedene Serialisierungen:
+    * SPARQL-Standard: `{"boolean": true|false}`
+    * Tentris-Research: ASK als SELECT mit leerer Projektion
+      (`{"results":{"bindings":[{}]}}` = true, `[]` = false)
+    * nacktes `true`/`"true"` (text/boolean)
+    Semantisch ist ASK genau dann true, wenn eine Lösung existiert."""
+    if isinstance(parsed, dict):
+        if "boolean" in parsed:
+            return bool(parsed["boolean"])
+        res = parsed.get("results")
+        if isinstance(res, dict) and "bindings" in res:
+            return len(res["bindings"]) > 0
     s = (raw or b"").decode("utf-8", "replace").strip().strip('"').lower()
     if s in ("true", "false"):
         return s == "true"

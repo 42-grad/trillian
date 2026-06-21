@@ -77,7 +77,7 @@ def main():
 
     # 1) Entity-Lookup: alle Properties eines konkreten Subjekts.
     #    Subjekt mit mittlerer Property-Anzahl wählen.
-    rich_subj = max(preds_of_subj, key=lambda s: len(preds_of_subj[s]))
+    rich_subj = max(sorted(preds_of_subj), key=lambda s: len(preds_of_subj[s]))
     queries["q01_entity"] = f"SELECT ?p ?o WHERE {{ {rich_subj} ?p ?o }}"
 
     # 2) Property-Werte: (S, P, ?o) für ein Subjekt + eines seiner Prädikate.
@@ -86,8 +86,8 @@ def main():
 
     # 3) Inverse Lookup: ?s mit Prädikat P auf ein konkretes Objekt.
     #    Objekt mit mehreren eingehenden Kanten wählen.
-    pop_obj = max(obj_subjects, key=lambda o: len(obj_subjects[o]))
-    some_subj = next(iter(obj_subjects[pop_obj]))
+    pop_obj = max(sorted(obj_subjects), key=lambda o: len(obj_subjects[o]))
+    some_subj = min(obj_subjects[pop_obj])  # deterministisch (statt next(iter(set)))
     pred_in = next(p for s, p, o in triples if o == pop_obj and s == some_subj)
     queries["q03_inverse"] = f"SELECT ?s WHERE {{ ?s {pred_in} {pop_obj} }}"
 

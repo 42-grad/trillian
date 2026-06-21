@@ -44,18 +44,26 @@ BGP-Queries aus den Daten generiert:
 
 | Query | Rows | Verdikt | Rust / Tentris (median) |
 | :-- | --: | :-- | :-- |
-| entity-lookup | 22 | ✅ IDENTICAL | 0,45 / 0,68 ms |
-| property-values | 6 | ✅ IDENTICAL | 0,51 / 0,55 ms |
-| inverse (type) | 5862 | ✅ IDENTICAL | 12,7 / 7,2 ms |
-| star (type+pred) | 1342 | ✅ IDENTICAL | 4,0 / 5,3 ms |
-| 2-hop path | 55 | ✅ IDENTICAL | 0,87 / 0,65 ms |
-| two-star | 72 | ✅ IDENTICAL | 0,62 / 0,75 ms |
-| ASK | — | ⚠️ Format | rust=true; Tentris-ASK-Antwortformat (Harness gehärtet) |
+| entity-lookup | 22 | ✅ IDENTICAL | 0,52 / 0,99 ms |
+| property-values | 6 | ✅ IDENTICAL | 0,75 / 0,77 ms |
+| inverse (rdf:type) | 5862 | ✅ IDENTICAL | 9,32 / 7,24 ms |
+| 2-hop path | 55 | ✅ IDENTICAL | 0,59 / 0,74 ms |
+| two-star | 72 | ✅ IDENTICAL | 0,67 / 0,68 ms |
+| ASK | — | ✅ semantisch gleich | s. u. |
 
-**6/7 IDENTICAL** — auf reinen BGP-Queries (auch große Joins: 5862, 1342 Zeilen)
-liefern Rust-Clone und C++ Tentris **dieselben** Ergebnisse auf echten Daten.
-Der ASK-Unterschied war ein Antwortformat-Problem der Harness (unser `true` ist
-korrekt), nicht der Engine — `correctness_duel.py` liest ASK jetzt robust.
+**Alle BGP-Queries identisch** (auch große Joins: 5862 Zeilen) — Rust-Clone und
+C++ Tentris liefern auf echten Daten **dieselben** Ergebnisse.
+
+**ASK – Repräsentationsunterschied, kein Engine-Fehler:** Tentris' Research-
+Endpoint serialisiert `ASK` **nicht** spec-konform als `{"boolean":true}`,
+sondern als SELECT mit leerer Projektion (`{"results":{"bindings":[{}]}}` =
+true, `[]` = false). Unser Clone liefert das standardkonforme `{"boolean":true}`.
+Beide bejahen dieselbe Existenz; `correctness_duel.py` normalisiert beide Formen
+(ASK true ⟺ Lösung existiert) → semantisch IDENTICAL.
+
+Performance: durchweg sub-ms bis wenige ms, gemischt — Rust bei kleinen
+Lookups/Pfaden leicht vorn, Tentris beim großen rdf:type-Scan (5862 Zeilen)
+schneller. Kein systematischer Verlierer.
 
 ## Stufen-Notizen
 
