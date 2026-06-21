@@ -366,10 +366,13 @@ fn evaluate_select_with_modifiers(
     let internal = match translate_bgp(bgp, &store.dict)? {
         Some(pat) => pat,
         None => {
+            // Unbekannte Konstante im BGP -> leere Lösung. var_order = vars,
+            // damit die Projektion (sparql_json) konsistent auflösen kann.
+            let vars = projection.unwrap_or_default();
             return Ok(SelectResult {
-                vars: projection.unwrap_or_default(),
-                rows: RowBlock::new(0),
-                var_order: Vec::new(),
+                rows: RowBlock::new(vars.len()),
+                var_order: vars.clone(),
+                vars,
             });
         }
     };
@@ -955,6 +958,24 @@ mod tests {
             .collect();
         assert!(ages.contains(&Some(25)));
         assert!(ages.contains(&None));
+    }
+
+    #[test]
+    fn select_with_unknown_constant_returns_empty_not_panic() {
+        let store = test_store();
+        let engine = HybridEngine::new();
+        // <…/zzz> kommt im Store nicht vor -> leere Lösung, kein Panic.
+        let query = "SELECT ?p ?o WHERE { <http://example.org/zzz> ?p ?o }";
+        let result = execute_sparql(&store, &engine, query).unwrap();
+        assert_eq!(result["results"]["bindings"].as_array().unwrap().len(), 0);
+        // Head-Variablen bleiben erhalten.
+        let head: Vec<&str> = result["head"]["vars"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(head, vec!["p", "o"]);
     }
 
     #[test]
