@@ -63,14 +63,15 @@ Streaming-JSON, jetzt 1,9× schneller als Tentris; q03 4× schneller.
 | Metrik | Rust | Tentris | |
 | :-- | --: | --: | :-- |
 | Ingest + Startup | 2186 ms | 8614 ms | Rust 3,9× |
-| **Peak-RSS / Bytes-Triple** | **277 MB / 266 B** | 332 MB / 319 B | **Rust 1,2× kleiner** |
+| **Peak-RSS / Bytes-Triple** | **214 MB / 206 B** | 332 MB / 319 B | **Rust 1,55× kleiner** |
 | **Disk-Store** | **48,6 MB** | 1026 MB | **Rust ~21× kleiner** |
 | INSERT/DELETE (durabel) | 32,7k / 25,7k /s | n/a¹ | — |
 
-Streaming-JSON senkte zusätzlich den Peak-RSS (356 → 277 MB): der transiente
-`Vec<Map<Value>>`-Baum großer Ergebnisse war ein Memory-Treiber. Damit ist Rust
-auf echten Daten **auf jeder Achse vorn** (Korrektheit, Latenz, Ingest, RAM,
-Disk) — außer Updates (Tentris-Endpoint fehlt, s. u.).
+Footprint-Reise (RSS): 356 MB Baseline → 277 MB (Streaming-JSON entfernt den
+transienten `Vec<Map<Value>>`-Baum) → **214 MB (Dict-Interning, 712k → 212
+Allokationen)**. Damit ist Rust auf echten Daten **auf jeder Achse vorn**
+(Korrektheit 7/7, Latenz, Ingest 3,9×, RAM 1,55×, Disk 21×) — außer Updates
+(Tentris-`/update` fehlt, s. u.).
 
 ¹ Tentris-`/update` liefert **HTTP 404** — der gebaute Research-Server hat
 keinen Update-Endpoint. Damit ist Update-Durchsatz gegen Tentris **nicht**
