@@ -42,9 +42,18 @@ fn main() {
     // Muster: (?w, predicate_0, ?x) (?x, predicate_1, ?y) (?y, predicate_2, ?z)
     // Exakt dieselbe Struktur wie chain_query.sparql für Tentris.
     // ------------------------------------------------------------------
-    let pid0 = store.dict.lookup("http://example.org/predicate_0").unwrap();
-    let pid1 = store.dict.lookup("http://example.org/predicate_1").unwrap();
-    let pid2 = store.dict.lookup("http://example.org/predicate_2").unwrap();
+    let pid0 = store
+        .dict
+        .lookup_iri("http://example.org/predicate_0")
+        .unwrap();
+    let pid1 = store
+        .dict
+        .lookup_iri("http://example.org/predicate_1")
+        .unwrap();
+    let pid2 = store
+        .dict
+        .lookup_iri("http://example.org/predicate_2")
+        .unwrap();
 
     let chain_pattern = GraphPattern {
         patterns: vec![

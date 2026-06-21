@@ -1,3 +1,10 @@
+/// Sentinel-ID für „ungebunden“ (NULL) in Ergebniszeilen und Joins.
+///
+/// Echte Dictionary-IDs sind fortlaufend ab 0 und liegen damit weit unter
+/// `u32::MAX`; der Höchstwert ist daher kollisionsfrei als NULL nutzbar. Zentral
+/// definiert, statt in mehreren Modulen als lokale `const` dupliziert.
+pub const NULL_ID: u32 = u32::MAX;
+
 pub mod dictionary;
 pub mod engine;
 pub mod executor;

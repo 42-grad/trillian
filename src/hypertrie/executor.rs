@@ -6,8 +6,8 @@ use super::planner::{ExecutionPlan, GraphPattern, PatternTerm, TriplePattern};
 use super::query::{QueryResult, Term, TripleStore, Var};
 
 /// Sentinel für eine noch ungebundene Variable in einer (partiellen) Zeile.
-/// Echte Dictionary-IDs liegen weit unter `u32::MAX`, daher kollisionsfrei.
-pub const UNBOUND: u32 = u32::MAX;
+/// Alias auf die zentrale [`super::NULL_ID`]-Konstante.
+pub const UNBOUND: u32 = super::NULL_ID;
 
 /// Flache, zeilen-orientierte Ergebnis-Matrix.
 ///
@@ -625,7 +625,7 @@ mod wcoj_tests {
             ("alice", "knows", "dave"), // kein Dreieck
         ]);
 
-        let knows = store.dict.lookup("knows").unwrap();
+        let knows = store.dict.lookup_iri("knows").unwrap();
         let pattern = GraphPattern {
             patterns: vec![
                 TriplePattern {

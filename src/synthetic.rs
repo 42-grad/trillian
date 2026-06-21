@@ -126,9 +126,9 @@ mod tests {
         store.ingest_str_triples(&str_triples);
         let engine = HybridEngine::new();
 
-        let p0 = store.dict.lookup("predicate_0").unwrap();
-        let p1 = store.dict.lookup("predicate_1").unwrap();
-        let p2 = store.dict.lookup("predicate_2").unwrap();
+        let p0 = store.dict.lookup_iri("predicate_0").unwrap();
+        let p1 = store.dict.lookup_iri("predicate_1").unwrap();
+        let p2 = store.dict.lookup_iri("predicate_2").unwrap();
 
         // Chain: (?w,p0,?x)(?x,p1,?y)(?y,p2,?z)
         let chain = GraphPattern {

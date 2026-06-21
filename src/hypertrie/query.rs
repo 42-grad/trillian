@@ -7,6 +7,13 @@ use super::export::ParsedTriple;
 use super::index::{FlatCsr, LayeredIndex, U32Arena, intersect_sorted};
 use super::stats::CardEstimator;
 
+/// Signatur am Anfang jeder Snapshot-Datei. Die letzte Ziffer ist die
+/// Format-Generation; `SNAP_VERSION` versioniert das Layout darunter. Beim Laden
+/// werden beide geprüft, damit ein altes/fremdes Format einen Fehler liefert,
+/// statt still falsche Daten zu mappen.
+const SNAP_MAGIC: &[u8; 8] = b"TTRSNAP1";
+const SNAP_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Var {
     S,
@@ -417,8 +424,8 @@ impl TripleStore {
         }
 
         let mut buf: Vec<u8> = Vec::new();
-        buf.extend_from_slice(b"TTRSNAP1");
-        buf.extend_from_slice(&1u32.to_le_bytes()); // version
+        buf.extend_from_slice(SNAP_MAGIC);
+        buf.extend_from_slice(&SNAP_VERSION.to_le_bytes()); // version
         buf.extend_from_slice(&(self.dict.len() as u32).to_le_bytes());
         let arrays_off_pos = buf.len();
         buf.extend_from_slice(&0u64.to_le_bytes()); // arrays_offset (Platzhalter)
@@ -455,7 +462,23 @@ impl TripleStore {
         let rd_u32 = |b: &[u8], p: usize| u32::from_le_bytes(b[p..p + 4].try_into().unwrap());
         let rd_u64 = |b: &[u8], p: usize| u64::from_le_bytes(b[p..p + 8].try_into().unwrap());
 
-        assert_eq!(&b[0..8], b"TTRSNAP1", "ungültiger Snapshot");
+        let bad = |msg: String| std::io::Error::new(std::io::ErrorKind::InvalidData, msg);
+        // Header (Magic + Version + Längen-Tabelle) muss vollständig vorhanden sein.
+        if b.len() < 32 {
+            return Err(bad("Snapshot zu kurz (Header unvollständig)".into()));
+        }
+        if &b[0..8] != SNAP_MAGIC {
+            return Err(bad(format!(
+                "ungültige Snapshot-Signatur (erwartet {:?})",
+                std::str::from_utf8(SNAP_MAGIC).unwrap_or("?")
+            )));
+        }
+        let version = rd_u32(b, 8);
+        if version != SNAP_VERSION {
+            return Err(bad(format!(
+                "inkompatible Snapshot-Version {version} (unterstützt: {SNAP_VERSION})"
+            )));
+        }
         let arrays_off = rd_u64(b, 16) as usize;
         let dict_off = rd_u64(b, 24) as usize;
         let mut p = 32;
@@ -719,10 +742,10 @@ mod tests {
         // Besser: alice und charlie kennen beide bob.
         // (alice, knows, ?O) ∩ (charlie, knows, ?O) = [bob]
         let store = example_store();
-        let alice = store.dict.lookup("alice").unwrap();
-        let charlie = store.dict.lookup("charlie").unwrap();
-        let bob = store.dict.lookup("bob").unwrap();
-        let knows = store.dict.lookup("knows").unwrap();
+        let alice = store.dict.lookup_iri("alice").unwrap();
+        let charlie = store.dict.lookup_iri("charlie").unwrap();
+        let bob = store.dict.lookup_iri("bob").unwrap();
+        let knows = store.dict.lookup_iri("knows").unwrap();
 
         let common = store.intersect_objects(alice, knows, charlie, knows);
         assert_eq!(common, vec![bob]);
@@ -763,7 +786,13 @@ mod tests {
 
         assert_eq!(store.triple_count(), store2.triple_count());
         // Das Sprach-Literal muss verlustfrei erhalten sein.
-        let lit2 = store2.dict.lookup("Alice").expect("literal preserved");
+        let lit2 = store2
+            .dict
+            .lookup_term(
+                "Alice",
+                &super::super::dictionary::TermType::literal_lang("en"),
+            )
+            .expect("literal preserved");
         assert!(matches!(
             store2.dict.resolve_type(lit2),
             Some(super::super::dictionary::TermType::Literal { lang: Some(_), .. })
@@ -808,8 +837,8 @@ mod tests {
         assert_eq!(loaded.triple_count(), store.triple_count());
 
         // Query über den gemappten Index
-        let p = loaded.dict.lookup("http://example.org/p").unwrap();
-        let a = loaded.dict.lookup("http://example.org/a").unwrap();
+        let p = loaded.dict.lookup_iri("http://example.org/p").unwrap();
+        let a = loaded.dict.lookup_iri("http://example.org/a").unwrap();
         if let QueryResult::Single(Var::O, objs) =
             loaded.query(Term::Bound(a), Term::Bound(p), Term::Wildcard)
         {
@@ -819,7 +848,13 @@ mod tests {
         }
 
         // Literal-Typ verlustfrei
-        let lit2 = loaded.dict.lookup("Alice").unwrap();
+        let lit2 = loaded
+            .dict
+            .lookup_term(
+                "Alice",
+                &super::super::dictionary::TermType::literal_lang("en"),
+            )
+            .unwrap();
         assert!(matches!(
             loaded.dict.resolve_type(lit2),
             Some(super::super::dictionary::TermType::Literal { lang: Some(_), .. })
@@ -831,6 +866,33 @@ mod tests {
     }
 
     #[test]
+    fn load_snapshot_rejects_bad_magic_and_version() {
+        // Müll-Bytes -> Fehler statt Panic.
+        let bad = std::env::temp_dir().join("trillian_bad_snapshot.bin");
+        std::fs::write(&bad, vec![0u8; 64]).unwrap();
+        assert!(TripleStore::load_snapshot(bad.to_str().unwrap()).is_err());
+        let _ = std::fs::remove_file(&bad);
+
+        // Gültigen Snapshot schreiben, dann die Versionsnummer verfälschen.
+        let mut store = TripleStore::new();
+        store.ingest_str_triples(&[(
+            "http://example.org/a",
+            "http://example.org/p",
+            "http://example.org/b",
+        )]);
+        let path = std::env::temp_dir().join("trillian_versioned_snapshot.bin");
+        let ps = path.to_str().unwrap();
+        store.save_snapshot(ps).unwrap();
+        assert!(TripleStore::load_snapshot(ps).is_ok());
+
+        let mut bytes = std::fs::read(ps).unwrap();
+        bytes[8] = 0xFF; // Version-Byte kaputt machen
+        std::fs::write(ps, &bytes).unwrap();
+        assert!(TripleStore::load_snapshot(ps).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn apply_updates_single_rebuild() {
         let mut store = TripleStore::new();
         store.ingest_str_triples(&[(
@@ -838,9 +900,9 @@ mod tests {
             "http://example.org/p",
             "http://example.org/b",
         )]);
-        let a = store.dict.lookup("http://example.org/a").unwrap();
-        let p = store.dict.lookup("http://example.org/p").unwrap();
-        let b = store.dict.lookup("http://example.org/b").unwrap();
+        let a = store.dict.lookup_iri("http://example.org/a").unwrap();
+        let p = store.dict.lookup_iri("http://example.org/p").unwrap();
+        let b = store.dict.lookup_iri("http://example.org/b").unwrap();
         let c = store.dict.insert("http://example.org/c");
 
         // b löschen, c einfügen – in einem Rebuild.
@@ -870,9 +932,9 @@ mod tests {
             ("person2", "bornIn", "city1"), // andere Stadt
         ]);
 
-        let born_in = store.dict.lookup("bornIn").unwrap();
-        let located_in = store.dict.lookup("locatedIn").unwrap();
-        let country0 = store.dict.lookup("country0").unwrap();
+        let born_in = store.dict.lookup_iri("bornIn").unwrap();
+        let located_in = store.dict.lookup_iri("locatedIn").unwrap();
+        let country0 = store.dict.lookup_iri("country0").unwrap();
 
         let results = store.join_chain(born_in, located_in, country0);
         assert_eq!(results.len(), 2);

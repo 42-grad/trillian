@@ -16,8 +16,8 @@ use spargebra::{Query as SparqlQuery, SparqlParser};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::hypertrie::{
-    Dictionary, GraphPattern, HybridEngine, PatternTerm, RowBlock, TermType, TriplePattern,
-    TripleStore,
+    Dictionary, GraphPattern, HybridEngine, NULL_ID, PatternTerm, RowBlock, TermType,
+    TriplePattern, TripleStore,
 };
 use crate::wal::Wal;
 
@@ -74,12 +74,16 @@ pub async fn serve_durable(store: TripleStore, port: u16, wal: Option<crate::wal
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", port);
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .unwrap_or_else(|e| panic!("konnte nicht an {addr} binden: {e}"));
     println!(
         "SPARQL endpoint listening on http://{}/sparql, /stream, /count, /update",
         addr
     );
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app)
+        .await
+        .expect("HTTP-Server unerwartet beendet");
 }
 
 #[derive(serde::Deserialize, Debug, Default)]
@@ -114,7 +118,7 @@ pub async fn sparql_handler(
         }
     }
 
-    let store = state.store.read().unwrap();
+    let store = state.store.read().unwrap_or_else(|e| e.into_inner());
     match execute_sparql(&store, &state.engine, &query_str) {
         Ok(body) => {
             if let Ok(mut cache) = state.cache.lock() {
@@ -145,7 +149,7 @@ pub async fn stream_handler(
     let state = Arc::clone(&state);
 
     tokio::task::spawn_blocking(move || {
-        let store = state.store.read().unwrap();
+        let store = state.store.read().unwrap_or_else(|e| e.into_inner());
         let result = evaluate_select(&store, &state.engine, &query_str);
         match result {
             Ok(select) => {
@@ -206,7 +210,7 @@ pub async fn count_handler(
         );
     }
 
-    let store = state.store.read().unwrap();
+    let store = state.store.read().unwrap_or_else(|e| e.into_inner());
     match execute_count(&store, &state.engine, &query_str) {
         Ok(result) => (StatusCode::OK, axum::Json(result)).into_response(),
         Err(e) => sparql_error(&e, StatusCode::BAD_REQUEST),
@@ -231,9 +235,12 @@ pub async fn update_handler(
         );
     }
 
-    let mut store = state.store.write().unwrap();
+    let mut store = state.store.write().unwrap_or_else(|e| e.into_inner());
     // WAL für die Dauer des Updates sperren (durabel protokollieren).
-    let mut wal_guard = state.wal.as_ref().map(|m| m.lock().unwrap());
+    let mut wal_guard = state
+        .wal
+        .as_ref()
+        .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
     match execute_update(&mut store, &update_str, wal_guard.as_deref_mut()) {
         Ok(()) => {
             // Write-Ahead-Log auf Platte zwingen, BEVOR wir Erfolg melden.
@@ -499,8 +506,12 @@ enum PathEnd {
 fn resolve_path_end(tp: &spargebra::term::TermPattern, dict: &Dictionary) -> Option<PathEnd> {
     match tp {
         spargebra::term::TermPattern::Variable(v) => Some(PathEnd::Var(v.as_str().to_string())),
-        spargebra::term::TermPattern::NamedNode(nn) => dict.lookup(nn.as_str()).map(PathEnd::Bound),
-        spargebra::term::TermPattern::Literal(lit) => dict.lookup(lit.value()).map(PathEnd::Bound),
+        spargebra::term::TermPattern::NamedNode(nn) => {
+            dict.lookup_iri(nn.as_str()).map(PathEnd::Bound)
+        }
+        spargebra::term::TermPattern::Literal(lit) => dict
+            .lookup_term(lit.value(), &literal_term_type(lit))
+            .map(PathEnd::Bound),
         spargebra::term::TermPattern::BlankNode(_) => None,
     }
 }
@@ -510,7 +521,7 @@ fn step_forward(store: &TripleStore, path: &Ppe, from: &FxHashSet<u32>) -> FxHas
     let mut out = FxHashSet::default();
     match path {
         Ppe::NamedNode(nn) => {
-            if let Some(pid) = store.dict.lookup(nn.as_str()) {
+            if let Some(pid) = store.dict.lookup_iri(nn.as_str()) {
                 for &s in from {
                     out.extend(store.objects_of(s, pid).iter().copied());
                 }
@@ -534,8 +545,9 @@ fn step_forward(store: &TripleStore, path: &Ppe, from: &FxHashSet<u32>) -> FxHas
         Ppe::NegatedPropertySet(nns) => {
             let exclude: FxHashSet<u32> = nns
                 .iter()
-                .filter_map(|n| store.dict.lookup(n.as_str()))
+                .filter_map(|n| store.dict.lookup_iri(n.as_str()))
                 .collect();
+
             for &s in from {
                 for (pid, o) in store.po_pairs_of(s) {
                     if !exclude.contains(&pid) {
@@ -553,7 +565,7 @@ fn step_backward(store: &TripleStore, path: &Ppe, from: &FxHashSet<u32>) -> FxHa
     let mut out = FxHashSet::default();
     match path {
         Ppe::NamedNode(nn) => {
-            if let Some(pid) = store.dict.lookup(nn.as_str()) {
+            if let Some(pid) = store.dict.lookup_iri(nn.as_str()) {
                 for &o in from {
                     out.extend(store.subjects_of(pid, o).iter().copied());
                 }
@@ -578,7 +590,7 @@ fn step_backward(store: &TripleStore, path: &Ppe, from: &FxHashSet<u32>) -> FxHa
         Ppe::NegatedPropertySet(nns) => {
             let exclude: FxHashSet<u32> = nns
                 .iter()
-                .filter_map(|n| store.dict.lookup(n.as_str()))
+                .filter_map(|n| store.dict.lookup_iri(n.as_str()))
                 .collect();
             for &o in from {
                 for (pid, s) in store.sp_pairs_of(o) {
@@ -759,7 +771,6 @@ fn hash_join(
     rvo: &[String],
     left_outer: bool,
 ) -> (RowBlock, Vec<String>) {
-    const NULL_ID: u32 = u32::MAX;
     let mut shared: Vec<(usize, usize)> = Vec::new(); // (left_pos, right_pos)
     let mut new_positions: Vec<usize> = Vec::new();
     let mut new_vars: Vec<String> = Vec::new();
@@ -815,7 +826,6 @@ fn union_rows(
     right: RowBlock,
     rvo: &[String],
 ) -> (RowBlock, Vec<String>) {
-    const NULL_ID: u32 = u32::MAX;
     let mut vo = lvo.to_vec();
     for v in rvo {
         if !vo.contains(v) {
@@ -849,6 +859,7 @@ fn union_rows(
 #[derive(PartialEq)]
 enum OrderKey {
     Unbound,
+    Blank(String),
     Num(f64),
     Iri(String),
     Str(String),
@@ -859,6 +870,7 @@ fn order_key(expr: &Expression, row: &[u32], vo: &[String], store: &TripleStore)
         Ok(Fv::Num(n)) => OrderKey::Num(n),
         Ok(Fv::Bool(b)) => OrderKey::Num(if b { 1.0 } else { 0.0 }),
         Ok(Fv::Iri(s)) => OrderKey::Iri(s),
+        Ok(Fv::Blank(s)) => OrderKey::Blank(s),
         Ok(Fv::Str(s)) | Ok(Fv::Lang(s, _)) | Ok(Fv::Typed(s, _)) => OrderKey::Str(s),
         Err(()) => OrderKey::Unbound,
     }
@@ -869,14 +881,15 @@ fn cmp_key(a: &OrderKey, b: &OrderKey) -> std::cmp::Ordering {
     fn rank(k: &OrderKey) -> u8 {
         match k {
             Unbound => 0,
-            Num(_) => 1,
-            Iri(_) => 2,
-            Str(_) => 3,
+            Blank(_) => 1,
+            Num(_) => 2,
+            Iri(_) => 3,
+            Str(_) => 4,
         }
     }
     match (a, b) {
         (Num(x), Num(y)) => x.total_cmp(y),
-        (Iri(x), Iri(y)) | (Str(x), Str(y)) => x.cmp(y),
+        (Blank(x), Blank(y)) | (Iri(x), Iri(y)) | (Str(x), Str(y)) => x.cmp(y),
         _ => rank(a).cmp(&rank(b)),
     }
 }
@@ -1029,6 +1042,11 @@ fn append_term(out: &mut String, id: u32, dict: &Dictionary) {
             append_json_str(out, v);
             out.push('}');
         }
+        (Some(v), Some(TermType::BlankNode)) => {
+            out.push_str("{\"type\":\"bnode\",\"value\":");
+            append_json_str(out, v);
+            out.push('}');
+        }
         (Some(v), Some(TermType::Literal { datatype, lang })) => {
             out.push_str("{\"type\":\"literal\",\"value\":");
             append_json_str(out, v);
@@ -1058,7 +1076,6 @@ fn append_term(out: &mut String, id: u32, dict: &Dictionary) {
 /// Serialisiert das Ergebnis **direkt als JSON-String** – ohne pro Zeile eine
 /// `serde_json::Map`/`Value` zu allokieren (das war ~95 % der Zeit großer Queries).
 fn write_sparql_json(result: &SelectResult, store: &TripleStore) -> String {
-    const NULL_ID: u32 = u32::MAX;
     let mut var_indices = Vec::with_capacity(result.vars.len());
     for var in &result.vars {
         let pos = result
@@ -1165,9 +1182,9 @@ fn execute_update(
                 for quad in data {
                     let (s, p, o) = ground_quad_to_triple_terms(&quad)?;
                     if let (Some(sid), Some(pid), Some(oid)) = (
-                        store.dict.lookup(&s.value),
-                        store.dict.lookup(&p.value),
-                        store.dict.lookup(&o.value),
+                        store.dict.lookup_term(&s.value, &s.typ),
+                        store.dict.lookup_term(&p.value, &p.typ),
+                        store.dict.lookup_term(&o.value, &o.typ),
                     ) {
                         if let Some(w) = wal.as_deref_mut() {
                             w.log_op(false, sid, pid, oid).map_err(|e| e.to_string())?;
@@ -1255,14 +1272,20 @@ fn ground_term_to_parsed(term: &GroundTerm) -> Result<ParsedTermRdf, String> {
     }
 }
 
-fn literal_to_parsed(lit: &Literal) -> ParsedTermRdf {
-    let value = lit.value().to_string();
-    let typ = if let Some(lang) = lit.language() {
+/// Term-Typ eines geparsten SPARQL-Literals (für Dictionary-Lookup/-Insert).
+fn literal_term_type(lit: &Literal) -> TermType {
+    if let Some(lang) = lit.language() {
         TermType::literal_lang(lang)
     } else {
         TermType::literal_datatype(lit.datatype().as_str())
-    };
-    ParsedTermRdf { value, typ }
+    }
+}
+
+fn literal_to_parsed(lit: &Literal) -> ParsedTermRdf {
+    ParsedTermRdf {
+        value: lit.value().to_string(),
+        typ: literal_term_type(lit),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1279,8 +1302,9 @@ const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
 #[derive(Debug, Clone)]
 enum Fv {
     Iri(String),
-    Str(String), // einfaches Literal / xsd:string
-    Num(f64),    // numerischer Datentyp
+    Blank(String), // Blank-Node-Label (isBlank != isIri)
+    Str(String),   // einfaches Literal / xsd:string
+    Num(f64),      // numerischer Datentyp
     Bool(bool),
     Lang(String, String),  // (Lexikal, Sprach-Tag)
     Typed(String, String), // (Lexikal, Datatype-IRI) – nicht numerisch/string
@@ -1329,7 +1353,8 @@ fn classify(lex: &str, datatype: Option<&str>, lang: Option<&str>) -> Fv {
 fn term_to_fv(id: u32, store: &TripleStore) -> Option<Fv> {
     let v = store.dict.resolve(id)?;
     match store.dict.resolve_type(id)? {
-        TermType::Iri | TermType::BlankNode => Some(Fv::Iri(v.to_string())),
+        TermType::Iri => Some(Fv::Iri(v.to_string())),
+        TermType::BlankNode => Some(Fv::Blank(v.to_string())),
         TermType::Literal { datatype, lang } => {
             Some(classify(v, datatype.as_deref(), lang.as_deref()))
         }
@@ -1364,6 +1389,7 @@ fn fv_equal(a: &Fv, b: &Fv) -> Option<bool> {
     }
     match (a, b) {
         (Fv::Iri(x), Fv::Iri(y)) => Some(x == y),
+        (Fv::Blank(x), Fv::Blank(y)) => Some(x == y),
         (Fv::Bool(x), Fv::Bool(y)) => Some(x == y),
         (Fv::Str(x), Fv::Str(y)) => Some(x == y),
         (Fv::Lang(x, lx), Fv::Lang(y, ly)) => Some(x == y && lx == ly),
@@ -1379,12 +1405,17 @@ fn fv_cmp(a: &Fv, b: &Fv) -> Option<std::cmp::Ordering> {
     match (a, b) {
         (Fv::Str(x), Fv::Str(y)) => Some(x.cmp(y)),
         (Fv::Lang(x, _), Fv::Lang(y, _)) => Some(x.cmp(y)),
+        // SPARQL erlaubt Ordnungsvergleiche auf IRIs und (gleich-typisierten) Literalen.
+        (Fv::Iri(x), Fv::Iri(y)) => Some(x.cmp(y)),
+        (Fv::Blank(x), Fv::Blank(y)) => Some(x.cmp(y)),
+        (Fv::Bool(x), Fv::Bool(y)) => Some(x.cmp(y)),
+        // Gleicher Datentyp -> lexikalischer Vergleich; verschiedene -> unvergleichbar.
+        (Fv::Typed(x, dx), Fv::Typed(y, dy)) if dx == dy => Some(x.cmp(y)),
         _ => None,
     }
 }
 
 fn eval(expr: &Expression, row: &[u32], vars: &[String], store: &TripleStore) -> Result<Fv, ()> {
-    const NULL_ID: u32 = u32::MAX;
     match expr {
         Expression::NamedNode(nn) => Ok(Fv::Iri(nn.as_str().to_string())),
         Expression::Literal(lit) => Ok(literal_to_fv(lit)),
@@ -1440,7 +1471,15 @@ fn eval(expr: &Expression, row: &[u32], vars: &[String], store: &TripleStore) ->
         Expression::Add(a, b) => num_op(a, b, row, vars, store, |x, y| x + y),
         Expression::Subtract(a, b) => num_op(a, b, row, vars, store, |x, y| x - y),
         Expression::Multiply(a, b) => num_op(a, b, row, vars, store, |x, y| x * y),
-        Expression::Divide(a, b) => num_op(a, b, row, vars, store, |x, y| x / y),
+        Expression::Divide(a, b) => {
+            let x = as_num(&eval(a, row, vars, store)?).ok_or(())?;
+            let y = as_num(&eval(b, row, vars, store)?).ok_or(())?;
+            // SPARQL 1.1: Division durch Null ist ein Fehler -> Zeile fällt raus.
+            if y == 0.0 {
+                return Err(());
+            }
+            Ok(Fv::Num(x / y))
+        }
         Expression::UnaryPlus(a) => Ok(Fv::Num(as_num(&eval(a, row, vars, store)?).ok_or(())?)),
         Expression::UnaryMinus(a) => Ok(Fv::Num(-as_num(&eval(a, row, vars, store)?).ok_or(())?)),
         Expression::Bound(v) => {
@@ -1505,7 +1544,7 @@ fn eval_func(
     let arg = |i: usize| eval(&args[i], row, vars, store);
     match func {
         Function::Str => Ok(Fv::Str(match arg(0)? {
-            Fv::Iri(s) | Fv::Str(s) | Fv::Lang(s, _) | Fv::Typed(s, _) => s,
+            Fv::Iri(s) | Fv::Blank(s) | Fv::Str(s) | Fv::Lang(s, _) | Fv::Typed(s, _) => s,
             Fv::Num(n) => format_num(n),
             Fv::Bool(b) => b.to_string(),
         })),
@@ -1519,7 +1558,7 @@ fn eval_func(
             Fv::Str(_) => format!("{XSD}string"),
             Fv::Lang(..) => "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString".to_string(),
             Fv::Typed(_, dt) => dt,
-            Fv::Iri(_) => return Err(()),
+            Fv::Iri(_) | Fv::Blank(_) => return Err(()), // datatype() nur für Literale
         })),
         Function::StrLen => Ok(Fv::Num(as_str(&arg(0)?).ok_or(())?.chars().count() as f64)),
         Function::UCase => Ok(Fv::Str(as_str(&arg(0)?).ok_or(())?.to_uppercase())),
@@ -1527,8 +1566,9 @@ fn eval_func(
         Function::Contains => str2(&arg(0)?, &arg(1)?, |a, b| a.contains(b)),
         Function::StrStarts => str2(&arg(0)?, &arg(1)?, |a, b| a.starts_with(b)),
         Function::StrEnds => str2(&arg(0)?, &arg(1)?, |a, b| a.ends_with(b)),
-        Function::IsIri | Function::IsBlank => Ok(Fv::Bool(matches!(arg(0)?, Fv::Iri(_)))),
-        Function::IsLiteral => Ok(Fv::Bool(!matches!(arg(0)?, Fv::Iri(_)))),
+        Function::IsIri => Ok(Fv::Bool(matches!(arg(0)?, Fv::Iri(_)))),
+        Function::IsBlank => Ok(Fv::Bool(matches!(arg(0)?, Fv::Blank(_)))),
+        Function::IsLiteral => Ok(Fv::Bool(!matches!(arg(0)?, Fv::Iri(_) | Fv::Blank(_)))),
         Function::IsNumeric => Ok(Fv::Bool(matches!(arg(0)?, Fv::Num(_)))),
         _ => Err(()),
     }
@@ -1601,7 +1641,7 @@ fn translate_named_node_pattern(
     match np {
         spargebra::term::NamedNodePattern::NamedNode(nn) => {
             let iri = nn.as_str();
-            match dict.lookup(iri) {
+            match dict.lookup_iri(iri) {
                 Some(id) => Ok(TranslationResult::Term(PatternTerm::Bound(id))),
                 None => Ok(TranslationResult::UnknownConstant),
             }
@@ -1617,19 +1657,17 @@ fn translate_term_pattern(
     dict: &Dictionary,
 ) -> Result<TranslationResult, String> {
     match tp {
-        spargebra::term::TermPattern::NamedNode(nn) => {
-            let iri = nn.as_str();
-            match dict.lookup(iri) {
-                Some(id) => Ok(TranslationResult::Term(PatternTerm::Bound(id))),
-                None => Ok(TranslationResult::UnknownConstant),
-            }
-        }
+        spargebra::term::TermPattern::NamedNode(nn) => match dict.lookup_iri(nn.as_str()) {
+            Some(id) => Ok(TranslationResult::Term(PatternTerm::Bound(id))),
+            None => Ok(TranslationResult::UnknownConstant),
+        },
         spargebra::term::TermPattern::Variable(v) => Ok(TranslationResult::Term(
             PatternTerm::Variable(v.as_str().to_string()),
         )),
         spargebra::term::TermPattern::Literal(lit) => {
-            let lexical = lit.value();
-            match dict.lookup(lexical) {
+            // Lexikalwert **und** Datentyp/Sprach-Tag müssen passen: "25"^^xsd:integer
+            // darf nicht "25"^^xsd:string oder den IRI 25 treffen.
+            match dict.lookup_term(lit.value(), &literal_term_type(lit)) {
                 Some(id) => Ok(TranslationResult::Term(PatternTerm::Bound(id))),
                 None => Ok(TranslationResult::UnknownConstant),
             }
@@ -1649,7 +1687,6 @@ fn translate_term_pattern(
 // ---------------------------------------------------------------------------
 
 fn term_to_json(id: u32, dict: &Dictionary) -> Value {
-    const NULL_ID: u32 = u32::MAX;
     if id == NULL_ID {
         return Value::Null;
     }
@@ -1657,6 +1694,7 @@ fn term_to_json(id: u32, dict: &Dictionary) -> Value {
     let typ = dict.resolve_type(id);
     match (value, typ) {
         (Some(v), Some(TermType::Iri)) => json!({ "type": "uri", "value": v }),
+        (Some(v), Some(TermType::BlankNode)) => json!({ "type": "bnode", "value": v }),
         (Some(v), Some(TermType::Literal { datatype, lang })) => {
             let mut obj = json!({ "type": "literal", "value": v });
             if let Some(dt) = datatype {
@@ -1701,6 +1739,141 @@ mod tests {
             ),
         ]);
         store
+    }
+
+    fn rows_of(store: &TripleStore, query: &str) -> Vec<Value> {
+        let engine = HybridEngine::new();
+        let result: Value =
+            serde_json::from_str(&execute_sparql(store, &engine, query).unwrap()).unwrap();
+        result["results"]["bindings"].as_array().unwrap().clone()
+    }
+
+    const XSD_INT: &str = "http://www.w3.org/2001/XMLSchema#integer";
+
+    /// BGP-Lookup eines Literals muss den Datentyp respektieren: `"25"`
+    /// (= xsd:string) darf nicht das gleichnamige xsd:integer-Literal treffen.
+    #[test]
+    fn bgp_literal_lookup_respects_datatype() {
+        let mut store = TripleStore::new();
+        let s_int = store
+            .dict
+            .insert_with_type("http://example.org/sInt", TermType::Iri);
+        let s_str = store
+            .dict
+            .insert_with_type("http://example.org/sStr", TermType::Iri);
+        let p = store
+            .dict
+            .insert_with_type("http://example.org/p", TermType::Iri);
+        let o_int = store
+            .dict
+            .insert_with_type("25", TermType::literal_datatype(XSD_INT));
+        let o_str = store.dict.insert_with_type("25", TermType::literal_plain());
+        assert_ne!(
+            o_int, o_str,
+            "typisierte Literale müssen verschiedene IDs haben"
+        );
+        store.insert_triple(s_int, p, o_int);
+        store.insert_triple(s_str, p, o_str);
+
+        // "25" ohne Typ -> xsd:string -> nur sStr.
+        let rows = rows_of(
+            &store,
+            "SELECT ?s WHERE { ?s <http://example.org/p> \"25\" }",
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["s"]["value"], "http://example.org/sStr");
+
+        // "25"^^xsd:integer -> nur sInt.
+        let rows = rows_of(
+            &store,
+            "SELECT ?s WHERE { ?s <http://example.org/p> \"25\"^^<http://www.w3.org/2001/XMLSchema#integer> }",
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["s"]["value"], "http://example.org/sInt");
+    }
+
+    /// SPARQL 1.1: Division durch Null ist ein Fehler -> die Zeile fällt im
+    /// FILTER raus (kein INFINITY, das `> 0` erfüllen würde).
+    #[test]
+    fn filter_division_by_zero_drops_row() {
+        let mut store = TripleStore::new();
+        let s = store
+            .dict
+            .insert_with_type("http://example.org/s", TermType::Iri);
+        let p = store
+            .dict
+            .insert_with_type("http://example.org/v", TermType::Iri);
+        let o = store
+            .dict
+            .insert_with_type("5", TermType::literal_datatype(XSD_INT));
+        store.insert_triple(s, p, o);
+
+        let rows = rows_of(
+            &store,
+            "SELECT ?s WHERE { ?s <http://example.org/v> ?v FILTER(?v / 0 > 0) }",
+        );
+        assert_eq!(rows.len(), 0);
+    }
+
+    /// FILTER mit `<` auf IRIs muss vergleichen (vorher: immer Fehler -> leer).
+    #[test]
+    fn filter_iri_less_than_compares() {
+        let mut store = TripleStore::new();
+        store.ingest_str_triples(&[(
+            "http://example.org/a",
+            "http://example.org/p",
+            "http://example.org/b",
+        )]);
+        // a < b lexikalisch -> eine Zeile.
+        let rows = rows_of(
+            &store,
+            "SELECT ?x ?y WHERE { ?x <http://example.org/p> ?y FILTER(?x < ?y) }",
+        );
+        assert_eq!(rows.len(), 1);
+        // umgekehrt: b < a ist falsch -> leer.
+        let rows = rows_of(
+            &store,
+            "SELECT ?x ?y WHERE { ?x <http://example.org/p> ?y FILTER(?y < ?x) }",
+        );
+        assert_eq!(rows.len(), 0);
+    }
+
+    /// isBlank unterscheidet Blank Nodes von IRIs; das IRI-Objekt darf nicht
+    /// als Blank Node durchgehen, und es wird als `bnode` ausgegeben.
+    #[test]
+    fn isblank_distinguishes_blank_from_iri() {
+        let mut store = TripleStore::new();
+        let s_b = store
+            .dict
+            .insert_with_type("http://example.org/sB", TermType::Iri);
+        let s_i = store
+            .dict
+            .insert_with_type("http://example.org/sI", TermType::Iri);
+        let p = store
+            .dict
+            .insert_with_type("http://example.org/p", TermType::Iri);
+        let blank = store.dict.insert_with_type("b0", TermType::BlankNode);
+        let iri = store
+            .dict
+            .insert_with_type("http://example.org/o", TermType::Iri);
+        store.insert_triple(s_b, p, blank);
+        store.insert_triple(s_i, p, iri);
+
+        let rows = rows_of(
+            &store,
+            "SELECT ?s ?o WHERE { ?s <http://example.org/p> ?o FILTER(isBlank(?o)) }",
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["s"]["value"], "http://example.org/sB");
+        assert_eq!(rows[0]["o"]["type"], "bnode");
+
+        // isIri ist komplementär: nur das IRI-Objekt.
+        let rows = rows_of(
+            &store,
+            "SELECT ?s WHERE { ?s <http://example.org/p> ?o FILTER(isIri(?o)) }",
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["s"]["value"], "http://example.org/sI");
     }
 
     #[test]

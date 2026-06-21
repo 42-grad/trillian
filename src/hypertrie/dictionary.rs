@@ -46,6 +46,47 @@ impl TermType {
     }
 }
 
+/// `xsd:string` – ein einfaches Literal (`datatype: None`) ist nach RDF 1.1
+/// **identisch** zu einem explizit mit `xsd:string` typisierten Literal. Beide
+/// müssen daher denselben Dictionary-Schlüssel erhalten.
+const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
+
+/// Trenner zwischen Typ-Präfix und Lexikalwert im internierten Schlüssel.
+/// `0x01` kommt in normalen IRIs, Datentyp-IRIs und Sprach-Tags nicht vor; der
+/// (beliebige) Lexikalwert steht als Suffix nach dem **ersten** Vorkommen.
+const SEP: char = '\u{1}';
+
+/// Baut den eindeutigen Interner-Schlüssel aus Lexikalwert **und** Typ.
+///
+/// Ohne Typ im Schlüssel kollabieren z. B. `"25"^^xsd:integer`,
+/// `"25"^^xsd:string` und der IRI `25` zu einer einzigen ID – ein
+/// Korrektheitsfehler bei typisierten Literal-Constraints. Der Lexikalwert
+/// bleibt zusammenhängendes Suffix, sodass [`decode_value`] zero-copy slicen kann.
+fn encode_key(value: &str, typ: &TermType) -> String {
+    match typ {
+        TermType::Iri => format!("I{SEP}{value}"),
+        TermType::BlankNode => format!("B{SEP}{value}"),
+        TermType::Literal { lang: Some(l), .. } => format!("G{l}{SEP}{value}"),
+        TermType::Literal {
+            datatype: Some(d),
+            lang: None,
+        } if d != XSD_STRING => {
+            format!("D{d}{SEP}{value}")
+        }
+        // einfaches Literal oder explizit xsd:string -> derselbe Schlüssel
+        TermType::Literal { .. } => format!("L{SEP}{value}"),
+    }
+}
+
+/// Holt den Lexikalwert aus einem internierten Schlüssel zurück (zero-copy).
+#[inline]
+fn decode_value(key: &str) -> &str {
+    match key.find(SEP) {
+        Some(i) => &key[i + SEP.len_utf8()..],
+        None => key, // sollte nicht vorkommen; defensiv
+    }
+}
+
 /// Bidirektionales String ↔ u32 Dictionary mit Term-Typ-Information.
 ///
 /// Strings werden **interniert** (eine Arena, jeder String einmal) statt als
@@ -64,7 +105,8 @@ impl Dictionary {
 
     /// Fügt einen Term mit Typ hinzu oder liefert die existierende ID.
     pub fn insert_with_type(&mut self, term: &str, typ: TermType) -> u32 {
-        let id = self.interner.get_or_intern(term).to_usize() as u32;
+        let key = encode_key(term, &typ);
+        let id = self.interner.get_or_intern(&key).to_usize() as u32;
         // Neuer Term -> ID == bisherige Länge; Typ parallel anhängen.
         if id as usize == self.id_to_type.len() {
             self.id_to_type.push(typ);
@@ -77,16 +119,26 @@ impl Dictionary {
         self.insert_with_type(term, TermType::Iri)
     }
 
-    /// Liefert die ID eines Terms, falls bekannt.
+    /// Liefert die ID eines Terms anhand von Lexikalwert **und** Typ.
     #[inline]
-    pub fn lookup(&self, term: &str) -> Option<u32> {
-        self.interner.get(term).map(|s| s.to_usize() as u32)
+    pub fn lookup_term(&self, value: &str, typ: &TermType) -> Option<u32> {
+        self.interner
+            .get(encode_key(value, typ))
+            .map(|s| s.to_usize() as u32)
     }
 
-    /// Löst eine ID in den ursprünglichen String auf.
+    /// Bequemlichkeit: ID eines IRI-Terms.
+    #[inline]
+    pub fn lookup_iri(&self, iri: &str) -> Option<u32> {
+        self.lookup_term(iri, &TermType::Iri)
+    }
+
+    /// Löst eine ID in den ursprünglichen Lexikalwert auf (ohne Typ-Präfix).
     #[inline]
     pub fn resolve(&self, id: u32) -> Option<&str> {
-        SymbolU32::try_from_usize(id as usize).and_then(|s| self.interner.resolve(s))
+        SymbolU32::try_from_usize(id as usize)
+            .and_then(|s| self.interner.resolve(s))
+            .map(decode_value)
     }
 
     /// Liefert den Typ eines Terms.
@@ -192,5 +244,63 @@ impl Dictionary {
             dict.insert_with_type(s, typ);
         }
         dict
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Gleicher Lexikalwert, aber verschiedene Typen -> verschiedene IDs.
+    #[test]
+    fn distinct_terms_for_same_lexical_value() {
+        let mut d = Dictionary::new();
+        let i_int = d.insert_with_type(
+            "25",
+            TermType::literal_datatype("http://www.w3.org/2001/XMLSchema#integer"),
+        );
+        let i_str = d.insert_with_type("25", TermType::literal_datatype(XSD_STRING));
+        let i_iri = d.insert_with_type("25", TermType::Iri);
+        let i_plain = d.insert_with_type("25", TermType::literal_plain());
+
+        assert_ne!(i_int, i_str, "integer != string");
+        assert_ne!(i_int, i_iri, "integer != IRI");
+        assert_ne!(i_str, i_iri, "string != IRI");
+        // einfaches Literal und explizites xsd:string sind nach RDF 1.1 identisch
+        assert_eq!(i_str, i_plain, "plain literal == xsd:string");
+    }
+
+    /// `resolve` liefert den reinen Lexikalwert zurück (ohne Typ-Präfix), und
+    /// `lookup_term` findet exakt den passend typisierten Eintrag.
+    #[test]
+    fn resolve_strips_prefix_and_lookup_is_typed() {
+        let mut d = Dictionary::new();
+        let dt = "http://www.w3.org/2001/XMLSchema#integer";
+        let id = d.insert_with_type("25", TermType::literal_datatype(dt));
+        d.insert_with_type("25", TermType::Iri);
+
+        assert_eq!(d.resolve(id), Some("25"));
+        assert_eq!(
+            d.lookup_term("25", &TermType::literal_datatype(dt)),
+            Some(id)
+        );
+        assert_ne!(d.lookup_iri("25"), Some(id));
+        assert_eq!(
+            d.lookup_term(
+                "25",
+                &TermType::literal_datatype("http://www.w3.org/2001/XMLSchema#double")
+            ),
+            None
+        );
+    }
+
+    /// Lexikalwert mit eingebettetem Trenner-Byte bleibt unversehrt.
+    #[test]
+    fn value_containing_separator_byte_roundtrips() {
+        let mut d = Dictionary::new();
+        let weird = "a\u{1}b";
+        let id = d.insert_with_type(weird, TermType::literal_plain());
+        assert_eq!(d.resolve(id), Some(weird));
+        assert_eq!(d.lookup_term(weird, &TermType::literal_plain()), Some(id));
     }
 }

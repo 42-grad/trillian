@@ -168,3 +168,120 @@ fn read_term(b: &[u8], mut p: usize) -> Option<(String, TermType, usize)> {
     };
     Some((value, typ, p))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// Eindeutiger Temp-Pfad pro Testfall (keine `Date`/`rand`-APIs nötig).
+    fn temp_path(tag: &str) -> String {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir()
+            .join(format!("trillian_wal_{tag}_{n}.log"))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Schreibt drei IRI-Terme (IDs 0,1,2) + ein Insert und prüft, dass der
+    /// Replay in einen frischen Store dieselben IDs vergibt und das Triple setzt.
+    #[test]
+    fn replays_terms_and_insert() {
+        let path = temp_path("insert");
+        {
+            let mut wal = Wal::open_append(&path).unwrap();
+            wal.log_term("http://ex/s", &TermType::Iri).unwrap();
+            wal.log_term("http://ex/p", &TermType::Iri).unwrap();
+            wal.log_term("http://ex/o", &TermType::Iri).unwrap();
+            wal.log_op(true, 0, 1, 2).unwrap();
+            wal.sync().unwrap();
+        }
+
+        let mut store = TripleStore::new();
+        let applied = Wal::replay(&path, &mut store).unwrap();
+        assert_eq!(applied, 1);
+        assert_eq!(store.triple_count(), 1);
+        assert_eq!(store.dict.lookup_iri("http://ex/s"), Some(0));
+        assert_eq!(store.dict.lookup_iri("http://ex/o"), Some(2));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Insert gefolgt von Delete desselben Triples -> Store wieder leer.
+    #[test]
+    fn replays_delete_after_insert() {
+        let path = temp_path("delete");
+        {
+            let mut wal = Wal::open_append(&path).unwrap();
+            wal.log_term("a", &TermType::Iri).unwrap();
+            wal.log_term("b", &TermType::Iri).unwrap();
+            wal.log_term("c", &TermType::Iri).unwrap();
+            wal.log_op(true, 0, 1, 2).unwrap();
+            wal.log_op(false, 0, 1, 2).unwrap();
+            wal.sync().unwrap();
+        }
+
+        let mut store = TripleStore::new();
+        let applied = Wal::replay(&path, &mut store).unwrap();
+        assert_eq!(applied, 2); // ein Insert + ein Delete angewandt
+        assert_eq!(store.triple_count(), 0);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Der Typ (Sprach-Literal) muss den Replay verlustfrei überleben.
+    #[test]
+    fn replays_typed_literal_term() {
+        let path = temp_path("typed");
+        {
+            let mut wal = Wal::open_append(&path).unwrap();
+            wal.log_term("Alice", &TermType::literal_lang("en"))
+                .unwrap();
+            wal.sync().unwrap();
+        }
+
+        let mut store = TripleStore::new();
+        Wal::replay(&path, &mut store).unwrap();
+        let id = store
+            .dict
+            .lookup_term("Alice", &TermType::literal_lang("en"))
+            .expect("Sprach-Literal nach Replay vorhanden");
+        assert!(matches!(
+            store.dict.resolve_type(id),
+            Some(TermType::Literal { lang: Some(_), .. })
+        ));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Ein angerissener letzter Record (Crash beim Schreiben) wird ignoriert,
+    /// die davor vollständig geschriebene Operation bleibt erhalten.
+    #[test]
+    fn ignores_truncated_tail() {
+        use std::io::Write;
+        let path = temp_path("truncated");
+        {
+            let mut wal = Wal::open_append(&path).unwrap();
+            wal.log_term("a", &TermType::Iri).unwrap();
+            wal.log_term("b", &TermType::Iri).unwrap();
+            wal.log_term("c", &TermType::Iri).unwrap();
+            wal.log_op(true, 0, 1, 2).unwrap();
+            wal.sync().unwrap();
+        }
+        // Halben Insert-Record anhängen: Tag + nur 4 statt 12 Byte.
+        {
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(&[0x00]).unwrap();
+            f.write_all(&7u32.to_le_bytes()).unwrap();
+            f.sync_data().unwrap();
+        }
+
+        let mut store = TripleStore::new();
+        let applied = Wal::replay(&path, &mut store).unwrap();
+        assert_eq!(applied, 1); // nur die vollständige Operation
+        assert_eq!(store.triple_count(), 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+}

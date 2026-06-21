@@ -193,8 +193,10 @@ mod tests {
 
     #[test]
     fn optimizer_picks_most_selective_first() {
-        let mut stats = Stats::default();
-        stats.total_triples = 155;
+        let mut stats = Stats {
+            total_triples: 155,
+            ..Default::default()
+        };
         stats.predicate_degree.insert(1, 100);
         stats.predicate_degree.insert(2, 5);
         stats.predicate_degree.insert(3, 50);
@@ -207,8 +209,10 @@ mod tests {
 
     #[test]
     fn optimizer_prefers_connected_patterns() {
-        let mut stats = Stats::default();
-        stats.total_triples = 155;
+        let mut stats = Stats {
+            total_triples: 155,
+            ..Default::default()
+        };
         stats.predicate_degree.insert(1, 100);
         stats.predicate_degree.insert(2, 5);
         stats.predicate_degree.insert(3, 50);
