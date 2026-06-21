@@ -150,7 +150,7 @@ mod tests {
                 },
             ],
         };
-        let chain_rows = engine.execute(&store, &chain).n_rows();
+        let chain_rows = engine.execute(&store, &chain).expect("chain").n_rows();
 
         // Triangle: (?a,p0,?b)(?b,p0,?c)(?c,p0,?a)
         let triangle = GraphPattern {
@@ -172,7 +172,10 @@ mod tests {
                 },
             ],
         };
-        let triangle_rows = engine.execute(&store, &triangle).n_rows();
+        let triangle_rows = engine
+            .execute(&store, &triangle)
+            .expect("triangle")
+            .n_rows();
 
         assert!(
             chain_rows > 0,

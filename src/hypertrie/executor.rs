@@ -9,6 +9,21 @@ use super::query::{QueryResult, Term, TripleStore, Var};
 /// Alias auf die zentrale [`super::NULL_ID`]-Konstante.
 pub const UNBOUND: u32 = super::NULL_ID;
 
+/// Obergrenze für materialisierte Ergebniszeilen. Schützt den Server davor, bei
+/// einer entarteten Query (Kreuzprodukt disjunkter Muster oder unbeschränkt
+/// großer Zwischen-Join) den gesamten RAM zu allozieren und vom OOM-Killer
+/// beendet zu werden. Per `TRILLIAN_MAX_ROWS` überschreibbar.
+pub fn max_result_rows() -> usize {
+    use std::sync::OnceLock;
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("TRILLIAN_MAX_ROWS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20_000_000)
+    })
+}
+
 /// Flache, zeilen-orientierte Ergebnis-Matrix.
 ///
 /// Statt `Vec<Vec<u32>>` (eine Heap-Allokation **pro Zeile**) liegen alle
@@ -196,7 +211,11 @@ impl<'a> Iterator for RowIter<'a> {
 // ---------------------------------------------------------------------------
 
 /// Führt einen `ExecutionPlan` für ein `GraphPattern` aus.
-pub fn execute_plan(store: &TripleStore, pattern: &GraphPattern, plan: &ExecutionPlan) -> RowBlock {
+pub fn execute_plan(
+    store: &TripleStore,
+    pattern: &GraphPattern,
+    plan: &ExecutionPlan,
+) -> Result<RowBlock, String> {
     let mut var_map: FxHashMap<String, usize> = FxHashMap::default();
     for pat in &pattern.patterns {
         collect_vars(&pat.subject, &mut var_map);
@@ -204,9 +223,10 @@ pub fn execute_plan(store: &TripleStore, pattern: &GraphPattern, plan: &Executio
         collect_vars(&pat.object, &mut var_map);
     }
     let n_vars = var_map.len();
+    let cap = max_result_rows();
 
     if plan.steps.is_empty() {
-        return RowBlock::new(n_vars);
+        return Ok(RowBlock::new(n_vars));
     }
 
     let mut results = RowBlock::new(n_vars);
@@ -225,11 +245,25 @@ pub fn execute_plan(store: &TripleStore, pattern: &GraphPattern, plan: &Executio
                     n_vars,
                     &mut next,
                 );
+                if next.n_rows() > cap {
+                    return Err(result_too_large(cap));
+                }
             }
             results = next;
         }
+        if results.n_rows() > cap {
+            return Err(result_too_large(cap));
+        }
     }
-    results
+    Ok(results)
+}
+
+fn result_too_large(cap: usize) -> String {
+    format!(
+        "result exceeds {} rows (likely an unbounded/cross-product query); \
+         raise TRILLIAN_MAX_ROWS to allow",
+        cap
+    )
 }
 
 fn collect_vars(term: &PatternTerm, var_map: &mut FxHashMap<String, usize>) {
@@ -358,7 +392,7 @@ impl PatternTerm {
 // ---------------------------------------------------------------------------
 
 /// Führt ein Graph-Pattern mit Worst-Case-Optimal Join aus.
-pub fn execute_wcoj(store: &TripleStore, pattern: &GraphPattern) -> RowBlock {
+pub fn execute_wcoj(store: &TripleStore, pattern: &GraphPattern) -> Result<RowBlock, String> {
     if !is_wcoj_applicable(pattern, store) {
         let plan = pattern.optimize(store);
         return execute_plan(store, pattern, &plan);
@@ -386,7 +420,11 @@ pub fn execute_wcoj(store: &TripleStore, pattern: &GraphPattern) -> RowBlock {
         true, // erste Ebene parallel
     );
 
-    results
+    let cap = max_result_rows();
+    if results.n_rows() > cap {
+        return Err(result_too_large(cap));
+    }
+    Ok(results)
 }
 
 fn is_wcoj_applicable(pattern: &GraphPattern, store: &TripleStore) -> bool {
@@ -646,7 +684,7 @@ mod wcoj_tests {
             ],
         };
 
-        let results = execute_wcoj(&store, &pattern);
+        let results = execute_wcoj(&store, &pattern).unwrap();
         // Jede Rotation des Dreiecks ist ein Ergebnis: (a,b,c), (b,c,a), (c,a,b)
         assert_eq!(results.n_rows(), 3);
     }

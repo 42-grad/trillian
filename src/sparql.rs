@@ -752,7 +752,7 @@ fn eval_bgp(
     match translate_bgp(patterns, &store.dict)? {
         Some(internal) => {
             let vo: Vec<String> = internal.variable_order().into_iter().cloned().collect();
-            Ok((engine.execute(store, &internal), vo))
+            Ok((engine.execute(store, &internal)?, vo))
         }
         None => {
             // Unbekannte Konstante -> leere Lösung mit den Pattern-Variablen.
@@ -2341,5 +2341,63 @@ mod tests {
         let select = evaluate_select(&store, &engine, query).unwrap();
         assert_eq!(select.rows.n_rows(), 3);
         assert_eq!(select.vars, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn chained_optional_referencing_prior_optional_var() {
+        // Reproduziert die WDBench-`opts`-q3-Form (Rust 19 vs Tentris 6,77M):
+        // ein OPTIONAL, dessen Muster eine Variable nutzt, die nur in einem
+        // FRÜHEREN OPTIONAL gebunden wird ("nicht wohlgeformtes" Pattern).
+        //   ?x1 P102 <O> .
+        //   OPTIONAL { ?x1 P569 ?x2 }
+        //   OPTIONAL { ?x1 P19  ?x3 }
+        //   OPTIONAL { ?x1 P21  ?x4 }
+        //   OPTIONAL { ?x3 P625 ?x5 }   <- ?x3 stammt aus dem 2. OPTIONAL
+        let e = "http://ex/";
+        let mut store = TripleStore::new();
+        store.ingest_str_triples(&[
+            // base: s1, s2 haben P102 -> O
+            (&format!("{e}s1"), &format!("{e}P102"), &format!("{e}O")),
+            (&format!("{e}s2"), &format!("{e}P102"), &format!("{e}O")),
+            (&format!("{e}s1"), &format!("{e}P569"), &format!("{e}v1")), // x2: s1 only
+            (&format!("{e}s1"), &format!("{e}P19"), &format!("{e}m1")),  // x3: s1 -> {m1,m2}
+            (&format!("{e}s1"), &format!("{e}P19"), &format!("{e}m2")),
+            (&format!("{e}s1"), &format!("{e}P21"), &format!("{e}g")), // x4: s1 only
+            (&format!("{e}m1"), &format!("{e}P625"), &format!("{e}c1")), // x5 via x3
+            (&format!("{e}m2"), &format!("{e}P625"), &format!("{e}c2")),
+            // RAUSCHEN: P625 von einem NICHT über x3 erreichbaren Subjekt.
+            // Ein Kreuzprodukt (Tentris-Verdacht) würde das fälschlich einziehen.
+            (&format!("{e}noise"), &format!("{e}P625"), &format!("{e}nc")),
+        ]);
+        let engine = HybridEngine::new();
+        let q = format!(
+            "SELECT * WHERE {{ ?x1 <{e}P102> <{e}O> . \
+             OPTIONAL {{ ?x1 <{e}P569> ?x2 }} \
+             OPTIONAL {{ ?x1 <{e}P19> ?x3 }} \
+             OPTIONAL {{ ?x1 <{e}P21> ?x4 }} \
+             OPTIONAL {{ ?x3 <{e}P625> ?x5 }} }}"
+        );
+        let result: Value =
+            serde_json::from_str(&execute_sparql(&store, &engine, &q).unwrap()).unwrap();
+        let rows = result["results"]["bindings"].as_array().unwrap();
+        // Korrekte SPARQL-Semantik (left-deep):
+        //   s1×{m1,m2} -> 2 Zeilen mit x5=c1/c2; s2 -> 1 Zeile komplett NULL = 3.
+        // KEIN Kreuzprodukt: das Rausch-Tripel (noise P625 nc) darf NICHT auftauchen.
+        assert_eq!(rows.len(), 3, "left-deep OPTIONAL-Kette, kein Kreuzprodukt");
+        let x5: Vec<Option<&str>> = rows
+            .iter()
+            .map(|r| {
+                r.get("x5")
+                    .and_then(|v| v.get("value"))
+                    .and_then(|v| v.as_str())
+            })
+            .collect();
+        assert!(x5.contains(&Some("http://ex/c1")));
+        assert!(x5.contains(&Some("http://ex/c2")));
+        assert!(x5.contains(&None)); // s2-Zeile: x3=NULL -> x5=NULL
+        assert!(
+            !x5.contains(&Some("http://ex/nc")),
+            "kein Rausch-Tripel (Kreuzprodukt)"
+        );
     }
 }

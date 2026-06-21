@@ -78,7 +78,7 @@ fn main() {
     let engine = HybridEngine::new();
 
     // Einmal ausführen, um Ergebniszahl zu ermitteln
-    let chain_results = engine.execute(&store, &chain_pattern);
+    let chain_results = engine.execute(&store, &chain_pattern).expect("chain query");
     let chain_count = chain_results.n_rows();
 
     // Benchmark: 1.000 Durchläufe
@@ -127,7 +127,9 @@ fn main() {
     };
 
     // Einmal ausführen, um Ergebniszahl zu ermitteln
-    let triangle_results = engine.execute(&store, &triangle_pattern);
+    let triangle_results = engine
+        .execute(&store, &triangle_pattern)
+        .expect("triangle query");
     let triangle_count = triangle_results.n_rows();
 
     // Benchmark: 20 Durchläufe

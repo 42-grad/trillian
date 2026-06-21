@@ -24,7 +24,9 @@ impl HybridEngine {
     }
 
     /// Führt ein Graph-Pattern aus und wählt automatisch den optimalen Pfad.
-    pub fn execute(&self, store: &TripleStore, pattern: &GraphPattern) -> RowBlock {
+    /// Gibt `Err` zurück, wenn die Ergebnismenge den Row-Cap übersteigt
+    /// (Schutz vor OOM bei entarteten Queries), siehe `executor::max_result_rows`.
+    pub fn execute(&self, store: &TripleStore, pattern: &GraphPattern) -> Result<RowBlock, String> {
         if has_cycle(pattern) {
             execute_wcoj(store, pattern)
         } else {

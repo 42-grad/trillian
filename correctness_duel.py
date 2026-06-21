@@ -37,19 +37,34 @@ INT_TYPES = {
 FLOAT_TYPES = {XSD + "double", XSD + "float", XSD + "decimal"}
 
 
+HTTP_TIMEOUT = 60  # s pro Query (WDBench-Stil); danach -> ERR, Lauf läuft weiter
+
+
 def http_get_sparql(url: str, query: str):
-    """GET ?query=… mit SPARQL-JSON Accept. Liefert (status, parsed_json|None, raw)."""
+    """GET ?query=… mit SPARQL-JSON Accept. Liefert (status, parsed_json|None, raw).
+
+    Wirft NIE: Timeout/Connection-Fehler/Server-Tod werden als
+    `(None, {"error": ...}, raw)` zurückgegeben, damit eine einzelne entartete
+    Query den Gesamtlauf nicht abbricht (die Kategorie würde sonst sterben und
+    nachfolgende Kategorien `Connection refused` bekommen)."""
     parts = urlsplit(url)
-    conn = http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=120)
-    path = parts.path + "?" + urlencode({"query": query})
-    conn.request("GET", path, headers={"Accept": "application/sparql-results+json"})
-    resp = conn.getresponse()
-    body = resp.read()
-    conn.close()
+    conn = None
     try:
-        return resp.status, json.loads(body), body
-    except json.JSONDecodeError:
-        return resp.status, None, body
+        conn = http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=HTTP_TIMEOUT)
+        path = parts.path + "?" + urlencode({"query": query})
+        conn.request("GET", path, headers={"Accept": "application/sparql-results+json"})
+        resp = conn.getresponse()
+        body = resp.read()
+        try:
+            return resp.status, json.loads(body), body
+        except json.JSONDecodeError:
+            return resp.status, None, body
+    except (TimeoutError, OSError, http.client.HTTPException) as e:
+        kind = "timeout" if isinstance(e, TimeoutError) else type(e).__name__
+        return None, {"error": f"{kind}: {e}"}, b""
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def norm_term(t: dict):
@@ -302,7 +317,9 @@ def main():
         m = detail.split()[0] if detail and detail[0].isdigit() else ""
         rows = m
         lat = ""
-        if args.perf:
+        # Perf nur für saubere Vergleiche messen — sonst würden Timeouts (je
+        # `runs` × HTTP_TIMEOUT) den Lauf massiv verzögern, ohne Aussagewert.
+        if args.perf and status == "IDENTICAL":
             rmed, rp95 = latencies(args.rust_url, query, args.perf)
             tmed, tp95 = latencies(args.tentris_url, query, args.perf)
             lat = f"  {rmed:6.2f}/{rp95:6.2f} ms   {tmed:6.2f}/{tp95:6.2f} ms"
