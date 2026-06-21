@@ -135,6 +135,39 @@ def main():
     s0, p0, o0 = triples[0]
     queries["q07_ask"] = f"ASK {{ {s0} {p0} {o0} }}"
 
+    # --- FILTER-Queries (Verifikation der FILTER-Semantik gegen Tentris) ------
+    # 8) IRI-Ungleichheit: schließt genau ein Subjekt aus der Inverse-Menge aus.
+    queries["q08_filter_neq"] = (
+        f"SELECT ?s WHERE {{ ?s {pred_in} {pop_obj} FILTER(?s != {some_subj}) }}"
+    )
+
+    # Literal-wertiges Prädikat + numerisches Literal-Prädikat finden.
+    lit_pred, lit_first, num_pred = None, None, None
+    for p in preds:
+        for (_s, o) in by_pred[p][:80]:
+            if o.startswith('"'):
+                end = o.rfind('"')
+                lex = o[1:end] if end > 0 else ""
+                if lit_pred is None and lex and lex[0].isalnum():
+                    lit_pred, lit_first = p, lex[0]
+                if num_pred is None and lex.isdigit():
+                    num_pred = p
+        if lit_pred and num_pred:
+            break
+
+    # 9) String-Funktion (STRSTARTS) auf einem Literal-Prädikat.
+    if lit_pred and lit_first:
+        queries["q09_filter_strstarts"] = (
+            f'SELECT ?s ?o WHERE {{ ?s {lit_pred} ?o FILTER(STRSTARTS(STR(?o), "{lit_first}")) }}'
+        )
+
+    # 10) Numerischer Vergleich auf (untypisierten) Zahl-Literalen -> prüft, ob
+    #     beide Engines gleich damit umgehen (Typfehler vs. Zahl-Coercion).
+    if num_pred:
+        queries["q10_filter_num"] = (
+            f"SELECT ?s ?o WHERE {{ ?s {num_pred} ?o FILTER(?o > 5000) }}"
+        )
+
     for name, q in queries.items():
         (out_dir / f"{name}.rq").write_text(q + "\n")
     print(f"{len(queries)} Queries -> {out_dir}")
