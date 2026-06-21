@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 # watdiv_correctness.sh — Korrektheits- + Performance-Vergleich auf ECHTEN
-# (WatDiv-)Daten: baut WatDiv, generiert Daten + reale BGP-Queries, lädt beide
-# Engines (Rust-Clone + C++ Tentris) und vergleicht die vollständigen
-# Binding-Mengen via correctness_duel.py.
+# WatDiv-Daten: lädt einen **vorgenerierten** WatDiv-10M-Dump (kein brüchiger
+# Generator-Build), erzeugt reale BGP-Queries, lädt beide Engines (Rust-Clone +
+# C++ Tentris) und vergleicht die vollständigen Binding-Mengen via
+# correctness_duel.py.
 #
-# Läuft auf der Linux-Box (Tentris muss unter third_party/tentris/build gebaut
-# sein, wie nach run_remote_duel.sh). Aufruf:
-#     ./watdiv_correctness.sh [scale-factor]   # default 10  (~1M Triples)
-#
-# Voraussetzungen: g++, make, libboost-date-time-dev, python3, cargo.
+# Läuft auf der Linux-Box (Tentris unter third_party/tentris/build gebaut).
+# Aufruf:  ./watdiv_correctness.sh [stride]   # default 4 -> ~2.7M Triples
+#          stride=N nimmt jede N-te Zeile (diverse Auswahl, beschränkt Größe).
 set -euo pipefail
 
-SCALE="${1:-10}"
+STRIDE="${1:-4}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WD="${ROOT}/third_party/watdiv"
-NT="${ROOT}/watdiv_sf${SCALE}.nt"
+WATDIV_URL="https://dsg.uwaterloo.ca/watdiv/watdiv.10M.tar.bz2"
+FULL="${ROOT}/watdiv.10M.nt"
+NT="${ROOT}/watdiv_slice.nt"
 QDIR="${ROOT}/watdiv_queries"
 SNAP="${ROOT}/watdiv.bin"
 TDATA="${ROOT}/watdiv-tentris-data"
@@ -23,31 +23,19 @@ TENTRIS_PORT=9080
 
 log() { echo "[watdiv] $*"; }
 
-# --- 1. WatDiv-Generator bauen (mit Fixes für modernes Boost/C++17) ---------
-if [ ! -x "${WD}/bin/Release/watdiv" ]; then
-    log "Baue WatDiv-Generator..."
-    if ! ldconfig -p 2>/dev/null | grep -q libboost_date_time; then
-        log "Installiere libboost-date-time-dev..."
-        (apt-get install -y libboost-date-time-dev || sudo apt-get install -y libboost-date-time-dev) >/dev/null 2>&1 || true
-    fi
-    mkdir -p "${WD}"
-    curl -sL -o /tmp/watdiv_v06.tar https://dsg.uwaterloo.ca/watdiv/watdiv_v06.tar
-    tar -xf /tmp/watdiv_v06.tar -C "${WD}" --strip-components=1
-    cd "${WD}"
-    sed -i 's/c++0x/c++17/g' Makefile
-    # std::random_shuffle wurde in C++17 entfernt -> deterministisches std::shuffle
-    perl -0pi -e 's/random_shuffle\(eligible_list\.begin\(\), eligible_list\.end\(\)\);/{ static std::mt19937 _rng(42); std::shuffle(eligible_list.begin(), eligible_list.end(), _rng); }/' src/statistics.cpp
-    grep -q '#include <random>' src/statistics.cpp || sed -i '1i #include <random>' src/statistics.cpp
-    make
-    cd "${ROOT}"
+# --- 1. Vorgenerierten WatDiv-Dump laden (kein Generator-Build) -------------
+if [ ! -f "${FULL}" ]; then
+    log "Lade vorgenerierten WatDiv-10M-Dump (~56 MB)..."
+    curl -sL -o /tmp/watdiv.10M.tar.bz2 "${WATDIV_URL}"
+    tar -xjf /tmp/watdiv.10M.tar.bz2 -C "${ROOT}" watdiv.10M.nt
 fi
 
-# --- 2. Daten generieren ----------------------------------------------------
+# --- 2. Diverse, beschränkte Slice (jede STRIDE-te Zeile) -------------------
 if [ ! -f "${NT}" ]; then
-    log "Generiere WatDiv-Daten (scale ${SCALE})..."
-    "${WD}/bin/Release/watdiv" -d "${WD}/model/wsdbm-data-model.txt" "${SCALE}" > "${NT}"
+    log "Erzeuge Slice (jede ${STRIDE}. Zeile)..."
+    awk "NR % ${STRIDE} == 1" "${FULL}" > "${NT}"
 fi
-log "Datensatz: $(wc -l < "${NT}") Tripel"
+log "Datensatz: $(wc -l < "${NT}") Tripel (echte WatDiv-Daten)"
 
 # --- 3. Reale BGP-Queries aus den Daten erzeugen ----------------------------
 python3 "${ROOT}/watdiv_queries.py" "${NT}" "${QDIR}"
@@ -78,7 +66,7 @@ trap cleanup EXIT
 
 # --- 6. Auf beide Ports warten ----------------------------------------------
 for port in "${RUST_PORT}" "${TENTRIS_PORT}"; do
-    for _ in $(seq 1 120); do
+    for _ in $(seq 1 180); do
         if (echo > "/dev/tcp/localhost/${port}") 2>/dev/null; then break; fi
         sleep 1
     done
@@ -89,4 +77,4 @@ log "Vergleiche Binding-Mengen (Rust :${RUST_PORT} vs Tentris :${TENTRIS_PORT}).
 python3 "${ROOT}/correctness_duel.py" \
     "http://localhost:${RUST_PORT}/sparql" \
     "http://localhost:${TENTRIS_PORT}/sparql" \
-    "${QDIR}" --perf 50 | tee "${ROOT}/watdiv_correctness.log"
+    "${QDIR}" --perf 50
