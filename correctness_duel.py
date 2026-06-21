@@ -287,12 +287,13 @@ def main():
         for label, url in (("Rust", args.rust_url), ("Tentris", args.tentris_url)):
             upd_url = url.replace("/sparql", "/update")
             t0 = time.perf_counter()
-            st, _ = http_post(upd_url, build_update("INSERT DATA", k), "application/sparql-update")
-            ins = k / (time.perf_counter() - t0) if st in (200, 204) else None
+            st_i, body_i = http_post(upd_url, build_update("INSERT DATA", k), "application/sparql-update")
+            ins = k / (time.perf_counter() - t0) if st_i in (200, 204) else None
             t0 = time.perf_counter()
-            st, _ = http_post(upd_url, build_update("DELETE DATA", k), "application/sparql-update")
-            dele = k / (time.perf_counter() - t0) if st in (200, 204) else None
-            print(f"  {label:<8} INSERT {fmt(ins,'/s',0)} | DELETE {fmt(dele,'/s',0)}")
+            st_d, _ = http_post(upd_url, build_update("DELETE DATA", k), "application/sparql-update")
+            dele = k / (time.perf_counter() - t0) if st_d in (200, 204) else None
+            note = "" if ins is not None else f"  (INSERT HTTP {st_i}: {snippet(body_i)})"
+            print(f"  {label:<8} INSERT {fmt(ins,'/s',0)} | DELETE {fmt(dele,'/s',0)}{note}")
 
     # --- Memory-Footprint ---
     if args.rust_pid or args.tentris_pid:

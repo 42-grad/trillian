@@ -42,17 +42,38 @@ Strenger Binding-Mengen-Vergleich (`correctness_duel.py`) auf einem realen
 WatDiv-Slice (~1,09M Tripel, echte IRIs+Literale, keine Blank Nodes), reale
 BGP-Queries aus den Daten generiert:
 
-| Query | Rows | Verdikt | Rust / Tentris (median) |
-| :-- | --: | :-- | :-- |
-| entity-lookup | 22 | ✅ IDENTICAL | 0,52 / 0,99 ms |
-| property-values | 6 | ✅ IDENTICAL | 0,75 / 0,77 ms |
-| inverse (rdf:type) | 5862 | ✅ IDENTICAL | 9,32 / 7,24 ms |
-| 2-hop path | 55 | ✅ IDENTICAL | 0,59 / 0,74 ms |
-| two-star | 72 | ✅ IDENTICAL | 0,67 / 0,68 ms |
-| ASK | — | ✅ semantisch gleich | s. u. |
+### Korrektheit + Latenz (Median / p95)
 
-**Alle BGP-Queries identisch** (auch große Joins: 5862 Zeilen) — Rust-Clone und
-C++ Tentris liefern auf echten Daten **dieselben** Ergebnisse.
+| Query | Rows | Verdikt | Rust med/p95 | Tentris med/p95 |
+| :-- | --: | :-- | --: | --: |
+| entity-lookup | 22 | ✅ | 0,56 / 0,80 | 0,88 / 1,08 ms |
+| property-values | 6 | ✅ | 0,86 / 0,96 | 0,80 / 1,03 ms |
+| inverse (rdf:type) | 5862 | ✅ | 11,8 / 15,5 | 9,0 / 11,4 ms |
+| **star (rdf:type+pred)** | **18995** | ✅ | **97,1 / 132,9** | **50,4 / 62,3 ms** |
+| 2-hop path | 55 | ✅ | 0,53 / 0,64 | 0,65 / 0,79 ms |
+| two-star | 72 | ✅ | 0,61 / 0,78 | 0,68 / 0,89 ms |
+| ASK | — | ✅ | 0,37 / 0,53 | 0,51 / 0,59 ms |
+
+**7/7 IDENTISCH** — Rust-Clone und C++ Tentris liefern auf echten Daten
+**dieselben** Ergebnisse, auch beim 18995-Zeilen-Star.
+
+Latenz gemischt: bei kleinen/selektiven Queries ist Rust vorn, bei
+**großen Ergebnismengen** (q03 5862, q04 18995 Zeilen) ist Tentris schneller
+(q04 ~2×). Das ist unsere Schwäche — die `Vec`/JSON-Materialisierung großer
+Ergebnisse (gleiche Wurzel wie OPTIONAL).
+
+### Ingest / Memory / Updates (echte Daten, ~1,09M Tripel)
+
+| Metrik | Rust | Tentris | |
+| :-- | --: | --: | :-- |
+| Ingest + Startup | 2238 ms | 8710 ms | Rust 3,9× |
+| Peak-RSS | 356 MB | 332 MB | ~Gleichstand |
+| **Bytes/Triple (RSS)** | **336 B** | 319 B | **1,05× (Parität)** |
+| **Disk-Store** | **48,6 MB** | 1026 MB | **Rust ~21× kleiner** |
+| INSERT/DELETE (durabel) | 33,7k / 27,9k /s | n/a¹ | — |
+
+¹ Tentris lehnte den 20k-Bulk-`INSERT DATA` ab (HTTP ≠ 200); Diagnose-Ausgabe
+nachgerüstet. Rust-Update ist durabel (WAL+fsync) und parse-gebunden bei 20k/Request.
 
 **ASK – Repräsentationsunterschied, kein Engine-Fehler:** Tentris' Research-
 Endpoint serialisiert `ASK` **nicht** spec-konform als `{"boolean":true}`,
