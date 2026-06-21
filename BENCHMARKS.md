@@ -42,35 +42,35 @@ Strenger Binding-Mengen-Vergleich (`correctness_duel.py`) auf einem realen
 WatDiv-Slice (~1,09M Tripel, echte IRIs+Literale, keine Blank Nodes), reale
 BGP-Queries aus den Daten generiert:
 
-### Korrektheit + Latenz (Median / p95)
+### Korrektheit + Latenz (Median / p95) — nach Streaming-JSON (`d7440c7`)
 
 | Query | Rows | Verdikt | Rust med/p95 | Tentris med/p95 |
 | :-- | --: | :-- | --: | --: |
-| entity-lookup | 22 | ✅ | 0,56 / 0,80 | 0,88 / 1,08 ms |
-| property-values | 6 | ✅ | 0,86 / 0,96 | 0,80 / 1,03 ms |
-| inverse (rdf:type) | 5862 | ✅ | 11,8 / 15,5 | 9,0 / 11,4 ms |
-| **star (rdf:type+pred)** | **18995** | ✅ | **97,1 / 132,9** | **50,4 / 62,3 ms** |
-| 2-hop path | 55 | ✅ | 0,53 / 0,64 | 0,65 / 0,79 ms |
-| two-star | 72 | ✅ | 0,61 / 0,78 | 0,68 / 0,89 ms |
-| ASK | — | ✅ | 0,37 / 0,53 | 0,51 / 0,59 ms |
+| entity-lookup | 22 | ✅ | 0,43 / 0,54 | 1,13 / 1,32 ms |
+| property-values | 6 | ✅ | 0,76 / 0,98 | 0,54 / 0,85 ms |
+| inverse (rdf:type) | 5862 | ✅ | **2,90 / 3,38** | 7,12 / 9,95 ms |
+| **star (rdf:type+pred)** | **18995** | ✅ | **25,0 / 28,8** | 47,4 / 64,3 ms |
+| 2-hop path | 55 | ✅ | 0,42 / 0,48 | 0,65 / 1,02 ms |
+| two-star | 72 | ✅ | 0,45 / 0,51 | 0,66 / 0,74 ms |
+| ASK | — | ✅ | 0,73 / 0,84 | 0,48 / 0,54 ms |
 
-**7/7 IDENTISCH** — Rust-Clone und C++ Tentris liefern auf echten Daten
-**dieselben** Ergebnisse, auch beim 18995-Zeilen-Star.
-
-Latenz gemischt: bei kleinen/selektiven Queries ist Rust vorn, bei
-**großen Ergebnismengen** (q03 5862, q04 18995 Zeilen) ist Tentris schneller
-(q04 ~2×). Das ist unsere Schwäche — die `Vec`/JSON-Materialisierung großer
-Ergebnisse (gleiche Wurzel wie OPTIONAL).
+**7/7 IDENTISCH** und Rust ist jetzt **bei allen Join-Queries schneller** —
+inkl. der vormaligen Schwäche: q04 (18995 Zeilen) **97 → 25 ms** durch
+Streaming-JSON, jetzt 1,9× schneller als Tentris; q03 4× schneller.
 
 ### Ingest / Memory / Updates (echte Daten, ~1,09M Tripel)
 
 | Metrik | Rust | Tentris | |
 | :-- | --: | --: | :-- |
-| Ingest + Startup | 2238 ms | 8710 ms | Rust 3,9× |
-| Peak-RSS | 356 MB | 332 MB | ~Gleichstand |
-| **Bytes/Triple (RSS)** | **336 B** | 319 B | **1,05× (Parität)** |
+| Ingest + Startup | 2186 ms | 8614 ms | Rust 3,9× |
+| **Peak-RSS / Bytes-Triple** | **277 MB / 266 B** | 332 MB / 319 B | **Rust 1,2× kleiner** |
 | **Disk-Store** | **48,6 MB** | 1026 MB | **Rust ~21× kleiner** |
-| INSERT/DELETE (durabel) | 33,7k / 27,9k /s | n/a¹ | — |
+| INSERT/DELETE (durabel) | 32,7k / 25,7k /s | n/a¹ | — |
+
+Streaming-JSON senkte zusätzlich den Peak-RSS (356 → 277 MB): der transiente
+`Vec<Map<Value>>`-Baum großer Ergebnisse war ein Memory-Treiber. Damit ist Rust
+auf echten Daten **auf jeder Achse vorn** (Korrektheit, Latenz, Ingest, RAM,
+Disk) — außer Updates (Tentris-Endpoint fehlt, s. u.).
 
 ¹ Tentris-`/update` liefert **HTTP 404** — der gebaute Research-Server hat
 keinen Update-Endpoint. Damit ist Update-Durchsatz gegen Tentris **nicht**

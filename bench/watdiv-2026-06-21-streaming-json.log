@@ -1,0 +1,39 @@
+[watdiv] Datensatz: 1091646 Tripel (echte WatDiv-Daten)
+7 Queries -> /opt/tentris_clone/watdiv_queries
+  q01_entity: SELECT ?p ?o WHERE { <http://db.uwaterloo.ca/~galuc/wsdbm/User10152> ?p ?o }
+  q02_values: SELECT ?o WHERE { <http://db.uwaterloo.ca/~galuc/wsdbm/User10152> <http://db.uwaterloo.ca/
+  q03_inverse: SELECT ?s WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://db.uwaterlo
+  q04_star: SELECT ?s ?y WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://db.uwate
+  q05_path: SELECT ?mid ?o WHERE { <http://db.uwaterloo.ca/~galuc/wsdbm/User10003> <http://db.uwaterlo
+  q06_twostar: SELECT ?a ?b WHERE { <http://db.uwaterloo.ca/~galuc/wsdbm/User10152> <http://db.uwaterloo.
+  q07_ask: ASK { <http://db.uwaterloo.ca/~galuc/wsdbm/City0> <http://www.geonames.org/ontology#parent
+[watdiv] Baue Rust-Server + Snapshot...
+[watdiv] Tentris-Ingest...
+[watdiv] Vergleiche (Korrektheit + Latenz + Updates + Footprint)...
+### Ingest / Startup (echte Daten)
+  Rust 2186 ms | Tentris 8614 ms | Rust 3.9x
+
+### Korrektheit + Latenz
+Query                  Status            Rows      Rust med/p95   Tentris med/p95
+--------------------------------------------------------------------------------------------
+q01_entity.rq          IDENTICAL           22    0.43/  0.54 ms     1.13/  1.32 ms
+q02_values.rq          IDENTICAL            6    0.76/  0.98 ms     0.54/  0.85 ms
+q03_inverse.rq         IDENTICAL         5862    2.90/  3.38 ms     7.12/  9.95 ms
+q04_star.rq            IDENTICAL        18995   25.02/ 28.80 ms    47.44/ 64.31 ms
+q05_path.rq            IDENTICAL           55    0.42/  0.48 ms     0.65/  1.02 ms
+q06_twostar.rq         IDENTICAL           72    0.45/  0.51 ms     0.66/  0.74 ms
+q07_ask.rq             IDENTICAL                 0.73/  0.84 ms     0.48/  0.54 ms
+--------------------------------------------------------------------------------------------
+Korrektheit: 7/7 IDENTICAL  IDENTICAL=7
+
+### Update-Throughput (durabel)
+  Rust     INSERT 32656 /s | DELETE 25694 /s
+  Tentris  INSERT n/a | DELETE n/a  (INSERT HTTP 404: )
+
+### Memory-Footprint (echte Daten)
+  Peak-RSS:  Rust 276.56 MB | Tentris 332.30 MB
+  RSS:       Rust 276.56 MB | Tentris 332.30 MB
+  Disk:      Rust 48.63 MB (Snapshot) | Tentris 1025.94 MB (metall)
+  Bytes/Triple (RSS): Rust 265.6 B | Tentris 319.2 B
+
+=== STDERR ===
