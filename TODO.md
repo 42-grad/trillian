@@ -24,9 +24,11 @@ Zeile/Zelle). Das ist der gesamte „2×-Rückstand" zu Tentris.
 
 ## 1. Performance-Optimierungen (datengetrieben) — als nächstes
 
-- [ ] **(Speed, größter Hebel) Streaming-SPARQL-JSON**: Antwort direkt als
-      Bytes schreiben statt `Vec<Map<String,Value>>` aufzubauen. Behebt den
-      2×-Rückstand bei großen Ergebnissen (q04: 25 → erwartet wenige ms).
+- [x] **(Speed) Streaming-SPARQL-JSON** — ✅ erledigt. Antwort wird direkt als
+      String geschrieben (kein `Vec<Map<Value>>` mehr), Cache hält den fertigen
+      Body, Content-Type jetzt `application/sparql-results+json`.
+      Gemessen (q04, 18995 Zeilen): serialize **25,3 → 7,1 ms (3,6×)**, gesamt
+      26,4 → 8,0 ms. Remote-Bestätigung gegen Tentris ausstehend.
 - [ ] **(Memory, größter Hebel) Dictionary-String-Interning**: Strings in
       *einer* Arena (Buffer + Offsets) statt 712k Einzel-`String`s, und nur
       **einmal** halten (str_to_id → id, id_to_str → Offset). Erwartet
@@ -50,7 +52,7 @@ Zeile/Zelle). Das ist der gesamte „2×-Rückstand" zu Tentris.
 
 - [ ] Blank Nodes (Parser überspringt sie aktuell)
 - [ ] Turtle-Input (.ttl), nicht nur N-Triples
-- [ ] Content-Type `application/sparql-results+json` (aktuell `application/json`)
+- [x] Content-Type `application/sparql-results+json` — ✅ (mit Streaming-JSON)
 
 ## 4. Benchmark-Hygiene
 

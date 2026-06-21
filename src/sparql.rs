@@ -20,18 +20,12 @@ use crate::wal::Wal;
 
 const DEFAULT_CACHE_SIZE: usize = 256;
 
-/// Cache-Eintrag für bereits ausgeführte SPARQL-Queries.
-#[derive(Debug, Clone)]
-pub enum CacheEntry {
-    Select { vars: Vec<String>, rows: Vec<Map<String, Value>> },
-    Ask(bool),
-}
-
 /// Shared application state: the loaded triple store plus the query engine.
 pub struct AppState {
     pub store: RwLock<TripleStore>,
     pub engine: HybridEngine,
-    pub cache: Mutex<LruCache<String, CacheEntry>>,
+    /// Query-String -> fertig serialisierter JSON-Antwort-Body.
+    pub cache: Mutex<LruCache<String, String>>,
     /// Optionales Write-Ahead-Log. Ist es gesetzt, werden Updates durabel
     /// (append + fsync) protokolliert, sodass sie einen Neustart überleben.
     pub wal: Option<Mutex<crate::wal::Wal>>,
@@ -105,25 +99,22 @@ pub async fn sparql_handler(
         return sparql_error("Missing query parameter or empty body", StatusCode::BAD_REQUEST);
     }
 
-    // Cache-Lookup
+    // Cache-Lookup (fertiger JSON-Body).
     {
         if let Ok(cache) = state.cache.lock() {
-            if let Some(entry) = cache.peek(&query_str) {
-                return format_cached_entry(entry);
+            if let Some(body) = cache.peek(&query_str) {
+                return json_response(body.clone());
             }
         }
     }
 
     let store = state.store.read().unwrap();
     match execute_sparql(&store, &state.engine, &query_str) {
-        Ok(result) => {
-            // Ergebnis cachen
-            if let Some(entry) = cache_entry_from_result(&result) {
-                if let Ok(mut cache) = state.cache.lock() {
-                    cache.put(query_str, entry);
-                }
+        Ok(body) => {
+            if let Ok(mut cache) = state.cache.lock() {
+                cache.put(query_str, body.clone());
             }
-            (StatusCode::OK, axum::Json(result)).into_response()
+            json_response(body)
         }
         Err(e) => sparql_error(&e, StatusCode::BAD_REQUEST),
     }
@@ -260,41 +251,17 @@ fn sparql_error(msg: &str, status: StatusCode) -> Response {
     (status, axum::Json(body)).into_response()
 }
 
-fn format_cached_entry(entry: &CacheEntry) -> Response {
-    match entry {
-        CacheEntry::Select { vars, rows } => {
-            let result = json!({
-                "head": { "vars": vars },
-                "results": { "bindings": rows }
-            });
-            (StatusCode::OK, axum::Json(result)).into_response()
-        }
-        CacheEntry::Ask(b) => {
-            let result = json!({ "head": {}, "boolean": b });
-            (StatusCode::OK, axum::Json(result)).into_response()
-        }
-    }
-}
-
-fn cache_entry_from_result(result: &Value) -> Option<CacheEntry> {
-    if let Some(boolean) = result.get("boolean").and_then(|v| v.as_bool()) {
-        return Some(CacheEntry::Ask(boolean));
-    }
-    let vars = result
-        .get("head")?
-        .get("vars")?
-        .as_array()?
-        .iter()
-        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-        .collect();
-    let rows = result
-        .get("results")?
-        .get("bindings")?
-        .as_array()?
-        .iter()
-        .filter_map(|v| v.as_object().cloned())
-        .collect();
-    Some(CacheEntry::Select { vars, rows })
+/// Baut die HTTP-Antwort aus einem bereits serialisierten JSON-Body.
+fn json_response(body: String) -> Response {
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/sparql-results+json",
+        )],
+        body,
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -329,7 +296,7 @@ pub fn profile_query(store: &TripleStore, engine: &HybridEngine, query_str: &str
         eval.push(t.elapsed().as_secs_f64() * 1000.0);
         rows = result.rows.n_rows();
         let t = Instant::now();
-        let _ = sparql_json(&result, store);
+        let _ = write_sparql_json(&result, store);
         ser.push(t.elapsed().as_secs_f64() * 1000.0);
     }
     let med = |mut v: Vec<f64>| {
@@ -365,7 +332,7 @@ fn execute_sparql(
     store: &TripleStore,
     engine: &HybridEngine,
     query_str: &str,
-) -> Result<Value, String> {
+) -> Result<String, String> {
     let query = SparqlParser::new()
         .parse_query(query_str)
         .map_err(|e| e.to_string())?;
@@ -376,7 +343,7 @@ fn execute_sparql(
             let result = evaluate_select_with_modifiers(
                 store, engine, bgp, optionals, projection, distinct, limit, offset,
             )?;
-            Ok(sparql_json(&result, store))
+            Ok(write_sparql_json(&result, store))
         }
         SparqlQuery::Ask { pattern, .. } => {
             let (bgp, _, _, _, _, _) = extract_bgp_and_projection(&pattern)?;
@@ -384,7 +351,7 @@ fn execute_sparql(
                 Some(internal) => engine.execute(store, &internal).n_rows() > 0,
                 None => false,
             };
-            Ok(json!({ "head": {}, "boolean": has_match }))
+            Ok(format!("{{\"head\":{{}},\"boolean\":{}}}", has_match))
         }
         _ => Err("Only SELECT and ASK queries are supported".to_string()),
     }
@@ -579,7 +546,61 @@ fn term_pattern_variables(tp: &spargebra::term::TermPattern) -> Vec<String> {
 }
 
 
-fn sparql_json(result: &SelectResult, store: &TripleStore) -> Value {
+/// Hängt einen JSON-String-Literal (mit Escaping) an den Puffer an.
+fn append_json_str(out: &mut String, s: &str) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// Hängt das SPARQL-JSON-Term-Objekt für eine ID an (uri/literal+datatype/lang).
+fn append_term(out: &mut String, id: u32, dict: &Dictionary) {
+    match (dict.resolve(id), dict.resolve_type(id)) {
+        (Some(v), Some(TermType::Iri)) => {
+            out.push_str("{\"type\":\"uri\",\"value\":");
+            append_json_str(out, v);
+            out.push('}');
+        }
+        (Some(v), Some(TermType::Literal { datatype, lang })) => {
+            out.push_str("{\"type\":\"literal\",\"value\":");
+            append_json_str(out, v);
+            if let Some(dt) = datatype {
+                out.push_str(",\"datatype\":");
+                append_json_str(out, dt);
+            }
+            if let Some(l) = lang {
+                out.push_str(",\"xml:lang\":");
+                append_json_str(out, l);
+            }
+            out.push('}');
+        }
+        (Some(v), _) => {
+            out.push_str("{\"type\":\"literal\",\"value\":");
+            append_json_str(out, v);
+            out.push('}');
+        }
+        (None, _) => {
+            out.push_str("{\"type\":\"literal\",\"value\":\"__id_");
+            out.push_str(&id.to_string());
+            out.push_str("\"}");
+        }
+    }
+}
+
+/// Serialisiert das Ergebnis **direkt als JSON-String** – ohne pro Zeile eine
+/// `serde_json::Map`/`Value` zu allokieren (das war ~95 % der Zeit großer Queries).
+fn write_sparql_json(result: &SelectResult, store: &TripleStore) -> String {
+    const NULL_ID: u32 = u32::MAX;
     let mut var_indices = Vec::with_capacity(result.vars.len());
     for var in &result.vars {
         let pos = result
@@ -590,27 +611,40 @@ fn sparql_json(result: &SelectResult, store: &TripleStore) -> Value {
         var_indices.push(pos);
     }
 
-    let bindings: Vec<Map<String, Value>> = result
-        .rows
-        .rows()
-        .map(|row| {
-            result
-                .vars
-                .iter()
-                .enumerate()
-                .map(|(i, var)| {
-                    let id = row[var_indices[i]];
-                    let term = term_to_json(id, &store.dict);
-                    (var.clone(), term)
-                })
-                .collect()
-        })
-        .collect();
-
-    json!({
-        "head": { "vars": result.vars },
-        "results": { "bindings": bindings }
-    })
+    let mut out = String::with_capacity(256 + result.rows.n_rows() * 48);
+    out.push_str("{\"head\":{\"vars\":[");
+    for (i, v) in result.vars.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        append_json_str(&mut out, v);
+    }
+    out.push_str("]},\"results\":{\"bindings\":[");
+    let mut first_row = true;
+    for row in result.rows.rows() {
+        if !first_row {
+            out.push(',');
+        }
+        first_row = false;
+        out.push('{');
+        let mut first_cell = true;
+        for (i, var) in result.vars.iter().enumerate() {
+            let id = row[var_indices[i]];
+            if id == NULL_ID {
+                continue; // ungebundene (OPTIONAL-)Variable: weglassen
+            }
+            if !first_cell {
+                out.push(',');
+            }
+            first_cell = false;
+            append_json_str(&mut out, var);
+            out.push(':');
+            append_term(&mut out, id, &store.dict);
+        }
+        out.push('}');
+    }
+    out.push_str("]}}");
+    out
 }
 
 fn execute_count(
@@ -985,7 +1019,7 @@ mod tests {
         let store = test_store();
         let engine = HybridEngine::new();
         let query = "SELECT ?a ?b ?age WHERE { ?a <http://example.org/knows> ?b . OPTIONAL { ?b <http://example.org/age> ?age } }";
-        let result = execute_sparql(&store, &engine, query).unwrap();
+        let result: Value = serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
         let rows = result["results"]["bindings"].as_array().unwrap();
         // alice->bob has age 25; charlie->alice has no age
         assert_eq!(rows.len(), 3);
@@ -1003,7 +1037,7 @@ mod tests {
         let engine = HybridEngine::new();
         // <…/zzz> kommt im Store nicht vor -> leere Lösung, kein Panic.
         let query = "SELECT ?p ?o WHERE { <http://example.org/zzz> ?p ?o }";
-        let result = execute_sparql(&store, &engine, query).unwrap();
+        let result: Value = serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
         assert_eq!(result["results"]["bindings"].as_array().unwrap().len(), 0);
         // Head-Variablen bleiben erhalten.
         let head: Vec<&str> = result["head"]["vars"]
@@ -1028,7 +1062,7 @@ mod tests {
         ]);
         let engine = HybridEngine::new();
         let query = "SELECT ?b ?age WHERE { ?a <http://example.org/knows> ?b . OPTIONAL { ?b <http://example.org/age> ?age } }";
-        let result = execute_sparql(&store, &engine, query).unwrap();
+        let result: Value = serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
         let rows = result["results"]["bindings"].as_array().unwrap();
         // bob×{25,26} = 2 Zeilen + carol×NULL = 1 Zeile.
         assert_eq!(rows.len(), 3);
@@ -1051,7 +1085,7 @@ mod tests {
         let store = test_store();
         let engine = HybridEngine::new();
         let query = "SELECT ?a ?c WHERE { ?a <http://example.org/knows> ?b . OPTIONAL { ?b <http://example.org/unknown> ?c } }";
-        let result = execute_sparql(&store, &engine, query).unwrap();
+        let result: Value = serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
         let rows = result["results"]["bindings"].as_array().unwrap();
         assert_eq!(rows.len(), 3);
         for row in rows {
@@ -1067,7 +1101,7 @@ mod tests {
         let store = test_store();
         let engine = HybridEngine::new();
         let query = "SELECT DISTINCT ?p WHERE { ?s ?p ?o }";
-        let result = execute_sparql(&store, &engine, query).unwrap();
+        let result: Value = serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
         let rows = result["results"]["bindings"].as_array().unwrap();
         assert_eq!(rows.len(), 2, "DISTINCT ?p should dedup on the projected column");
     }
@@ -1077,7 +1111,7 @@ mod tests {
         let store = test_store();
         let engine = HybridEngine::new();
         let query = "SELECT DISTINCT ?p WHERE { ?s ?p ?o } LIMIT 1";
-        let result = execute_sparql(&store, &engine, query).unwrap();
+        let result: Value = serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
         let rows = result["results"]["bindings"].as_array().unwrap();
         assert_eq!(rows.len(), 1);
     }
