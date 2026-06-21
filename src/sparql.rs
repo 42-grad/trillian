@@ -9,6 +9,7 @@ use axum::Router;
 use lru::LruCache;
 use serde_json::{json, Map, Value};
 use tokio_stream::wrappers::ReceiverStream;
+use spargebra::algebra::{Expression, Function};
 use spargebra::term::{GroundQuad, GroundTerm, Literal, NamedNode, NamedOrBlankNode, Quad, Term as SparqlTerm};
 use spargebra::{Query as SparqlQuery, SparqlParser};
 
@@ -289,10 +290,10 @@ pub fn profile_query(store: &TripleStore, engine: &HybridEngine, query_str: &str
             eprintln!("profile_query: nur SELECT");
             return;
         };
-        let (bgp, opt, proj, dist, lim, off) = extract_bgp_and_projection(&pattern).unwrap();
+        let (bgp, opt, proj, dist, lim, off, filt) = extract_bgp_and_projection(&pattern).unwrap();
         let t = Instant::now();
         let result =
-            evaluate_select_with_modifiers(store, engine, bgp, opt, proj, dist, lim, off).unwrap();
+            evaluate_select_with_modifiers(store, engine, bgp, opt, proj, dist, lim, off, filt).unwrap();
         eval.push(t.elapsed().as_secs_f64() * 1000.0);
         rows = result.rows.n_rows();
         let t = Instant::now();
@@ -324,8 +325,10 @@ fn evaluate_select(
         return Err("Only SELECT queries are supported here".to_string());
     };
 
-    let (bgp, optionals, projection, distinct, limit, offset) = extract_bgp_and_projection(&pattern)?;
-    evaluate_select_with_modifiers(store, engine, bgp, optionals, projection, distinct, limit, offset)
+    let (bgp, optionals, projection, distinct, limit, offset, filters) = extract_bgp_and_projection(&pattern)?;
+    evaluate_select_with_modifiers(
+        store, engine, bgp, optionals, projection, distinct, limit, offset, filters,
+    )
 }
 
 fn execute_sparql(
@@ -339,19 +342,20 @@ fn execute_sparql(
 
     match query {
         SparqlQuery::Select { pattern, .. } => {
-            let (bgp, optionals, projection, distinct, limit, offset) = extract_bgp_and_projection(&pattern)?;
+            let (bgp, optionals, projection, distinct, limit, offset, filters) =
+                extract_bgp_and_projection(&pattern)?;
             let result = evaluate_select_with_modifiers(
-                store, engine, bgp, optionals, projection, distinct, limit, offset,
+                store, engine, bgp, optionals, projection, distinct, limit, offset, filters,
             )?;
             Ok(write_sparql_json(&result, store))
         }
         SparqlQuery::Ask { pattern, .. } => {
-            let (bgp, _, _, _, _, _) = extract_bgp_and_projection(&pattern)?;
-            let has_match = match translate_bgp(bgp, &store.dict)? {
-                Some(internal) => engine.execute(store, &internal).n_rows() > 0,
-                None => false,
-            };
-            Ok(format!("{{\"head\":{{}},\"boolean\":{}}}", has_match))
+            // ASK über den vollen WHERE-Pfad (inkl. OPTIONAL/FILTER) -> ≥1 Lösung?
+            let (bgp, optionals, _, _, _, _, filters) = extract_bgp_and_projection(&pattern)?;
+            let result = evaluate_select_with_modifiers(
+                store, engine, bgp, optionals, None, false, None, None, filters,
+            )?;
+            Ok(format!("{{\"head\":{{}},\"boolean\":{}}}", result.rows.n_rows() > 0))
         }
         _ => Err("Only SELECT and ASK queries are supported".to_string()),
     }
@@ -366,6 +370,7 @@ fn evaluate_select_with_modifiers(
     distinct: bool,
     limit: Option<usize>,
     offset: Option<usize>,
+    filters: Vec<&Expression>,
 ) -> Result<SelectResult, String> {
     let internal = match translate_bgp(bgp, &store.dict)? {
         Some(pat) => pat,
@@ -389,6 +394,17 @@ fn evaluate_select_with_modifiers(
         let (new_rows, new_var_order) = left_join(store, engine, &var_order, rows, opt_bgp)?;
         rows = new_rows;
         var_order = new_var_order;
+    }
+
+    // FILTER anwenden (auf die vollen Bindings, vor der Projektion).
+    if !filters.is_empty() {
+        let mut kept = RowBlock::new(rows.n_vars());
+        for row in rows.rows() {
+            if row_passes(&filters, row, &var_order, store) {
+                kept.push_row(row);
+            }
+        }
+        rows = kept;
     }
 
     let vars = projection.unwrap_or_else(|| var_order.clone());
@@ -658,19 +674,19 @@ fn execute_count(
 
     match query {
         SparqlQuery::Select { pattern, .. } => {
-            let (bgp, optionals, projection, distinct, limit, offset) = extract_bgp_and_projection(&pattern)?;
+            let (bgp, optionals, projection, distinct, limit, offset, filters) =
+                extract_bgp_and_projection(&pattern)?;
             let result = evaluate_select_with_modifiers(
-                store, engine, bgp, optionals, projection, distinct, limit, offset,
+                store, engine, bgp, optionals, projection, distinct, limit, offset, filters,
             )?;
             Ok(json!({ "count": result.rows.n_rows() }))
         }
         SparqlQuery::Ask { pattern, .. } => {
-            let (bgp, _, _, _, _, _) = extract_bgp_and_projection(&pattern)?;
-            let has_match = match translate_bgp(bgp, &store.dict)? {
-                Some(internal) => !engine.execute(store, &internal).is_empty(),
-                None => false,
-            };
-            Ok(json!({ "boolean": has_match }))
+            let (bgp, optionals, _, _, _, _, filters) = extract_bgp_and_projection(&pattern)?;
+            let result = evaluate_select_with_modifiers(
+                store, engine, bgp, optionals, None, false, None, None, filters,
+            )?;
+            Ok(json!({ "boolean": result.rows.n_rows() > 0 }))
         }
         _ => Err("Only SELECT and ASK queries are supported for /count".to_string()),
     }
@@ -810,6 +826,280 @@ fn literal_to_parsed(lit: &Literal) -> ParsedTermRdf {
 // BGP Translation
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// FILTER: SPARQL-Ausdrucks-Evaluator
+// ---------------------------------------------------------------------------
+
+const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
+
+/// Laufzeit-Wert eines FILTER-Ausdrucks.
+#[derive(Debug, Clone)]
+enum Fv {
+    Iri(String),
+    Str(String),          // einfaches Literal / xsd:string
+    Num(f64),             // numerischer Datentyp
+    Bool(bool),
+    Lang(String, String), // (Lexikal, Sprach-Tag)
+    Typed(String, String),// (Lexikal, Datatype-IRI) – nicht numerisch/string
+}
+
+fn is_numeric_dt(dt: &str) -> bool {
+    matches!(
+        dt.strip_prefix(XSD),
+        Some(
+            "integer" | "decimal" | "double" | "float" | "int" | "long" | "short"
+                | "byte" | "nonNegativeInteger" | "positiveInteger" | "nonPositiveInteger"
+                | "negativeInteger" | "unsignedInt" | "unsignedLong" | "unsignedShort"
+                | "unsignedByte"
+        )
+    )
+}
+
+fn classify(lex: &str, datatype: Option<&str>, lang: Option<&str>) -> Fv {
+    if let Some(l) = lang {
+        return Fv::Lang(lex.to_string(), l.to_string());
+    }
+    match datatype {
+        None => Fv::Str(lex.to_string()),
+        Some(dt) if dt == format!("{XSD}string") => Fv::Str(lex.to_string()),
+        Some(dt) if dt == format!("{XSD}boolean") => Fv::Bool(lex == "true" || lex == "1"),
+        Some(dt) if is_numeric_dt(dt) => match lex.parse::<f64>() {
+            Ok(n) => Fv::Num(n),
+            Err(_) => Fv::Typed(lex.to_string(), dt.to_string()),
+        },
+        Some(dt) => Fv::Typed(lex.to_string(), dt.to_string()),
+    }
+}
+
+fn term_to_fv(id: u32, store: &TripleStore) -> Option<Fv> {
+    let v = store.dict.resolve(id)?;
+    match store.dict.resolve_type(id)? {
+        TermType::Iri | TermType::BlankNode => Some(Fv::Iri(v.to_string())),
+        TermType::Literal { datatype, lang } => Some(classify(v, datatype.as_deref(), lang.as_deref())),
+    }
+}
+
+fn literal_to_fv(lit: &Literal) -> Fv {
+    classify(lit.value(), Some(lit.datatype().as_str()), lit.language())
+}
+
+/// Numerischer Wert, falls der Ausdruck einen liefert.
+fn as_num(fv: &Fv) -> Option<f64> {
+    match fv {
+        Fv::Num(n) => Some(*n),
+        Fv::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+        _ => None,
+    }
+}
+
+/// Lexikalischer Vergleichs-String (für =/< auf Strings).
+fn as_str<'a>(fv: &'a Fv) -> Option<&'a str> {
+    match fv {
+        Fv::Str(s) | Fv::Lang(s, _) | Fv::Typed(s, _) => Some(s),
+        Fv::Iri(s) => Some(s),
+        _ => None,
+    }
+}
+
+fn fv_equal(a: &Fv, b: &Fv) -> Option<bool> {
+    if let (Some(x), Some(y)) = (as_num(a), as_num(b)) {
+        return Some(x == y);
+    }
+    match (a, b) {
+        (Fv::Iri(x), Fv::Iri(y)) => Some(x == y),
+        (Fv::Bool(x), Fv::Bool(y)) => Some(x == y),
+        (Fv::Str(x), Fv::Str(y)) => Some(x == y),
+        (Fv::Lang(x, lx), Fv::Lang(y, ly)) => Some(x == y && lx == ly),
+        (Fv::Typed(x, dx), Fv::Typed(y, dy)) => Some(x == y && dx == dy),
+        _ => None, // unvergleichbar -> Fehler
+    }
+}
+
+fn fv_cmp(a: &Fv, b: &Fv) -> Option<std::cmp::Ordering> {
+    if let (Some(x), Some(y)) = (as_num(a), as_num(b)) {
+        return x.partial_cmp(&y);
+    }
+    match (a, b) {
+        (Fv::Str(x), Fv::Str(y)) => Some(x.cmp(y)),
+        (Fv::Lang(x, _), Fv::Lang(y, _)) => Some(x.cmp(y)),
+        _ => None,
+    }
+}
+
+fn eval(expr: &Expression, row: &[u32], vars: &[String], store: &TripleStore) -> Result<Fv, ()> {
+    const NULL_ID: u32 = u32::MAX;
+    match expr {
+        Expression::NamedNode(nn) => Ok(Fv::Iri(nn.as_str().to_string())),
+        Expression::Literal(lit) => Ok(literal_to_fv(lit)),
+        Expression::Variable(v) => {
+            let col = vars.iter().position(|x| x == v.as_str()).ok_or(())?;
+            let id = row[col];
+            if id == NULL_ID {
+                return Err(());
+            }
+            term_to_fv(id, store).ok_or(())
+        }
+        Expression::Or(a, b) => {
+            let ea = ebv(a, row, vars, store);
+            let eb = ebv(b, row, vars, store);
+            if ea == Ok(true) || eb == Ok(true) {
+                Ok(Fv::Bool(true))
+            } else if ea.is_err() || eb.is_err() {
+                Err(())
+            } else {
+                Ok(Fv::Bool(false))
+            }
+        }
+        Expression::And(a, b) => {
+            let ea = ebv(a, row, vars, store);
+            let eb = ebv(b, row, vars, store);
+            if ea == Ok(false) || eb == Ok(false) {
+                Ok(Fv::Bool(false))
+            } else if ea.is_err() || eb.is_err() {
+                Err(())
+            } else {
+                Ok(Fv::Bool(true))
+            }
+        }
+        Expression::Not(a) => Ok(Fv::Bool(!ebv(a, row, vars, store)?)),
+        Expression::Equal(a, b) => {
+            let (x, y) = (eval(a, row, vars, store)?, eval(b, row, vars, store)?);
+            fv_equal(&x, &y).map(Fv::Bool).ok_or(())
+        }
+        Expression::SameTerm(a, b) => {
+            let (x, y) = (eval(a, row, vars, store)?, eval(b, row, vars, store)?);
+            Ok(Fv::Bool(fv_equal(&x, &y).unwrap_or(false)))
+        }
+        Expression::Greater(a, b) => cmp_op(a, b, row, vars, store, |o| o == std::cmp::Ordering::Greater),
+        Expression::GreaterOrEqual(a, b) => cmp_op(a, b, row, vars, store, |o| o != std::cmp::Ordering::Less),
+        Expression::Less(a, b) => cmp_op(a, b, row, vars, store, |o| o == std::cmp::Ordering::Less),
+        Expression::LessOrEqual(a, b) => cmp_op(a, b, row, vars, store, |o| o != std::cmp::Ordering::Greater),
+        Expression::Add(a, b) => num_op(a, b, row, vars, store, |x, y| x + y),
+        Expression::Subtract(a, b) => num_op(a, b, row, vars, store, |x, y| x - y),
+        Expression::Multiply(a, b) => num_op(a, b, row, vars, store, |x, y| x * y),
+        Expression::Divide(a, b) => num_op(a, b, row, vars, store, |x, y| x / y),
+        Expression::UnaryPlus(a) => Ok(Fv::Num(as_num(&eval(a, row, vars, store)?).ok_or(())?)),
+        Expression::UnaryMinus(a) => Ok(Fv::Num(-as_num(&eval(a, row, vars, store)?).ok_or(())?)),
+        Expression::Bound(v) => {
+            let col = vars.iter().position(|x| x == v.as_str());
+            Ok(Fv::Bool(col.is_some_and(|c| row[c] != NULL_ID)))
+        }
+        Expression::In(e, list) => {
+            let x = eval(e, row, vars, store)?;
+            for item in list {
+                if let Ok(y) = eval(item, row, vars, store) {
+                    if fv_equal(&x, &y) == Some(true) {
+                        return Ok(Fv::Bool(true));
+                    }
+                }
+            }
+            Ok(Fv::Bool(false))
+        }
+        Expression::If(c, a, b) => {
+            if ebv(c, row, vars, store)? {
+                eval(a, row, vars, store)
+            } else {
+                eval(b, row, vars, store)
+            }
+        }
+        Expression::FunctionCall(func, args) => eval_func(func, args, row, vars, store),
+        _ => Err(()), // nicht unterstützt -> Fehler (Zeile fällt raus)
+    }
+}
+
+fn cmp_op(
+    a: &Expression,
+    b: &Expression,
+    row: &[u32],
+    vars: &[String],
+    store: &TripleStore,
+    pred: impl Fn(std::cmp::Ordering) -> bool,
+) -> Result<Fv, ()> {
+    let (x, y) = (eval(a, row, vars, store)?, eval(b, row, vars, store)?);
+    fv_cmp(&x, &y).map(|o| Fv::Bool(pred(o))).ok_or(())
+}
+
+fn num_op(
+    a: &Expression,
+    b: &Expression,
+    row: &[u32],
+    vars: &[String],
+    store: &TripleStore,
+    op: impl Fn(f64, f64) -> f64,
+) -> Result<Fv, ()> {
+    let x = as_num(&eval(a, row, vars, store)?).ok_or(())?;
+    let y = as_num(&eval(b, row, vars, store)?).ok_or(())?;
+    Ok(Fv::Num(op(x, y)))
+}
+
+fn eval_func(
+    func: &Function,
+    args: &[Expression],
+    row: &[u32],
+    vars: &[String],
+    store: &TripleStore,
+) -> Result<Fv, ()> {
+    let arg = |i: usize| eval(&args[i], row, vars, store);
+    match func {
+        Function::Str => Ok(Fv::Str(match arg(0)? {
+            Fv::Iri(s) | Fv::Str(s) | Fv::Lang(s, _) | Fv::Typed(s, _) => s,
+            Fv::Num(n) => format_num(n),
+            Fv::Bool(b) => b.to_string(),
+        })),
+        Function::Lang => Ok(Fv::Str(match arg(0)? {
+            Fv::Lang(_, l) => l,
+            _ => String::new(),
+        })),
+        Function::Datatype => Ok(Fv::Iri(match arg(0)? {
+            Fv::Num(_) => format!("{XSD}double"),
+            Fv::Bool(_) => format!("{XSD}boolean"),
+            Fv::Str(_) => format!("{XSD}string"),
+            Fv::Lang(..) => "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString".to_string(),
+            Fv::Typed(_, dt) => dt,
+            Fv::Iri(_) => return Err(()),
+        })),
+        Function::StrLen => Ok(Fv::Num(as_str(&arg(0)?).ok_or(())?.chars().count() as f64)),
+        Function::UCase => Ok(Fv::Str(as_str(&arg(0)?).ok_or(())?.to_uppercase())),
+        Function::LCase => Ok(Fv::Str(as_str(&arg(0)?).ok_or(())?.to_lowercase())),
+        Function::Contains => str2(&arg(0)?, &arg(1)?, |a, b| a.contains(b)),
+        Function::StrStarts => str2(&arg(0)?, &arg(1)?, |a, b| a.starts_with(b)),
+        Function::StrEnds => str2(&arg(0)?, &arg(1)?, |a, b| a.ends_with(b)),
+        Function::IsIri | Function::IsBlank => Ok(Fv::Bool(matches!(arg(0)?, Fv::Iri(_)))),
+        Function::IsLiteral => Ok(Fv::Bool(!matches!(arg(0)?, Fv::Iri(_)))),
+        Function::IsNumeric => Ok(Fv::Bool(matches!(arg(0)?, Fv::Num(_)))),
+        _ => Err(()),
+    }
+}
+
+fn str2(a: &Fv, b: &Fv, f: impl Fn(&str, &str) -> bool) -> Result<Fv, ()> {
+    Ok(Fv::Bool(f(as_str(a).ok_or(())?, as_str(b).ok_or(())?)))
+}
+
+fn format_num(n: f64) -> String {
+    if n.fract() == 0.0 && n.is_finite() {
+        format!("{}", n as i64)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Effective Boolean Value eines Ausdrucks.
+fn ebv(expr: &Expression, row: &[u32], vars: &[String], store: &TripleStore) -> Result<bool, ()> {
+    match eval(expr, row, vars, store)? {
+        Fv::Bool(b) => Ok(b),
+        Fv::Num(n) => Ok(n != 0.0 && !n.is_nan()),
+        Fv::Str(s) => Ok(!s.is_empty()),
+        _ => Err(()),
+    }
+}
+
+/// Behält eine Zeile, wenn **alle** FILTER-Ausdrücke EBV true ergeben.
+fn row_passes(filters: &[&Expression], row: &[u32], vars: &[String], store: &TripleStore) -> bool {
+    filters
+        .iter()
+        .all(|f| ebv(f, row, vars, store) == Ok(true))
+}
+
 fn extract_bgp_and_projection(
     pattern: &spargebra::algebra::GraphPattern,
 ) -> Result<
@@ -820,6 +1110,7 @@ fn extract_bgp_and_projection(
         bool,
         Option<usize>,
         Option<usize>,
+        Vec<&Expression>,
     ),
     String,
 > {
@@ -843,16 +1134,21 @@ fn extract_bgp_and_projection(
         limit: &mut Option<usize>,
         offset: &mut Option<usize>,
         optionals: &mut Vec<&'a Vec<spargebra::term::TriplePattern>>,
+        filters: &mut Vec<&'a Expression>,
     ) -> &'a Vec<spargebra::term::TriplePattern> {
         match pattern {
+            spargebra::algebra::GraphPattern::Filter { expr, inner } => {
+                filters.push(expr);
+                walk(inner, projection, distinct, limit, offset, optionals, filters)
+            }
             spargebra::algebra::GraphPattern::Project { variables, inner } => {
                 *projection = Some(variables.iter().map(|v| v.as_str().to_string()).collect());
-                walk(inner, projection, distinct, limit, offset, optionals)
+                walk(inner, projection, distinct, limit, offset, optionals, filters)
             }
             spargebra::algebra::GraphPattern::Distinct { inner }
             | spargebra::algebra::GraphPattern::Reduced { inner } => {
                 *distinct = true;
-                walk(inner, projection, distinct, limit, offset, optionals)
+                walk(inner, projection, distinct, limit, offset, optionals, filters)
             }
             spargebra::algebra::GraphPattern::Slice {
                 inner,
@@ -861,10 +1157,10 @@ fn extract_bgp_and_projection(
             } => {
                 *offset = Some(*start);
                 *limit = *length;
-                walk(inner, projection, distinct, limit, offset, optionals)
+                walk(inner, projection, distinct, limit, offset, optionals, filters)
             }
             spargebra::algebra::GraphPattern::LeftJoin { left, right, .. } => {
-                let mandatory = walk(left, projection, distinct, limit, offset, optionals);
+                let mandatory = walk(left, projection, distinct, limit, offset, optionals, filters);
                 if let Ok(opt_bgp) = extract_bgp(right) {
                     optionals.push(opt_bgp);
                 }
@@ -884,8 +1180,17 @@ fn extract_bgp_and_projection(
     let mut limit = None;
     let mut offset = None;
     let mut optionals = Vec::new();
-    let mandatory = walk(pattern, &mut projection, &mut distinct, &mut limit, &mut offset, &mut optionals);
-    Ok((mandatory, optionals, projection, distinct, limit, offset))
+    let mut filters = Vec::new();
+    let mandatory = walk(
+        pattern,
+        &mut projection,
+        &mut distinct,
+        &mut limit,
+        &mut offset,
+        &mut optionals,
+        &mut filters,
+    );
+    Ok((mandatory, optionals, projection, distinct, limit, offset, filters))
 }
 
 fn translate_bgp(
@@ -1114,6 +1419,57 @@ mod tests {
         let result: Value = serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
         let rows = result["results"]["bindings"].as_array().unwrap();
         assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn filter_numeric_comparison() {
+        let mut store = TripleStore::new();
+        let dt = "http://www.w3.org/2001/XMLSchema#integer";
+        let alice = store.dict.insert("http://example.org/alice");
+        let bob = store.dict.insert("http://example.org/bob");
+        let age = store.dict.insert("http://example.org/age");
+        let v30 = store.dict.insert_with_type("30", TermType::literal_datatype(dt));
+        let v25 = store.dict.insert_with_type("25", TermType::literal_datatype(dt));
+        store.insert_triple(alice, age, v30);
+        store.insert_triple(bob, age, v25);
+        let engine = HybridEngine::new();
+        let query =
+            "SELECT ?p ?a WHERE { ?p <http://example.org/age> ?a FILTER(?a > 26) }";
+        let result: Value =
+            serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
+        let rows = result["results"]["bindings"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "nur 30 > 26");
+        assert_eq!(rows[0]["a"]["value"], "30");
+    }
+
+    #[test]
+    fn filter_str_function() {
+        let store = test_store();
+        let engine = HybridEngine::new();
+        // CONTAINS(STR(?b), "bob") -> nur alice->bob.
+        let query = "SELECT ?a ?b WHERE { ?a <http://example.org/knows> ?b \
+                     FILTER(CONTAINS(STR(?b), \"bob\")) }";
+        let result: Value =
+            serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
+        let rows = result["results"]["bindings"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["b"]["value"], "http://example.org/bob");
+    }
+
+    #[test]
+    fn filter_iri_inequality_and_logical() {
+        let store = test_store(); // knows: alice->bob, bob->charlie, charlie->alice
+        let engine = HybridEngine::new();
+        let query = "SELECT ?a ?b WHERE { ?a <http://example.org/knows> ?b \
+                     FILTER(?b != <http://example.org/charlie>) }";
+        let result: Value =
+            serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
+        let rows = result["results"]["bindings"].as_array().unwrap();
+        // bob (->charlie) fällt raus; alice->bob und charlie->alice bleiben.
+        assert_eq!(rows.len(), 2);
+        for r in rows {
+            assert_ne!(r["b"]["value"], "http://example.org/charlie");
+        }
     }
 
     #[test]

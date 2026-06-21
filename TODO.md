@@ -41,7 +41,12 @@ Zeile/Zelle). Das ist der gesamte „2×-Rückstand" zu Tentris.
 
 ## 2. SPARQL-Feature-Ausbau (ermöglicht echte Query-Suiten statt nur BGP)
 
-- [ ] **FILTER** (häufigstes Feature in realen Queries) — Erststart.
+- [x] **FILTER** — ✅ erledigt. SPARQL-Ausdrucks-Evaluator (3-wertige Logik,
+      EBV): Vergleiche (numerisch/String/IRI), `=`/`!=`/`sameTerm`, `&&`/`||`/`!`,
+      `BOUND`, Arithmetik, `IN`, `IF`, Funktionen STR/LANG/DATATYPE/STRLEN/
+      U-LCASE/CONTAINS/STRSTARTS/STRENDS/isIRI/isLiteral/isNumeric/isBlank.
+      Wird im WHERE (vor Projektion) und in ASK/`/count` angewandt. 38 Tests grün.
+      Offen: REGEX + Custom-Funktionen (derzeit → Ausdrucksfehler ⇒ Zeile fällt raus).
 - [ ] UNION
 - [ ] ORDER BY (inkl. Zusammenspiel mit DISTINCT/LIMIT)
 - [ ] Aggregation: GROUP BY, COUNT/SUM/MIN/MAX/AVG
