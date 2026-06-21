@@ -347,7 +347,7 @@ impl TripleStore {
         let total = perm + dict + pred + stats;
         println!("=== Memory-Report (logisch, {} Triples) ===", self.triple_count());
         println!("  3 Permutationen (SPO/POS/OSP): {:.1} MB", mb(perm));
-        println!("  Dictionary (Strings ×2 + Typen): {:.1} MB", mb(dict));
+        println!("  Dictionary (interniert + Typen):  {:.1} MB", mb(dict));
         println!("  Prädikat-Listen:                 {:.1} MB", mb(pred));
         println!(
             "  Stats-Maps ({} Einträge):        {:.1} MB",

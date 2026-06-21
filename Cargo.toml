@@ -17,6 +17,7 @@ lru = "0.13"
 tokio-stream = "0.1"
 memmap2 = "0.9"
 bytemuck = "1"
+string-interner = "0.17"
 dhat = { version = "0.3", optional = true }
 
 [features]

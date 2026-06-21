@@ -29,10 +29,10 @@ Zeile/Zelle). Das ist der gesamte „2×-Rückstand" zu Tentris.
       Body, Content-Type jetzt `application/sparql-results+json`.
       Gemessen (q04, 18995 Zeilen): serialize **25,3 → 7,1 ms (3,6×)**, gesamt
       26,4 → 8,0 ms. Remote-Bestätigung gegen Tentris ausstehend.
-- [ ] **(Memory, größter Hebel) Dictionary-String-Interning**: Strings in
-      *einer* Arena (Buffer + Offsets) statt 712k Einzel-`String`s, und nur
-      **einmal** halten (str_to_id → id, id_to_str → Offset). Erwartet
-      Dict ~66 → ~33 MB + drastisch weniger Allokationen.
+- [x] **(Memory) Dictionary-String-Interning** — ✅ erledigt (`string-interner`,
+      eine Arena). Dict 66,7 → 36,0 MB; logisch 140 → 109 MB (105 B/Triple).
+      dhat Heap-Peak 300,8 → 264,8 MB, **Allokations-Blöcke @Peak 711.922 → 212**.
+      Remote-Bestätigung (RSS) ausstehend.
 - [ ] **(Memory) Stats-Maps verschlanken**: 2,28M Pair-Count-Einträge (40 MB)
       für den Planner — on-demand aus dem Index ableiten oder kompakter halten.
 - [ ] DELETE-Pfad: `pred_subjects`/`pred_objects` als `BTreeSet` statt sortiertem

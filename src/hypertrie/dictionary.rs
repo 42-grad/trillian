@@ -1,4 +1,10 @@
-use rustc_hash::FxHashMap;
+use string_interner::backend::StringBackend;
+use string_interner::symbol::SymbolU32;
+use string_interner::{StringInterner, Symbol};
+
+/// String-Interner: alle Term-Strings liegen in **einer** Arena (statt je einem
+/// eigenen `String`), Symbole sind fortlaufende 0-basierte u32-IDs.
+type Interner = StringInterner<StringBackend<SymbolU32>>;
 
 /// Typ eines RDF-Terms. Wird pro Dictionary-ID gespeichert, damit die
 /// SPARQL-Ausgabe (term_to_json) zwischen IRI, Literal mit Datentyp und
@@ -42,17 +48,12 @@ impl TermType {
 
 /// Bidirektionales String ↔ u32 Dictionary mit Term-Typ-Information.
 ///
-/// Design-Entscheidungen:
-/// * `FxHashMap` statt `std::collections::HashMap` für deutlich schnellere
-///   String-Hashes (weniger Kollisions-Aufwand, bessere Cache-Lokalität).
-/// * IDs sind `u32` – ausreichend für Millionen von Termen und halb so groß
-///   wie `u64`, was die Index-Arrays dichter packt.
-/// * `id_to_str` ist ein flacher `Vec<String>`; der ID-Lookup ist O(1).
-/// * Neue Terme bekommen fortlaufende IDs (`id_to_str.len()`).
+/// Strings werden **interniert** (eine Arena, jeder String einmal) statt als
+/// Millionen einzelner `String`s × 2 gehalten. `id_to_type` ist parallel zu den
+/// fortlaufenden Interner-IDs (0-basiert).
 #[derive(Debug, Clone, Default)]
 pub struct Dictionary {
-    str_to_id: FxHashMap<String, u32>,
-    id_to_str: Vec<String>,
+    interner: Interner,
     id_to_type: Vec<TermType>,
 }
 
@@ -63,14 +64,11 @@ impl Dictionary {
 
     /// Fügt einen Term mit Typ hinzu oder liefert die existierende ID.
     pub fn insert_with_type(&mut self, term: &str, typ: TermType) -> u32 {
-        if let Some(&id) = self.str_to_id.get(term) {
-            return id;
+        let id = self.interner.get_or_intern(term).to_usize() as u32;
+        // Neuer Term -> ID == bisherige Länge; Typ parallel anhängen.
+        if id as usize == self.id_to_type.len() {
+            self.id_to_type.push(typ);
         }
-        let owned = term.to_string();
-        let id = self.id_to_str.len() as u32;
-        self.str_to_id.insert(owned.clone(), id);
-        self.id_to_str.push(owned);
-        self.id_to_type.push(typ);
         id
     }
 
@@ -82,13 +80,13 @@ impl Dictionary {
     /// Liefert die ID eines Terms, falls bekannt.
     #[inline]
     pub fn lookup(&self, term: &str) -> Option<u32> {
-        self.str_to_id.get(term).copied()
+        self.interner.get(term).map(|s| s.to_usize() as u32)
     }
 
     /// Löst eine ID in den ursprünglichen String auf.
     #[inline]
     pub fn resolve(&self, id: u32) -> Option<&str> {
-        self.id_to_str.get(id as usize).map(|s| s.as_str())
+        SymbolU32::try_from_usize(id as usize).and_then(|s| self.interner.resolve(s))
     }
 
     /// Liefert den Typ eines Terms.
@@ -97,28 +95,35 @@ impl Dictionary {
         self.id_to_type.get(id as usize)
     }
 
-    /// Grobe Byte-Schätzung (für den Memory-Report). Strings liegen doppelt
-    /// (id_to_str-Value + str_to_id-Key), plus Typ-Vec.
+    /// Grobe Byte-Schätzung (für den Memory-Report). Strings liegen jetzt
+    /// **einmal** in der Interner-Arena.
     pub fn approx_bytes(&self) -> usize {
-        let str_bytes: usize = self.id_to_str.iter().map(|s| s.len() + 24).sum();
-        let n = self.id_to_str.len();
-        str_bytes * 2 + n * std::mem::size_of::<TermType>()
+        let n = self.id_to_type.len();
+        let str_bytes: usize = (0..n as u32)
+            .filter_map(|i| self.resolve(i))
+            .map(|s| s.len())
+            .sum();
+        // Arena-Strings (einmal) + Offsets (~8 B/Eintrag) + Typ-Vec.
+        str_bytes + n * 8 + n * std::mem::size_of::<TermType>()
     }
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.id_to_str.len()
+        self.id_to_type.len()
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.id_to_str.is_empty()
+        self.id_to_type.is_empty()
     }
 
     /// Serialisiert das Dictionary in `buf` (für den Snapshot).
     pub fn serialize_into(&self, buf: &mut Vec<u8>) {
-        buf.extend_from_slice(&(self.id_to_str.len() as u32).to_le_bytes());
-        for (s, t) in self.id_to_str.iter().zip(self.id_to_type.iter()) {
+        let n = self.id_to_type.len();
+        buf.extend_from_slice(&(n as u32).to_le_bytes());
+        for id in 0..n as u32 {
+            let s = self.resolve(id).unwrap_or("");
+            let t = &self.id_to_type[id as usize];
             buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
             buf.extend_from_slice(s.as_bytes());
             match t {
@@ -149,11 +154,10 @@ impl Dictionary {
             v
         };
         let n = read_u32(bytes, &mut p) as usize;
-        dict.id_to_str.reserve(n);
         dict.id_to_type.reserve(n);
         for _ in 0..n {
             let slen = read_u32(bytes, &mut p) as usize;
-            let s = std::str::from_utf8(&bytes[p..p + slen]).unwrap().to_string();
+            let s = std::str::from_utf8(&bytes[p..p + slen]).unwrap();
             p += slen;
             let tag = bytes[p];
             p += 1;
@@ -175,10 +179,7 @@ impl Dictionary {
                 }
                 _ => TermType::Iri,
             };
-            let id = dict.id_to_str.len() as u32;
-            dict.str_to_id.insert(s.clone(), id);
-            dict.id_to_str.push(s);
-            dict.id_to_type.push(typ);
+            dict.insert_with_type(s, typ);
         }
         dict
     }
