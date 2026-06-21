@@ -70,7 +70,7 @@ ANSIBLE_HOST_KEY_CHECKING=False ansible-playbook -i inventory.ini playbook.yml \
 
 echo "[run_aws_duel] Hole Ergebnis..."
 scp -i "$SSH_PRIVATE_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-    "ubuntu@$SERVER_IP:/opt/tentris_clone/wdbench_duel.log" \
+    "ubuntu@$SERVER_IP:/opt/trillian/wdbench_duel.log" \
     "${SCRIPT_DIR}/wdbench_duel.log" 2>/dev/null || echo "  (kein Log gefunden)"
 
 echo "[run_aws_duel] Fertig. Ergebnis: ${SCRIPT_DIR}/wdbench_duel.log"

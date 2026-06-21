@@ -117,7 +117,7 @@ Prädikate) statt Spezialfall + Binär-Fallback.
 
 ```bash
 # Lokal (nur Rust-Seite): Daten erzeugen + interner Bench
-cargo run --release --bin tentris_clone
+cargo run --release --bin trillian
 
 # Server starten
 cargo build --release --bin server

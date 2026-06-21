@@ -812,27 +812,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bf256ce5efdfa370213c1dabab5935a12e49f2c58d15e9eac2870d3b4f27263"
 
 [[package]]
-name = "tentris_clone"
-version = "0.1.0"
-dependencies = [
- "axum",
- "bytemuck",
- "dhat",
- "lru",
- "memmap2",
- "rand",
- "rayon",
- "roaring",
- "rustc-hash 2.1.2",
- "serde",
- "serde_json",
- "spargebra",
- "string-interner",
- "tokio",
- "tokio-stream",
-]
-
-[[package]]
 name = "thiserror"
 version = "2.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -940,6 +919,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
+]
+
+[[package]]
+name = "trillian"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytemuck",
+ "dhat",
+ "lru",
+ "memmap2",
+ "rand",
+ "rayon",
+ "roaring",
+ "rustc-hash 2.1.2",
+ "serde",
+ "serde_json",
+ "spargebra",
+ "string-interner",
+ "tokio",
+ "tokio-stream",
 ]
 
 [[package]]

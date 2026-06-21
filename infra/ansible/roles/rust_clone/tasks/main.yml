@@ -23,7 +23,7 @@
 - name: Build Rust clone in release mode
   shell: |
     . $HOME/.cargo/env
-    cargo build --release --bin tentris_clone
+    cargo build --release --bin trillian
   args:
     chdir: "{{ project_dir }}"
   environment:
@@ -32,7 +32,7 @@
 - name: Generate synthetic_1m.nt
   shell: |
     . $HOME/.cargo/env
-    cargo run --release --bin tentris_clone
+    cargo run --release --bin trillian
   args:
     chdir: "{{ project_dir }}"
   environment:

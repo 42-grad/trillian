@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use tentris_clone::hypertrie::{
+use trillian::hypertrie::{
     export_ntriples, GraphPattern, HybridEngine, PatternTerm, TriplePattern, TripleStore,
 };
 
@@ -137,11 +137,11 @@ fn main() {
 }
 
 fn log(msg: &str) {
-    eprintln!("[tentris_clone] {}", msg);
+    eprintln!("[trillian] {}", msg);
 }
 
 fn generate_synthetic_nt(path: &str) {
-    use tentris_clone::synthetic::{generate, SyntheticParams};
+    use trillian::synthetic::{generate, SyntheticParams};
 
     // Graph-förmige Daten mit gemeinsamem S/O-Vokabular und eingepflanzten
     // Dreiecken/Ketten, damit Chain-/Triangle-/Star-Joins echte Treffer

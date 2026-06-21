@@ -1,8 +1,8 @@
 use std::time::Instant;
 
-use tentris_clone::hypertrie::{HybridEngine, TripleStore};
-use tentris_clone::sparql::{profile_query, serve, serve_durable};
-use tentris_clone::wal::Wal;
+use trillian::hypertrie::{HybridEngine, TripleStore};
+use trillian::sparql::{profile_query, serve, serve_durable};
+use trillian::wal::Wal;
 
 #[cfg(feature = "dhat")]
 #[global_allocator]

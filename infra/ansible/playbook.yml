@@ -3,7 +3,7 @@
   hosts: duel
   become: yes
   vars:
-    project_dir: /opt/tentris_clone
+    project_dir: /opt/trillian
   roles:
     - common
     - rust_clone

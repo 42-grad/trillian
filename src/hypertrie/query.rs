@@ -725,7 +725,7 @@ mod tests {
             .insert_with_type("Alice", super::super::dictionary::TermType::literal_lang("en"));
         store.insert_triple(s, name, lit);
 
-        let path = std::env::temp_dir().join("tentris_clone_roundtrip.nt");
+        let path = std::env::temp_dir().join("trillian_roundtrip.nt");
         let path_str = path.to_str().unwrap();
         store.dump_ntriples(path_str).unwrap();
 
@@ -759,7 +759,7 @@ mod tests {
             .insert_with_type("Alice", super::super::dictionary::TermType::literal_lang("en"));
         store.insert_triple(s, name, lit);
 
-        let path = std::env::temp_dir().join("tentris_clone_snapshot.bin");
+        let path = std::env::temp_dir().join("trillian_snapshot.bin");
         let path_str = path.to_str().unwrap();
         store.save_snapshot(path_str).unwrap();
 

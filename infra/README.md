@@ -36,7 +36,7 @@ cat duel_output.log
 2. **Ansible** installiert Build-Tools, Rust, Conan, CMake etc.
 3. **Ansible** kopiert den Rust-Klon, baut ihn im Release-Modus und generiert `synthetic_1m.nt`.
 4. **Ansible** klont die Forschungsversion von Tentris, fügt den DICE-Conan-Remote hinzu und baut sie.
-5. **Ansible** führt `final_duel.py` aus und speichert die Ausgabe in `/opt/tentris_clone/duel_output.log`.
+5. **Ansible** führt `final_duel.py` aus und speichert die Ausgabe in `/opt/trillian/duel_output.log`.
 6. Das Wrapper-Skript holt die Log-Datei zurück.
 
 `final_duel.py` erkennt automatisch, ob die Forschungsversion oder das kommerzielle `tentris/tentris`-Binary vorhanden ist. Die Forschungsversion wird bevorzugt, da die kommerzielle Beta eine Lizenzdatei benötigt.
@@ -68,7 +68,7 @@ Tentris ist ein komplexes C++-Projekt mit vielen Conan-Abhängigkeiten. Falls de
 ssh -i infra/terraform/duel_key root@$(cd infra/terraform && terraform output -raw server_ip)
 ```
 
-Dann im Verzeichnis `/opt/tentris_clone/third_party/tentris` die Build-Schritte manuell ausführen.
+Dann im Verzeichnis `/opt/trillian/third_party/tentris` die Build-Schritte manuell ausführen.
 
 ## Konfiguration
 
