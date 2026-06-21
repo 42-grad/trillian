@@ -100,6 +100,23 @@ def canon_rows(result: dict):
     return rows
 
 
+def canon_seq(result: dict):
+    """Bindings -> GEORDNETE Liste kanonischer Zeilen (Reihenfolge erhalten).
+
+    Für ORDER-BY-Queries: hier zählt die Sequenz, nicht nur die Multimenge."""
+    if result is None or "results" not in result:
+        return None
+    bindings = result.get("results", {}).get("bindings", [])
+    vars_set = set(result.get("head", {}).get("vars", []))
+    for b in bindings:
+        vars_set.update(b.keys())
+    vars_sorted = sorted(vars_set)
+    return [
+        tuple((v, norm_term(b[v]) if v in b else None) for v in vars_sorted)
+        for b in bindings
+    ]
+
+
 def snippet(raw: bytes) -> str:
     return (raw or b"").decode("utf-8", "replace").strip().replace("\n", " ")[:140]
 
@@ -150,6 +167,22 @@ def compare(query: str, rust, tentris, rust_raw: bytes, tentris_raw: bytes):
         )
     n_r = sum(rr.values())
     n_t = sum(tr.values())
+    # ORDER BY: zusätzlich die SEQUENZ vergleichen (Multimenge allein ist blind
+    # für die Sortierung). Tie-Mehrdeutigkeit umgehen unsere Queries durch
+    # eindeutige Sortierschlüssel; gleiche Multimenge bei abweichender Sequenz
+    # -> ORDER_DIFF. Abweichende Multimenge fällt in ROWCOUNT_/BINDING_DIFF.
+    has_order_by = "order by" in " ".join(query.lower().split())
+    if has_order_by and rr == tr:
+        sr, st = canon_seq(rust), canon_seq(tentris)
+        if sr == st:
+            return "IDENTICAL", f"{n_r} rows (ordered)"
+        first_diff = next(
+            (i for i, (a, b) in enumerate(zip(sr, st)) if a != b), min(len(sr), len(st))
+        )
+        return "ORDER_DIFF", (
+            f"{n_r} rows, gleiche Multimenge, Sequenz weicht ab @#{first_diff}: "
+            f"rust={sr[first_diff:first_diff+1]} tentris={st[first_diff:first_diff+1]}"
+        )
     if rr == tr:
         return "IDENTICAL", f"{n_r} rows"
     only_rust = rr - tr

@@ -168,6 +168,34 @@ def main():
             f"SELECT ?s ?o WHERE {{ ?s {num_pred} ?o FILTER(?o > 5000) }}"
         )
 
+    # --- UNION + ORDER BY (Verifikation gegen Tentris) ------------------------
+    # 11) UNION, gleiche Variable: Objekte zweier Prädikate eines Subjekts.
+    #     Bestimmte, beschränkte Ergebnismenge.
+    if len(preds_of_subj[rich_subj]) >= 2:
+        ps = sorted(preds_of_subj[rich_subj])[:2]
+        queries["q11_union_same"] = (
+            f"SELECT ?o WHERE {{ {{ {rich_subj} {ps[0]} ?o }} UNION "
+            f"{{ {rich_subj} {ps[1]} ?o }} }}"
+        )
+
+    # 12) UNION, abweichende Variablen -> prüft NULL-Spalten-Ausrichtung.
+    #     Zweig 1 bindet nur ?a (inverse Lookup), Zweig 2 nur ?b (Property-Werte).
+    queries["q12_union_diff"] = (
+        f"SELECT ?a ?b WHERE {{ {{ ?a {pred_in} {pop_obj} }} UNION "
+        f"{{ {rich_subj} {p_of} ?b }} }}"
+    )
+
+    # 13) ORDER BY (aufsteigend) auf der Inverse-Lookup-Menge (?s eindeutig ->
+    #     keine Tie-Mehrdeutigkeit, exakte Sequenz vergleichbar).
+    queries["q13_orderby_asc"] = (
+        f"SELECT ?s WHERE {{ ?s {pred_in} {pop_obj} }} ORDER BY ?s"
+    )
+
+    # 14) ORDER BY DESC + LIMIT: prüft Sortierrichtung + Slice-Reihenfolge.
+    queries["q14_orderby_desc_limit"] = (
+        f"SELECT ?s WHERE {{ ?s {pred_in} {pop_obj} }} ORDER BY DESC(?s) LIMIT 10"
+    )
+
     for name, q in queries.items():
         (out_dir / f"{name}.rq").write_text(q + "\n")
     print(f"{len(queries)} Queries -> {out_dir}")
