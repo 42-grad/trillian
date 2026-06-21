@@ -1,6 +1,10 @@
-# Tentris Clone in Rust
+<p align="center">
+  <img src="logo.png" alt="Trillian" width="480">
+</p>
 
-A high-performance RDF triple store and SPARQL endpoint written in Rust, inspired by the DICE-group research prototype [Tentris](https://github.com/dice-group/tentris).
+# Trillian
+
+A high-performance RDF triple store and SPARQL endpoint written in Rust, inspired by the DICE-group research prototype [Tentris](https://github.com/dice-group/tentris). The name is a nod to *The Hitchhiker's Guide to the Galaxy* — and to triple/trillion scale.
 
 ## Goal
 
