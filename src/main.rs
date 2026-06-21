@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use trillian::hypertrie::{
-    export_ntriples, GraphPattern, HybridEngine, PatternTerm, TriplePattern, TripleStore,
+    GraphPattern, HybridEngine, PatternTerm, TriplePattern, TripleStore, export_ntriples,
 };
 
 fn main() {
@@ -84,7 +84,10 @@ fn main() {
     println!("\n=== Chain Join Benchmark ===");
     println!("Pattern:          (?w,p0,?x) (?x,p1,?y) (?y,p2,?z)");
     println!("Runs:             {}", N_CHAIN_RUNS);
-    println!("Total time:       {:.2} ms", chain_time.as_secs_f64() * 1000.0);
+    println!(
+        "Total time:       {:.2} ms",
+        chain_time.as_secs_f64() * 1000.0
+    );
     println!("Average time:     {:.2} µs/query", chain_avg_us);
     println!("Result rows:      {}", chain_count);
 
@@ -130,10 +133,12 @@ fn main() {
     println!("\n=== Triangle WCOJ Benchmark ===");
     println!("Pattern:          (?a,p0,?b) (?b,p0,?c) (?c,p0,?a)");
     println!("Runs:             {}", N_TRIANGLE_RUNS);
-    println!("Total time:       {:.2} ms", triangle_time.as_secs_f64() * 1000.0);
+    println!(
+        "Total time:       {:.2} ms",
+        triangle_time.as_secs_f64() * 1000.0
+    );
     println!("Average time:     {:.2} ms/query", triangle_avg_ms);
     println!("Result rows:      {}", triangle_count);
-
 }
 
 fn log(msg: &str) {
@@ -141,7 +146,7 @@ fn log(msg: &str) {
 }
 
 fn generate_synthetic_nt(path: &str) {
-    use trillian::synthetic::{generate, SyntheticParams};
+    use trillian::synthetic::{SyntheticParams, generate};
 
     // Graph-förmige Daten mit gemeinsamem S/O-Vokabular und eingepflanzten
     // Dreiecken/Ketten, damit Chain-/Triangle-/Star-Joins echte Treffer

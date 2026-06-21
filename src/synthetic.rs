@@ -100,9 +100,7 @@ pub fn generate(params: &SyntheticParams) -> Vec<(String, String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hypertrie::{
-        GraphPattern, HybridEngine, PatternTerm, TriplePattern, TripleStore,
-    };
+    use crate::hypertrie::{GraphPattern, HybridEngine, PatternTerm, TriplePattern, TripleStore};
 
     fn var(name: &str) -> PatternTerm {
         PatternTerm::Variable(name.to_string())
@@ -135,9 +133,21 @@ mod tests {
         // Chain: (?w,p0,?x)(?x,p1,?y)(?y,p2,?z)
         let chain = GraphPattern {
             patterns: vec![
-                TriplePattern { subject: var("w"), predicate: PatternTerm::Bound(p0), object: var("x") },
-                TriplePattern { subject: var("x"), predicate: PatternTerm::Bound(p1), object: var("y") },
-                TriplePattern { subject: var("y"), predicate: PatternTerm::Bound(p2), object: var("z") },
+                TriplePattern {
+                    subject: var("w"),
+                    predicate: PatternTerm::Bound(p0),
+                    object: var("x"),
+                },
+                TriplePattern {
+                    subject: var("x"),
+                    predicate: PatternTerm::Bound(p1),
+                    object: var("y"),
+                },
+                TriplePattern {
+                    subject: var("y"),
+                    predicate: PatternTerm::Bound(p2),
+                    object: var("z"),
+                },
             ],
         };
         let chain_rows = engine.execute(&store, &chain).n_rows();
@@ -145,14 +155,30 @@ mod tests {
         // Triangle: (?a,p0,?b)(?b,p0,?c)(?c,p0,?a)
         let triangle = GraphPattern {
             patterns: vec![
-                TriplePattern { subject: var("a"), predicate: PatternTerm::Bound(p0), object: var("b") },
-                TriplePattern { subject: var("b"), predicate: PatternTerm::Bound(p0), object: var("c") },
-                TriplePattern { subject: var("c"), predicate: PatternTerm::Bound(p0), object: var("a") },
+                TriplePattern {
+                    subject: var("a"),
+                    predicate: PatternTerm::Bound(p0),
+                    object: var("b"),
+                },
+                TriplePattern {
+                    subject: var("b"),
+                    predicate: PatternTerm::Bound(p0),
+                    object: var("c"),
+                },
+                TriplePattern {
+                    subject: var("c"),
+                    predicate: PatternTerm::Bound(p0),
+                    object: var("a"),
+                },
             ],
         };
         let triangle_rows = engine.execute(&store, &triangle).n_rows();
 
-        assert!(chain_rows > 0, "chain join must be non-empty, got {}", chain_rows);
+        assert!(
+            chain_rows > 0,
+            "chain join must be non-empty, got {}",
+            chain_rows
+        );
         assert!(
             triangle_rows > 0,
             "triangle join must be non-empty, got {}",
