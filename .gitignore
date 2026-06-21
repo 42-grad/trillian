@@ -18,3 +18,6 @@ infra/ansible/*.log
 infra/terraform/duel_key
 infra/terraform/duel_key.pub
 # .terraform.lock.hcl sollte versioniert werden, daher nicht ignorieren
+watdiv_queries/
+watdiv-tentris-data/
+watdiv_correctness.log
