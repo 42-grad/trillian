@@ -17,6 +17,10 @@ lru = "0.13"
 tokio-stream = "0.1"
 memmap2 = "0.9"
 bytemuck = "1"
+dhat = { version = "0.3", optional = true }
+
+[features]
+dhat = ["dep:dhat"]
 
 [profile.release]
 opt-level = 3

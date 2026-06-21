@@ -1,11 +1,18 @@
 use std::time::Instant;
 
-use tentris_clone::hypertrie::TripleStore;
-use tentris_clone::sparql::{serve, serve_durable};
+use tentris_clone::hypertrie::{HybridEngine, TripleStore};
+use tentris_clone::sparql::{profile_query, serve, serve_durable};
 use tentris_clone::wal::Wal;
+
+#[cfg(feature = "dhat")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
 
 #[tokio::main]
 async fn main() {
+    #[cfg(feature = "dhat")]
+    let _dhat = dhat::Profiler::new_heap();
+
     let args: Vec<String> = std::env::args().collect();
 
     // Modi (analog zu Tentris' loader/server-Trennung):
@@ -22,6 +29,12 @@ async fn main() {
             let snap = args.get(2).expect("usage: server load <snapshot.bin> [port]");
             let port = args.get(3).and_then(|p| p.parse().ok()).unwrap_or(9080);
             load_and_serve(snap, port).await;
+        }
+        Some("profile") => {
+            let nt = args.get(2).expect("usage: server profile <file.nt> <query.rq> [runs]");
+            let qf = args.get(3).expect("usage: server profile <file.nt> <query.rq> [runs]");
+            let runs = args.get(4).and_then(|r| r.parse().ok()).unwrap_or(50);
+            profile(nt, qf, runs);
         }
         _ => {
             let nt = args.get(1).map(|s| s.as_str()).unwrap_or("synthetic_1m.nt");
@@ -71,6 +84,25 @@ async fn load_and_serve(snapshot: &str, port: u16) {
         t0.elapsed().as_millis()
     );
     serve_durable(store, port, Some(wal)).await;
+}
+
+/// Profiling: Index in-RAM bauen (Heap, für dhat sichtbar), Memory-Report
+/// drucken und eine Query mit Phasen-Timing (Parse/Eval/Serialize) messen.
+fn profile(nt: &str, query_file: &str, runs: usize) {
+    let mut store = TripleStore::new();
+    let t0 = Instant::now();
+    let n = store.ingest_ntriples_file(nt).expect("Failed to parse .nt file");
+    println!(
+        "Geladen (in-RAM): {} Triples, {} Terme in {} ms\n",
+        n,
+        store.dict.len(),
+        t0.elapsed().as_millis()
+    );
+    store.memory_report();
+    println!();
+    let engine = HybridEngine::new();
+    let query = std::fs::read_to_string(query_file).expect("Failed to read query file");
+    profile_query(&store, &engine, &query, runs);
 }
 
 /// Default: N-Triples parsen, Index bauen, serven (ohne Snapshot).

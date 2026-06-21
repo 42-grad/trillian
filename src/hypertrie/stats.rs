@@ -63,6 +63,31 @@ impl Stats {
         dec(&mut self.osp_pair_count, (o, s));
     }
 
+    /// Anzahl Einträge über alle Maps (für den Memory-Report).
+    pub fn entry_count(&self) -> usize {
+        self.subject_degree.len()
+            + self.predicate_degree.len()
+            + self.object_degree.len()
+            + self.spo_pair_count.len()
+            + self.pos_pair_count.len()
+            + self.osp_pair_count.len()
+    }
+
+    /// Grobe Byte-Schätzung der Statistik-Maps.
+    pub fn approx_bytes(&self) -> usize {
+        // Degree-Maps: u32->usize (~14 B/Eintrag mit hashbrown-Overhead).
+        let deg = (self.subject_degree.len()
+            + self.predicate_degree.len()
+            + self.object_degree.len())
+            * 14;
+        // Pair-Maps: (u32,u32)->usize (~20 B/Eintrag).
+        let pair = (self.spo_pair_count.len()
+            + self.pos_pair_count.len()
+            + self.osp_pair_count.len())
+            * 20;
+        deg + pair
+    }
+
     /// Schätzt die Kardinalität (Anzahl Ergebnisreihen) eines Musters.
     /// Läuft in O(1) dank vorberechneter Hash-Maps.
     pub fn estimate_cardinality(

@@ -97,6 +97,14 @@ impl Dictionary {
         self.id_to_type.get(id as usize)
     }
 
+    /// Grobe Byte-Schätzung (für den Memory-Report). Strings liegen doppelt
+    /// (id_to_str-Value + str_to_id-Key), plus Typ-Vec.
+    pub fn approx_bytes(&self) -> usize {
+        let str_bytes: usize = self.id_to_str.iter().map(|s| s.len() + 24).sum();
+        let n = self.id_to_str.len();
+        str_bytes * 2 + n * std::mem::size_of::<TermType>()
+    }
+
     #[inline]
     pub fn len(&self) -> usize {
         self.id_to_str.len()

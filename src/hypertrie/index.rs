@@ -409,6 +409,18 @@ impl LayeredIndex {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
+
+    /// Logische Byte-Größe (Basis-Arrays + Delta) – für den Memory-Report.
+    pub fn heap_bytes(&self) -> usize {
+        let base: usize = self.base.arrays().iter().map(|a| a.len() * 4).sum();
+        let delta: usize = self
+            .ins
+            .values()
+            .chain(self.del.values())
+            .map(|v| v.len() * 4 + 24)
+            .sum();
+        base + delta
+    }
 }
 
 // --- Delta-Leaf-Hilfsfunktionen (sortierte Vecs pro (first, second)) ---

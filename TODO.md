@@ -4,34 +4,38 @@ Stand 2026-06-21. Echtdaten-Benchmark (WatDiv) ist abgeschlossen: Korrektheit
 7/7 identisch zu Tentris, RAM-Parität (336 vs 319 B/Triple), ~21× kleiner auf
 Disk, Ingest 3,9× schneller. Offene Punkte, priorisiert.
 
-## 0. Profiling-Run zuerst (Speed + Memory) — NÄCHSTER SCHRITT
+## 0. Profiling-Run (Speed + Memory) — ✅ ERLEDIGT 2026-06-21
 
-Bevor optimiert wird: datengetrieben herausfinden, **wo** wir Performance liegen
-lassen.
+Tooling: `server profile <file.nt> <query.rq> [runs]` (Phasen-Timing +
+Memory-Report); `--features dhat` für reale Heap-Allokationen.
+Gemessen auf WatDiv-Slice (1,09M Tripel).
 
-- [ ] **Speed-Profiling** der langsamen Queries (v. a. `q04 star`, 18995 Zeilen,
-      97 vs. 50 ms; `q03 inverse`, 5862 Zeilen). Wo geht die Zeit hin?
-      Kandidaten: SPARQL-Parse · Planung · Join/Leapfrog · Row-Materialisierung
-      (`RowBlock`) · **JSON-Serialisierung** (`serde_json::Map` pro Zeile).
-      - Tooling: `cargo flamegraph` (Linux `perf`) oder `samply`; alternativ
-        Phasen-Timing im Server (parse/exec/serialize getrennt messen).
-- [ ] **Memory-Profiling** bei Load + Query. Wo sitzt der RSS?
-      Kandidaten: Index-Arenas (SPO/POS/OSP) · Dict-Strings (doppelt gehalten) ·
-      Stats-Maps (Pair-Counts ~1 Eintrag/distinktes Paar) · Query-Zwischenergebnisse.
-      - Tooling: `dhat-rs` (Heap-Profiler) oder `valgrind massif`.
-- [ ] Ergebnis: Hotspot-Liste → priorisierte Optimierungen für Abschnitt 1.
+**Speed-Befund (q04 star, 18995 Zeilen):** parse 0,015 ms · **eval 1,16 ms** ·
+**serialize 25,27 ms**. → Die Engine ist schnell; **~95 % der Zeit großer
+Queries geht in die SPARQL-JSON-Serialisierung** (`serde_json::Map`/`Value` pro
+Zeile/Zelle). Das ist der gesamte „2×-Rückstand" zu Tentris.
 
-## 1. Performance-Optimierungen (datengetrieben nach Profiling)
+**Memory-Befund (logisch 140 MB, dhat-Peak 300 MB / 711.922 Blöcke):**
+- **Dictionary 66,7 MB + ~712k Allokationen** (jeder String **doppelt**:
+  `id_to_str`-Value + `str_to_id`-Key) → größter Posten.
+- **Stats-Pair-Count-Maps 40,7 MB / 2,28M Einträge** → #2.
+- 3 Permutationen nur 29,9 MB (Index ist kompakt).
+- Overhead logisch→real (~160 MB) = die winzigen Dict-Strings + Stats-Einträge.
 
-- [ ] **Große Ergebnismengen ~2× langsamer als Tentris** (q04/q03). Hypothese:
-      JSON-Output (eine `Map`-Allokation pro Zeile) + Binär-Join-Materialisierung.
-      → SPARQL-JSON streamend/direkt schreiben statt `Vec<Map<..>>` aufzubauen;
-      ggf. Join für große Zwischenergebnisse verbessern. **Profiling bestätigt die Ursache.**
-- [ ] Dictionary hält jeden String doppelt (`str_to_id`-Key + `id_to_str`-Value)
-      → String-Interning / einfache Speicherung (Memory: ~Rest-Abstand zu Tentris).
+## 1. Performance-Optimierungen (datengetrieben) — als nächstes
+
+- [ ] **(Speed, größter Hebel) Streaming-SPARQL-JSON**: Antwort direkt als
+      Bytes schreiben statt `Vec<Map<String,Value>>` aufzubauen. Behebt den
+      2×-Rückstand bei großen Ergebnissen (q04: 25 → erwartet wenige ms).
+- [ ] **(Memory, größter Hebel) Dictionary-String-Interning**: Strings in
+      *einer* Arena (Buffer + Offsets) statt 712k Einzel-`String`s, und nur
+      **einmal** halten (str_to_id → id, id_to_str → Offset). Erwartet
+      Dict ~66 → ~33 MB + drastisch weniger Allokationen.
+- [ ] **(Memory) Stats-Maps verschlanken**: 2,28M Pair-Count-Einträge (40 MB)
+      für den Planner — on-demand aus dem Index ableiten oder kompakter halten.
 - [ ] DELETE-Pfad: `pred_subjects`/`pred_objects` als `BTreeSet` statt sortiertem
-      `Vec` (O(log n)- statt O(n)-Remove bei Einzeltransaktionen).
-- [ ] WAL-Checkpointing / Snapshot-Rotation (WAL wächst sonst unbegrenzt).
+      `Vec` (O(log n)- statt O(n)-Remove).
+- [ ] WAL-Checkpointing / Snapshot-Rotation.
 
 ## 2. SPARQL-Feature-Ausbau (ermöglicht echte Query-Suiten statt nur BGP)
 

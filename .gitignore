@@ -21,3 +21,4 @@ infra/terraform/duel_key.pub
 watdiv_queries/
 watdiv-tentris-data/
 watdiv_correctness.log
+dhat-heap.json

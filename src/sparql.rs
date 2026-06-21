@@ -307,6 +307,43 @@ struct SelectResult {
     var_order: Vec<String>,
 }
 
+/// Profiling: führt eine SELECT-Query `runs`-mal aus und gibt die Median-Zeiten
+/// der Phasen Parse / Eval (Plan+Join) / Serialize (SPARQL-JSON) aus. Trennt so,
+/// wo die Zeit großer Queries hingeht.
+pub fn profile_query(store: &TripleStore, engine: &HybridEngine, query_str: &str, runs: usize) {
+    use std::time::Instant;
+    let (mut parse, mut eval, mut ser) = (Vec::new(), Vec::new(), Vec::new());
+    let mut rows = 0usize;
+    for _ in 0..runs {
+        let t = Instant::now();
+        let query = SparqlParser::new().parse_query(query_str).expect("parse");
+        parse.push(t.elapsed().as_secs_f64() * 1000.0);
+        let SparqlQuery::Select { pattern, .. } = query else {
+            eprintln!("profile_query: nur SELECT");
+            return;
+        };
+        let (bgp, opt, proj, dist, lim, off) = extract_bgp_and_projection(&pattern).unwrap();
+        let t = Instant::now();
+        let result =
+            evaluate_select_with_modifiers(store, engine, bgp, opt, proj, dist, lim, off).unwrap();
+        eval.push(t.elapsed().as_secs_f64() * 1000.0);
+        rows = result.rows.n_rows();
+        let t = Instant::now();
+        let _ = sparql_json(&result, store);
+        ser.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    let med = |mut v: Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2]
+    };
+    let (p, e, s) = (med(parse), med(eval), med(ser));
+    println!("=== Profil ({} runs, {} rows) ===", runs, rows);
+    println!("  parse:     {:.3} ms", p);
+    println!("  eval:      {:.3} ms  (Plan + Join + Materialisierung)", e);
+    println!("  serialize: {:.3} ms  (SPARQL-JSON)", s);
+    println!("  gesamt:    {:.3} ms", p + e + s);
+}
+
 fn evaluate_select(
     store: &TripleStore,
     engine: &HybridEngine,

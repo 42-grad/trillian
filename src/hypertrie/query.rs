@@ -331,6 +331,36 @@ impl TripleStore {
         }
     }
 
+    /// Druckt eine logische Speicher-Aufschlüsselung (Komponenten in MB).
+    /// Logische Schätzung – der reale RSS enthält zusätzlich Allokator-Overhead.
+    pub fn memory_report(&self) {
+        let mb = |b: usize| b as f64 / 1024.0 / 1024.0;
+        let perm = self.spo.heap_bytes() + self.pos.heap_bytes() + self.osp.heap_bytes();
+        let dict = self.dict.approx_bytes();
+        let pred: usize = self
+            .pred_subjects
+            .values()
+            .map(|v| v.len() * 4)
+            .sum::<usize>()
+            + self.pred_objects.values().map(|v| v.len() * 4).sum::<usize>();
+        let stats = self.stats.approx_bytes();
+        let total = perm + dict + pred + stats;
+        println!("=== Memory-Report (logisch, {} Triples) ===", self.triple_count());
+        println!("  3 Permutationen (SPO/POS/OSP): {:.1} MB", mb(perm));
+        println!("  Dictionary (Strings ×2 + Typen): {:.1} MB", mb(dict));
+        println!("  Prädikat-Listen:                 {:.1} MB", mb(pred));
+        println!(
+            "  Stats-Maps ({} Einträge):        {:.1} MB",
+            self.stats.entry_count(),
+            mb(stats)
+        );
+        println!("  Summe (logisch):                 {:.1} MB", mb(total));
+        println!(
+            "  Bytes/Triple (logisch):          {:.0} B",
+            total as f64 / self.triple_count().max(1) as f64
+        );
+    }
+
     /// Kompaktiert die Deltas aller drei Permutationen in die flachen Basen.
     pub fn compact_all(&mut self) {
         self.spo.compact();
