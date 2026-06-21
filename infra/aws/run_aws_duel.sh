@@ -41,12 +41,18 @@ fi
 echo "[run_aws_duel] Terraform apply..."
 cd "$TERRAFORM_DIR"
 terraform init -input=false
+# Optionale Overrides pro Lauf (z. B. günstiger Warm-up):
+#   INSTANCE_TYPE=r6i.4xlarge DISK_GB=300 ./run_aws_duel.sh 10 50
+EXTRA_VARS=()
+[ -n "${INSTANCE_TYPE:-}" ] && EXTRA_VARS+=(-var="instance_type=${INSTANCE_TYPE}")
+[ -n "${DISK_GB:-}" ] && EXTRA_VARS+=(-var="disk_gb=${DISK_GB}")
 terraform apply -auto-approve \
-    -var="ssh_public_key_path=$SSH_PUBLIC_KEY"
+    -var="ssh_public_key_path=$SSH_PUBLIC_KEY" \
+    "${EXTRA_VARS[@]+"${EXTRA_VARS[@]}"}"
 
 SERVER_IP=$(terraform output -raw server_ip)
-INSTANCE_TYPE=$(terraform output -raw instance_type)
-echo "[run_aws_duel] Server: $SERVER_IP ($INSTANCE_TYPE)"
+LAUNCHED_TYPE=$(terraform output -raw instance_type)
+echo "[run_aws_duel] Server: $SERVER_IP ($LAUNCHED_TYPE)"
 
 echo "[run_aws_duel] Warte auf SSH..."
 MAX_WAIT=180; ELAPSED=0
