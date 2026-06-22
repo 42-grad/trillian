@@ -17,7 +17,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::hypertrie::{
     Dictionary, GraphPattern, HybridEngine, NULL_ID, PatternTerm, RowBlock, TermType,
-    TriplePattern, TripleStore,
+    TriplePattern, TripleStore, max_result_rows,
 };
 use crate::wal::Wal;
 
@@ -465,17 +465,17 @@ fn eval_where(
         GP::LeftJoin { left, right, .. } => {
             let (lr, lvo) = eval_where(left, store, engine, None)?;
             let (rr, rvo) = eval_where(right, store, engine, None)?;
-            Ok(hash_join(lr, &lvo, rr, &rvo, true))
+            hash_join(lr, &lvo, rr, &rvo, true)
         }
         GP::Join { left, right } => {
             let (lr, lvo) = eval_where(left, store, engine, None)?;
             let (rr, rvo) = eval_where(right, store, engine, None)?;
-            Ok(hash_join(lr, &lvo, rr, &rvo, false))
+            hash_join(lr, &lvo, rr, &rvo, false)
         }
         GP::Union { left, right } => {
             let (lr, lvo) = eval_where(left, store, engine, None)?;
             let (rr, rvo) = eval_where(right, store, engine, None)?;
-            Ok(union_rows(lr, &lvo, rr, &rvo))
+            union_rows(lr, &lvo, rr, &rvo)
         }
         GP::Path {
             subject,
@@ -674,12 +674,16 @@ fn eval_path(
         return Ok((RowBlock::new(vo.len()), vo));
     }
 
+    let cap = max_result_rows();
     match (s_end, o_end) {
         // Subjekt gebunden, Objekt Variable: Vorwärts-Closure.
         (Some(PathEnd::Bound(s)), Some(PathEnd::Var(ov))) => {
             let mut from = FxHashSet::default();
             from.insert(s);
             let ends = step_forward(store, path, &from);
+            if ends.len() > cap {
+                return Err(op_too_large());
+            }
             let mut rows = RowBlock::new(1);
             for o in ends {
                 rows.push_row(&[o]);
@@ -691,6 +695,9 @@ fn eval_path(
             let mut from = FxHashSet::default();
             from.insert(o);
             let starts = step_backward(store, path, &from);
+            if starts.len() > cap {
+                return Err(op_too_large());
+            }
             let mut rows = RowBlock::new(1);
             for s in starts {
                 rows.push_row(&[s]);
@@ -735,6 +742,9 @@ fn eval_path(
                         rows.push_row(&[s, o]);
                     }
                 }
+                if rows.n_rows() > cap {
+                    return Err(op_too_large());
+                }
             }
             Ok((rows, rows_vars))
         }
@@ -769,13 +779,23 @@ fn eval_bgp(
 
 /// Hash-Join zweier Ergebnis-Blöcke auf den gemeinsamen Variablen.
 /// `left_outer = true` behält linke Zeilen ohne Match (NULL-aufgefüllt).
+/// Fehlermeldung bei Cap-Überschreitung in einem eval_where-Operator.
+fn op_too_large() -> String {
+    format!(
+        "result exceeds {} rows (join/union/path materialization); \
+         raise TRILLIAN_MAX_ROWS to allow",
+        max_result_rows()
+    )
+}
+
 fn hash_join(
     left: RowBlock,
     lvo: &[String],
     right: RowBlock,
     rvo: &[String],
     left_outer: bool,
-) -> (RowBlock, Vec<String>) {
+) -> Result<(RowBlock, Vec<String>), String> {
+    let cap = max_result_rows();
     let mut shared: Vec<(usize, usize)> = Vec::new(); // (left_pos, right_pos)
     let mut new_positions: Vec<usize> = Vec::new();
     let mut new_vars: Vec<String> = Vec::new();
@@ -820,8 +840,11 @@ fn hash_join(
                 }
             }
         }
+        if out.n_rows() > cap {
+            return Err(op_too_large());
+        }
     }
-    (out, new_var_order)
+    Ok((out, new_var_order))
 }
 
 /// UNION zweier Ergebnis-Blöcke: gemeinsame Variablenmenge, fehlende -> NULL.
@@ -830,7 +853,8 @@ fn union_rows(
     lvo: &[String],
     right: RowBlock,
     rvo: &[String],
-) -> (RowBlock, Vec<String>) {
+) -> Result<(RowBlock, Vec<String>), String> {
+    let cap = max_result_rows();
     let mut vo = lvo.to_vec();
     for v in rvo {
         if !vo.contains(v) {
@@ -846,18 +870,22 @@ fn union_rows(
     let lmap = map_cols(lvo);
     let rmap = map_cols(rvo);
     let mut out = RowBlock::new(vo.len());
-    let emit = |src: &RowBlock, map: &[Option<usize>], out: &mut RowBlock| {
+    let emit = |src: &RowBlock, map: &[Option<usize>], out: &mut RowBlock| -> Result<(), String> {
         let mut buf = vec![NULL_ID; map.len()];
         for row in src.rows() {
             for (i, m) in map.iter().enumerate() {
                 buf[i] = m.map(|c| row[c]).unwrap_or(NULL_ID);
             }
             out.push_row(&buf);
+            if out.n_rows() > cap {
+                return Err(op_too_large());
+            }
         }
+        Ok(())
     };
-    emit(&left, &lmap, &mut out);
-    emit(&right, &rmap, &mut out);
-    (out, vo)
+    emit(&left, &lmap, &mut out)?;
+    emit(&right, &rmap, &mut out)?;
+    Ok((out, vo))
 }
 
 /// Sortier-Schlüssel für ORDER BY (SPARQL-nahe Gesamtordnung).
