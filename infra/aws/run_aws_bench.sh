@@ -81,8 +81,13 @@ echo "[run_aws_bench] Hole Ergebnis..."
 scp -i "$SSH_PRIVATE_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     "ubuntu@$SERVER_IP:/opt/trillian/wdbench_solo.log" \
     "${SCRIPT_DIR}/wdbench_solo.log" 2>/dev/null || echo "  (kein Log gefunden)"
+# Per-Query-CSVs für den Korrektheits-Vergleich (wdbench_compare.py).
+mkdir -p "${SCRIPT_DIR}/solo_csv"
+scp -i "$SSH_PRIVATE_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    "ubuntu@$SERVER_IP:/opt/trillian/wdbench_data/solo_*.csv" \
+    "${SCRIPT_DIR}/solo_csv/" 2>/dev/null || echo "  (keine CSVs gefunden)"
 
-echo "[run_aws_bench] Fertig. Ergebnis: ${SCRIPT_DIR}/wdbench_solo.log"
+echo "[run_aws_bench] Fertig. Ergebnis: ${SCRIPT_DIR}/wdbench_solo.log + solo_csv/"
 echo ""
 echo "WICHTIG – Instanz kostet weiter, bis du sie zerstörst:"
 echo "  ./infra/aws/destroy.sh"
