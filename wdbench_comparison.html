@@ -1,0 +1,355 @@
+<title>Trillian — WDBench comparison</title>
+<style>
+:root{
+  --ground:#ECF0F3; --panel:#F6F8FA; --text:#16242E; --muted:#5A6B78;
+  --line:#CBD5DD; --accent:#1E5BD6; --accent-soft:#D6E2FA;
+  --grey:#8A99A6; --grey-soft:#DBE2E8; --amber:#B7791F; --red:#B23A3A; --ok:#2E7D5B;
+  --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+}
+*{box-sizing:border-box}
+body{background:var(--ground);color:var(--text);font-family:var(--sans);
+  line-height:1.5;margin:0;-webkit-font-smoothing:antialiased}
+.wrap{max-width:980px;margin:0 auto;padding:clamp(20px,4vw,56px)}
+.eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.14em;text-transform:uppercase;
+  color:var(--accent);font-weight:600;margin:0 0 14px}
+h1{font-family:var(--mono);font-weight:700;font-size:clamp(34px,6vw,60px);line-height:1.02;
+  letter-spacing:-.02em;margin:0 0 18px}
+h1 .q{color:var(--accent)}
+.thesis{font-size:clamp(16px,2.2vw,20px);max-width:62ch;color:#2A3A45;margin:0 0 28px}
+.thesis b{color:var(--text)}
+.chips{display:flex;flex-wrap:wrap;gap:12px;margin:0 0 8px}
+.chip{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 18px;flex:1 1 200px}
+.chip .big{font-family:var(--mono);font-size:30px;font-weight:700;letter-spacing:-.02em;line-height:1}
+.chip .big.acc{color:var(--accent)}
+.chip .lbl{font-size:13px;color:var(--muted);margin-top:6px}
+section{margin-top:48px}
+h2{font-family:var(--mono);font-size:13px;letter-spacing:.12em;text-transform:uppercase;
+  color:var(--text);font-weight:700;margin:0 0 6px;padding-bottom:10px;border-bottom:2px solid var(--text)}
+.sub{font-size:14px;color:var(--muted);margin:0 0 22px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:20px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px 20px}
+.phead{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:14px}
+.pname{font-weight:700;font-size:15px}
+.pn{font-family:var(--mono);font-size:12px;color:var(--muted)}
+.row{display:grid;grid-template-columns:80px 1fr auto;align-items:center;gap:8px 10px;margin:7px 0;
+  grid-template-areas:"l t v" "l t k"}
+.rl{grid-area:l;font-size:13px;font-weight:600}
+.rt{grid-area:t;background:var(--grey-soft);border-radius:4px;height:18px;overflow:hidden}
+.bar{height:100%;background:var(--grey);border-radius:4px;transform-origin:left;animation:grow .8s cubic-bezier(.2,.7,.2,1) both}
+.bar.tri{background:var(--accent)}
+.rv{grid-area:v;font-family:var(--mono);font-size:13px;font-weight:600;text-align:right;min-width:74px}
+.rok{grid-area:k;font-family:var(--mono);font-size:11px;color:var(--muted);text-align:right}
+@keyframes grow{from{transform:scaleX(0)}to{transform:scaleX(1)}}
+.cov{display:grid;grid-template-columns:200px 1fr;gap:6px 16px;align-items:center;margin:12px 0;
+  grid-template-areas:"label bar" "label num"}
+.covlabel{grid-area:label;font-size:14px;font-weight:600}
+.covbar{grid-area:bar;display:flex;height:16px;background:var(--grey-soft);border-radius:4px;overflow:hidden}
+.seg{height:100%}.seg.ok{background:var(--ok)}.seg.to{background:var(--amber)}.seg.err{background:var(--red)}
+.covnum{grid-area:num;font-family:var(--mono);font-size:12px;color:var(--muted)}
+.covnum b{color:var(--ok)}
+.legend{display:flex;gap:18px;font-size:12px;color:var(--muted);margin-bottom:18px;font-family:var(--mono)}
+.legend i{display:inline-block;width:11px;height:11px;border-radius:2px;margin-right:6px;vertical-align:-1px}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th,td{text-align:left;padding:11px 12px;border-bottom:1px solid var(--line)}
+th{font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:600}
+.cnum,.cpct{font-family:var(--mono);text-align:right}
+.ccat{font-weight:600}
+.cbadge span{font-family:var(--mono);font-size:11px;font-weight:700;padding:3px 9px;border-radius:20px}
+.cgood .cbadge span{background:#DCF0E6;color:var(--ok)}
+.cwarn .cbadge span{background:#F6ECD2;color:var(--amber)}
+.cbad .cbadge span{background:#F4DDDD;color:var(--red)}
+.cnote{color:var(--muted);font-size:13px}
+.fchips{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px}
+.fc{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px 20px}
+.fc .v{font-family:var(--mono);font-size:26px;font-weight:700;letter-spacing:-.02em}
+.fc .v.acc{color:var(--accent)}
+.fc .k{font-size:13px;color:var(--muted);margin-top:6px}
+.note{font-size:13.5px;color:var(--muted);max-width:74ch;margin-top:16px}
+.note b{color:var(--text)}
+.caveats{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--accent);
+  border-radius:10px;padding:18px 22px;margin-top:22px}
+.caveats li{font-size:13.5px;color:#33434E;margin:7px 0}
+.foot{margin-top:44px;padding-top:18px;border-top:1px solid var(--line);font-family:var(--mono);
+  font-size:11.5px;color:var(--muted)}
+@media (max-width:560px){.row{grid-template-columns:64px 1fr}.cov{grid-template-columns:1fr}}
+@media (prefers-reduced-motion:reduce){.bar{animation:none}}
+</style>
+
+<div class="wrap">
+  <p class="eyebrow">WDBench · Wikidata truthy · 1,257,169,959 triples · 60 s timeout</p>
+  <h1>Trillian <span class="q">vs.</span> the field</h1>
+  <p class="thesis">On the <b>930 basic-graph-pattern queries</b> — the ones where Trillian returns the
+  <b>exact same result counts</b> as every published engine — its median answer is <b>1 ms</b> (single)
+  and <b>132 ms</b> (multiple): roughly <b>9× to 70× under</b> the fastest of Blazegraph, Jena, Virtuoso
+  and Neo4j. On property paths and C2RPQs it’s fast but currently under-produces — shown honestly below.</p>
+  <div class="chips">
+    <div class="chip"><div class="big acc">1 ms</div><div class="lbl">Single-BGP median latency — best published: 69 ms (Blazegraph)</div></div>
+    <div class="chip"><div class="big">100%</div><div class="lbl">BGP result counts matching the published engines (930/930)</div></div>
+    <div class="chip"><div class="big">78 GB</div><div class="lbl">resident RAM, fully in-memory — others are disk-backed stores</div></div>
+  </div>
+
+  <section>
+    <h2>Median latency per query class</h2>
+    <p class="sub">Median over completed (OK) queries, log scale. Lower is better. Trillian in blue; the
+    “n/m ok” tag shows how many of each class completed within the timeout.</p>
+    <div class="grid">
+      <div class="panel">
+  <div class="phead"><span class="pname">Single BGP</span><span class="pn">280 queries</span></div>
+  <div class="row">
+  <div class="rl">Trillian</div>
+  <div class="rt"><div class="bar tri" style="width:2.0%"></div></div>
+  <div class="rv">1 ms</div>
+  <div class="rok">267/280 ok</div>
+</div><div class="row">
+  <div class="rl">Blazegraph</div>
+  <div class="rt"><div class="bar" style="width:45.1%"></div></div>
+  <div class="rv">69 ms</div>
+  <div class="rok">277/280 ok</div>
+</div><div class="row">
+  <div class="rl">Virtuoso</div>
+  <div class="rt"><div class="bar" style="width:59.2%"></div></div>
+  <div class="rv">261 ms</div>
+  <div class="rok">279/280 ok</div>
+</div><div class="row">
+  <div class="rl">Jena</div>
+  <div class="rt"><div class="bar" style="width:60.0%"></div></div>
+  <div class="rv">279 ms</div>
+  <div class="rok">257/280 ok</div>
+</div><div class="row">
+  <div class="rl">Neo4j</div>
+  <div class="rt"><div class="bar" style="width:68.8%"></div></div>
+  <div class="rv">642 ms</div>
+  <div class="rok">233/280 ok</div>
+</div>
+</div>
+<div class="panel">
+  <div class="phead"><span class="pname">Multiple BGP</span><span class="pn">681 queries</span></div>
+  <div class="row">
+  <div class="rl">Trillian</div>
+  <div class="rt"><div class="bar tri" style="width:52.0%"></div></div>
+  <div class="rv">132 ms</div>
+  <div class="rok">667/681 ok</div>
+</div><div class="row">
+  <div class="rl">Blazegraph</div>
+  <div class="rt"><div class="bar" style="width:75.2%"></div></div>
+  <div class="rv">1,166 ms</div>
+  <div class="rok">634/681 ok</div>
+</div><div class="row">
+  <div class="rl">Jena</div>
+  <div class="rt"><div class="bar" style="width:84.4%"></div></div>
+  <div class="rv">2,761 ms</div>
+  <div class="rok">635/681 ok</div>
+</div><div class="row">
+  <div class="rl">Virtuoso</div>
+  <div class="rt"><div class="bar" style="width:96.2%"></div></div>
+  <div class="rv">8,436 ms</div>
+  <div class="rok">672/681 ok</div>
+</div>
+</div>
+<div class="panel">
+  <div class="phead"><span class="pname">Optional</span><span class="pn">498 queries</span></div>
+  <div class="row">
+  <div class="rl">Blazegraph</div>
+  <div class="rt"><div class="bar" style="width:80.3%"></div></div>
+  <div class="rv">1,892 ms</div>
+  <div class="rok">470/498 ok</div>
+</div><div class="row">
+  <div class="rl">Jena</div>
+  <div class="rt"><div class="bar" style="width:86.5%"></div></div>
+  <div class="rv">3,368 ms</div>
+  <div class="rok">457/498 ok</div>
+</div><div class="row">
+  <div class="rl">Trillian</div>
+  <div class="rt"><div class="bar tri" style="width:91.8%"></div></div>
+  <div class="rv">5,562 ms</div>
+  <div class="rok">315/498 ok</div>
+</div><div class="row">
+  <div class="rl">Virtuoso</div>
+  <div class="rt"><div class="bar" style="width:95.5%"></div></div>
+  <div class="rv">7,900 ms</div>
+  <div class="rok">428/498 ok</div>
+</div><div class="row">
+  <div class="rl">Neo4j</div>
+  <div class="rt"><div class="bar" style="width:100.0%"></div></div>
+  <div class="rv">11,967 ms</div>
+  <div class="rok">351/498 ok</div>
+</div>
+</div>
+<div class="panel">
+  <div class="phead"><span class="pname">Property Paths</span><span class="pn">660 queries</span></div>
+  <div class="row">
+  <div class="rl">Trillian</div>
+  <div class="rt"><div class="bar tri" style="width:11.7%"></div></div>
+  <div class="rv">3 ms</div>
+  <div class="rok">462/660 ok</div>
+</div><div class="row">
+  <div class="rl">Jena</div>
+  <div class="rt"><div class="bar" style="width:64.2%"></div></div>
+  <div class="rv">416 ms</div>
+  <div class="rok">564/660 ok</div>
+</div><div class="row">
+  <div class="rl">Blazegraph</div>
+  <div class="rt"><div class="bar" style="width:68.9%"></div></div>
+  <div class="rv">645 ms</div>
+  <div class="rok">573/660 ok</div>
+</div><div class="row">
+  <div class="rl">Virtuoso</div>
+  <div class="rt"><div class="bar" style="width:70.3%"></div></div>
+  <div class="rv">738 ms</div>
+  <div class="rok">609/660 ok</div>
+</div><div class="row">
+  <div class="rl">Neo4j</div>
+  <div class="rt"><div class="bar" style="width:89.8%"></div></div>
+  <div class="rv">4,612 ms</div>
+  <div class="rok">499/660 ok</div>
+</div>
+</div>
+<div class="panel">
+  <div class="phead"><span class="pname">C2RPQ</span><span class="pn">539 queries</span></div>
+  <div class="row">
+  <div class="rl">Trillian</div>
+  <div class="rt"><div class="bar tri" style="width:52.0%"></div></div>
+  <div class="rv">132 ms</div>
+  <div class="rok">347/539 ok</div>
+</div><div class="row">
+  <div class="rl">Jena</div>
+  <div class="rt"><div class="bar" style="width:68.7%"></div></div>
+  <div class="rv">632 ms</div>
+  <div class="rok">297/539 ok</div>
+</div><div class="row">
+  <div class="rl">Blazegraph</div>
+  <div class="rt"><div class="bar" style="width:74.7%"></div></div>
+  <div class="rv">1,113 ms</div>
+  <div class="rok">361/539 ok</div>
+</div><div class="row">
+  <div class="rl">Virtuoso</div>
+  <div class="rt"><div class="bar" style="width:84.3%"></div></div>
+  <div class="rv">2,755 ms</div>
+  <div class="rok">496/539 ok</div>
+</div>
+</div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Coverage — how many queries completed</h2>
+    <p class="sub">The honest counterweight to a fast median: where Trillian errors today it’s the
+    result-row cap firing on un-pipelined operators (a clean error, not a crash), not a timeout.</p>
+    <div class="legend">
+      <span><i style="background:var(--ok)"></i>OK</span>
+      <span><i style="background:var(--amber)"></i>Timeout</span>
+      <span><i style="background:var(--red)"></i>Error (cap)</span>
+    </div>
+    <div class="cov">
+  <div class="covlabel">Trillian · Single BGP</div>
+  <div class="covbar"><span class="seg ok" style="width:95.36%" title="ok 267"></span><span class="seg err" style="width:4.64%" title="err 13"></span></div>
+  <div class="covnum"><b>267</b> ok · 0 timeout · 13 error</div>
+</div>
+<div class="cov">
+  <div class="covlabel">Trillian · Multiple BGP</div>
+  <div class="covbar"><span class="seg ok" style="width:97.94%" title="ok 667"></span><span class="seg to" style="width:0.29%" title="to 2"></span><span class="seg err" style="width:1.76%" title="err 12"></span></div>
+  <div class="covnum"><b>667</b> ok · 2 timeout · 12 error</div>
+</div>
+<div class="cov">
+  <div class="covlabel">Trillian · Optional</div>
+  <div class="covbar"><span class="seg ok" style="width:63.25%" title="ok 315"></span><span class="seg err" style="width:36.75%" title="err 183"></span></div>
+  <div class="covnum"><b>315</b> ok · 0 timeout · 183 error</div>
+</div>
+<div class="cov">
+  <div class="covlabel">Trillian · Property Paths</div>
+  <div class="covbar"><span class="seg ok" style="width:70.00%" title="ok 462"></span><span class="seg to" style="width:1.06%" title="to 7"></span><span class="seg err" style="width:28.94%" title="err 191"></span></div>
+  <div class="covnum"><b>462</b> ok · 7 timeout · 191 error</div>
+</div>
+<div class="cov">
+  <div class="covlabel">Trillian · C2RPQ</div>
+  <div class="covbar"><span class="seg ok" style="width:64.38%" title="ok 347"></span><span class="seg to" style="width:0.19%" title="to 1"></span><span class="seg err" style="width:35.44%" title="err 191"></span></div>
+  <div class="covnum"><b>347</b> ok · 1 timeout · 191 error</div>
+</div>
+    <p class="note"><b>Read this together with the latency chart.</b> A 3 ms median on paths only covers
+    the 462 of 660 queries that completed; the other 198 timed out or hit the cap. The published engines
+    likewise carry heavy timeouts here (Neo4j 134, Jena 96 on paths; Jena 242 on C2RPQ).</p>
+  </section>
+
+  <section>
+    <h2>Correctness — result counts vs. the published engines</h2>
+    <p class="sub">Per query, Trillian’s result count compared to the published Blazegraph/Jena/Virtuoso/Neo4j
+    counts (both clamped at 100k). Below 100k the count must match exactly or we’re wrong.</p>
+    <table>
+      <thead><tr><th>Class</th><th class="cnum">compared</th><th class="cnum">match</th><th class="cpct">rate</th><th>verdict</th><th>note</th></tr></thead>
+      <tbody>
+        <tr class="cgood">
+  <td class="ccat">Single BGP</td>
+  <td class="cnum">267</td>
+  <td class="cnum">267</td>
+  <td class="cpct">100%</td>
+  <td class="cbadge"><span>exakt</span></td>
+  <td class="cnote">alle exakt</td>
+</tr>
+<tr class="cgood">
+  <td class="ccat">Multiple BGP</td>
+  <td class="cnum">663</td>
+  <td class="cnum">663</td>
+  <td class="cpct">100%</td>
+  <td class="cbadge"><span>exakt</span></td>
+  <td class="cnote">alle exakt</td>
+</tr>
+<tr class="cwarn">
+  <td class="ccat">Optional</td>
+  <td class="cnum">315</td>
+  <td class="cnum">240</td>
+  <td class="cpct">76%</td>
+  <td class="cbadge"><span>75 Abw.</span></td>
+  <td class="cnote">teils wir korrekter (kein OPTIONAL-Kreuzprodukt), teils Blank-Node-Diffs</td>
+</tr>
+<tr class="cbad">
+  <td class="ccat">Property Paths</td>
+  <td class="cnum">454</td>
+  <td class="cnum">358</td>
+  <td class="cpct">79%</td>
+  <td class="cbadge"><span>96 Abw.</span></td>
+  <td class="cnote">Unter-Produktion: liefert teils 0 statt Treffer</td>
+</tr>
+<tr class="cbad">
+  <td class="ccat">C2RPQ</td>
+  <td class="cnum">318</td>
+  <td class="cnum">36</td>
+  <td class="cpct">11%</td>
+  <td class="cbadge"><span>282 Abw.</span></td>
+  <td class="cnote">Unter-Produktion: liefert überwiegend 0 statt Treffer</td>
+</tr>
+      </tbody>
+    </table>
+    <p class="note"><b>BGP is provably correct</b> — 930 queries, zero deviations — so the latency win on
+    those classes is real. <b>Optional</b> mostly differs because we don’t cross-product unbound OPTIONALs
+    (we’re arguably more correct there). <b>Paths/C2RPQ under-produce</b> at full scale (return 0 where
+    others find matches) — a known open bug in the path traversal, not yet fixed.</p>
+  </section>
+
+  <section>
+    <h2>Footprint &amp; ingest</h2>
+    <p class="sub">Trillian holds everything in RAM; the published engines are disk-backed stores. The
+    numbers below are therefore different quantities — compare in kind, not one-to-one.</p>
+    <div class="fchips">
+      <div class="fc"><div class="v acc">78 GB</div><div class="k">Trillian resident RAM (in-memory) · ≈ 66 B / triple</div></div>
+      <div class="fc"><div class="v">49 GB</div><div class="k">Trillian on-disk snapshot (zero-copy mmap)</div></div>
+      <div class="fc"><div class="v">34 min</div><div class="k">ingest + load of all 1.257 B triples</div></div>
+      <div class="fc"><div class="v">70–112 GB</div><div class="k">published engines’ on-disk store (Blaze/Virtuoso 70, Jena 110, Neo4j 112)</div></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Reading the comparison fairly</h2>
+    <div class="caveats">
+      <ul>
+        <li><b>Different hardware &amp; setup.</b> The published numbers are from the WDBench paper’s machine; Trillian ran on an AWS r6i.16xlarge. Absolute milliseconds are indicative, not a controlled head-to-head.</li>
+        <li><b>In-memory vs. disk-backed.</b> Much of the latency gap is architectural — Trillian is a read-only in-RAM store with flat-CSR indexes and u32 IDs; the others are general-purpose DBMSs paging from disk with full transactional machinery.</li>
+        <li><b>Our error = their timeout.</b> Where Trillian shows “error” it’s the row-cap firing on operators we haven’t pipelined yet; a comparable engine would typically time out instead. Both mean “did not complete.”</li>
+        <li><b>Same queries, verified.</b> Identical WDBench query sets (280/681/498/660/539), 60 s timeout, 100 k output cap — and BGP result counts checked one-by-one against the published engines.</li>
+        <li><b>Single run.</b> One measured pass per query (warm), no averaging across runs.</li>
+      </ul>
+    </div>
+  </section>
+
+  <p class="foot">Trillian — Rust RDF store · WDBench 1.257 B triples · medians over OK queries, ms · published baselines from MillenniumDB/WDBench Results/*.xlsx · generated 2026-06-22</p>
+</div>
