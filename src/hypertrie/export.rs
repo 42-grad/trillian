@@ -44,7 +44,8 @@ pub struct ParsedTriple {
 ///   - Literale: `"hello"`, `"hello"@en`, `"30"^^<http://www.w3.org/2001/XMLSchema#integer>`
 ///   - Escape-Sequenzen in Strings: `\"`, `\\`, `\n`, `\r`, `\t`, `\uXXXX`, `\UXXXXXXXX`
 ///
-/// Blank Nodes (`_:b0`) und syntaktisch ungültige Zeilen werden übersprungen.
+/// Blank Nodes (`_:b0`) werden als [`TermType::BlankNode`] geparst (dokument-
+/// scoped). Syntaktisch ungültige Zeilen werden übersprungen.
 pub fn parse_ntriples(path: &str) -> std::io::Result<Vec<ParsedTriple>> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
@@ -96,11 +97,32 @@ fn parse_term(s: &str) -> Option<(ParsedTerm, &str)> {
     } else if s.starts_with('"') {
         parse_literal(s)
     } else if s.starts_with("_:") {
-        // Blank Nodes werden nicht unterstützt.
-        None
+        parse_blank_node(s)
     } else {
         None
     }
+}
+
+/// Parst einen Blank-Node-Knoten `_:label`. Das Label ist dokument-scoped; bei
+/// einem Single-File-Ingest dient es direkt als Dictionary-Schlüssel (Typ
+/// [`TermType::BlankNode`]), sodass dasselbe `_:label` über alle Zeilen hinweg
+/// auf dieselbe ID abbildet. Wert ohne `_:`-Präfix (die Serialisierung in
+/// [`serialize_term`] setzt es wieder davor).
+fn parse_blank_node(s: &str) -> Option<(ParsedTerm, &str)> {
+    let after = &s[2..]; // hinter "_:"
+    let end = after
+        .find(|c: char| c.is_whitespace())
+        .unwrap_or(after.len());
+    if end == 0 {
+        return None;
+    }
+    Some((
+        ParsedTerm {
+            value: after[..end].to_string(),
+            typ: TermType::BlankNode,
+        },
+        &after[end..],
+    ))
 }
 
 fn parse_iri(s: &str) -> Option<(ParsedTerm, &str)> {
@@ -298,8 +320,17 @@ mod tests {
     }
 
     #[test]
-    fn skips_blank_nodes() {
-        let line = "<http://example.org/s> <http://example.org/p> _:b0 .";
-        assert!(parse_triple_line(line).is_none());
+    fn parses_blank_nodes() {
+        // Objekt-Blank-Node.
+        let t = parse_triple_line("<http://example.org/s> <http://example.org/p> _:b0 .")
+            .expect("Tripel mit Blank-Node-Objekt muss geparst werden");
+        assert_eq!(t.object.typ, TermType::BlankNode);
+        assert_eq!(t.object.value, "b0"); // ohne _: Präfix
+
+        // Subjekt-Blank-Node + Round-trip über die Serialisierung.
+        let t2 = parse_triple_line("_:n1 <http://example.org/p> <http://example.org/o> .")
+            .expect("Tripel mit Blank-Node-Subjekt muss geparst werden");
+        assert_eq!(t2.subject.typ, TermType::BlankNode);
+        assert_eq!(serialize_term(&t2.subject.value, &t2.subject.typ), "_:n1");
     }
 }

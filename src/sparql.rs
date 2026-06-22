@@ -2400,4 +2400,39 @@ mod tests {
             "kein Rausch-Tripel (Kreuzprodukt)"
         );
     }
+
+    #[test]
+    fn ingests_and_queries_blank_nodes() {
+        // Blank-Node-Tripel werden geladen (nicht übersprungen), als `bnode`
+        // ausgegeben, und dasselbe `_:b0` über mehrere Zeilen ist derselbe
+        // Knoten (dokument-scoped Identität -> Join funktioniert).
+        let path = std::env::temp_dir().join("trillian_bnode_query_test.nt");
+        std::fs::write(
+            &path,
+            "<http://ex/alice> <http://ex/knows> _:b0 .\n\
+             _:b0 <http://ex/name> \"Bob\" .\n",
+        )
+        .unwrap();
+        let mut store = TripleStore::new();
+        store.ingest_ntriples_file(path.to_str().unwrap()).unwrap();
+        let engine = HybridEngine::new();
+
+        // (1) Objekt ist ein Blank Node -> type=bnode.
+        let q = "SELECT ?x WHERE { <http://ex/alice> <http://ex/knows> ?x }";
+        let r: Value = serde_json::from_str(&execute_sparql(&store, &engine, q).unwrap()).unwrap();
+        let rows = r["results"]["bindings"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "Blank-Node-Tripel wurde geladen");
+        assert_eq!(rows[0]["x"]["type"], "bnode");
+
+        // (2) Join über denselben Blank Node (beide _:b0 = dieselbe ID).
+        let q2 = "SELECT ?n WHERE { <http://ex/alice> <http://ex/knows> ?b . \
+                  ?b <http://ex/name> ?n }";
+        let r2: Value =
+            serde_json::from_str(&execute_sparql(&store, &engine, q2).unwrap()).unwrap();
+        let rows2 = r2["results"]["bindings"].as_array().unwrap();
+        assert_eq!(rows2.len(), 1, "Join über denselben Blank Node");
+        assert_eq!(rows2[0]["n"]["value"], "Bob");
+
+        let _ = std::fs::remove_file(&path);
+    }
 }
