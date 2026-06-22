@@ -444,12 +444,16 @@ fn eval_where(
     gp: &spargebra::algebra::GraphPattern,
     store: &TripleStore,
     engine: &HybridEngine,
+    limit: Option<usize>,
 ) -> Result<(RowBlock, Vec<String>), String> {
     use spargebra::algebra::GraphPattern as GP;
+    // `limit` darf NUR in ein direktes BGP gepusht werden. Über Join/LeftJoin/
+    // Union/Filter/Path hinweg ist Früh-Terminierung der Teilbäume nicht
+    // ergebnis-erhaltend -> Kinder erhalten None, das Limit wirkt post-hoc.
     match gp {
-        GP::Bgp { patterns } => eval_bgp(patterns, store, engine),
+        GP::Bgp { patterns } => eval_bgp(patterns, store, engine, limit),
         GP::Filter { expr, inner } => {
-            let (rows, vo) = eval_where(inner, store, engine)?;
+            let (rows, vo) = eval_where(inner, store, engine, None)?;
             let mut kept = RowBlock::new(rows.n_vars());
             for row in rows.rows() {
                 if row_passes(&[expr], row, &vo, store) {
@@ -459,18 +463,18 @@ fn eval_where(
             Ok((kept, vo))
         }
         GP::LeftJoin { left, right, .. } => {
-            let (lr, lvo) = eval_where(left, store, engine)?;
-            let (rr, rvo) = eval_where(right, store, engine)?;
+            let (lr, lvo) = eval_where(left, store, engine, None)?;
+            let (rr, rvo) = eval_where(right, store, engine, None)?;
             Ok(hash_join(lr, &lvo, rr, &rvo, true))
         }
         GP::Join { left, right } => {
-            let (lr, lvo) = eval_where(left, store, engine)?;
-            let (rr, rvo) = eval_where(right, store, engine)?;
+            let (lr, lvo) = eval_where(left, store, engine, None)?;
+            let (rr, rvo) = eval_where(right, store, engine, None)?;
             Ok(hash_join(lr, &lvo, rr, &rvo, false))
         }
         GP::Union { left, right } => {
-            let (lr, lvo) = eval_where(left, store, engine)?;
-            let (rr, rvo) = eval_where(right, store, engine)?;
+            let (lr, lvo) = eval_where(left, store, engine, None)?;
+            let (rr, rvo) = eval_where(right, store, engine, None)?;
             Ok(union_rows(lr, &lvo, rr, &rvo))
         }
         GP::Path {
@@ -748,11 +752,12 @@ fn eval_bgp(
     patterns: &[spargebra::term::TriplePattern],
     store: &TripleStore,
     engine: &HybridEngine,
+    limit: Option<usize>,
 ) -> Result<(RowBlock, Vec<String>), String> {
     match translate_bgp(patterns, &store.dict)? {
         Some(internal) => {
             let vo: Vec<String> = internal.variable_order().into_iter().cloned().collect();
-            Ok((engine.execute(store, &internal)?, vo))
+            Ok((engine.execute_limited(store, &internal, limit)?, vo))
         }
         None => {
             // Unbekannte Konstante -> leere Lösung mit den Pattern-Variablen.
@@ -932,7 +937,15 @@ fn evaluate_select_with_modifiers(
     engine: &HybridEngine,
     m: &Modifiers,
 ) -> Result<SelectResult, String> {
-    let (mut rows, var_order) = eval_where(m.where_pat, store, engine)?;
+    // LIMIT-Pushdown nur, wenn ergebnis-erhaltend: kein ORDER BY (braucht volle
+    // Sortierung) und kein DISTINCT (braucht ggf. mehr Rohzeilen für N distinkte).
+    // Dann reichen offset+limit Zeilen; apply_offset_limit schneidet exakt zu.
+    let pushdown = if m.order_by.is_empty() && !m.distinct {
+        m.limit.map(|l| l.saturating_add(m.offset.unwrap_or(0)))
+    } else {
+        None
+    };
+    let (mut rows, var_order) = eval_where(m.where_pat, store, engine, pushdown)?;
 
     // ORDER BY (auf den vollen Bindings, vor der Projektion).
     if !m.order_by.is_empty() {
@@ -2399,6 +2412,45 @@ mod tests {
             !x5.contains(&Some("http://ex/nc")),
             "kein Rausch-Tripel (Kreuzprodukt)"
         );
+    }
+
+    #[test]
+    fn limit_on_multi_pattern_bgp_is_pushed_down() {
+        // 2-Muster-Join `?s knows ?b . ?b knows ?x`: s->{b1..b5}, jedes bi->x.
+        // Volles Ergebnis = 5 Zeilen; LIMIT 3 muss exakt 3 gültige Zeilen liefern
+        // (pipelined DFS terminiert früh, statt alle 5 zu materialisieren).
+        let e = "http://ex/";
+        let k = format!("{e}knows");
+        let mut triples: Vec<(String, String, String)> = Vec::new();
+        for i in 1..=5 {
+            triples.push((format!("{e}s"), k.clone(), format!("{e}b{i}")));
+            triples.push((format!("{e}b{i}"), k.clone(), format!("{e}x")));
+        }
+        let refs: Vec<(&str, &str, &str)> = triples
+            .iter()
+            .map(|(a, b, c)| (a.as_str(), b.as_str(), c.as_str()))
+            .collect();
+        let mut store = TripleStore::new();
+        store.ingest_str_triples(&refs);
+        let engine = HybridEngine::new();
+        let q = format!("SELECT ?s ?b ?x WHERE {{ ?s <{k}> ?b . ?b <{k}> ?x }} LIMIT 3");
+        let r: Value = serde_json::from_str(&execute_sparql(&store, &engine, &q).unwrap()).unwrap();
+        let rows = r["results"]["bindings"].as_array().unwrap();
+        assert_eq!(rows.len(), 3, "LIMIT 3 -> genau 3 Zeilen");
+        for row in rows {
+            assert_eq!(row["x"]["value"], "http://ex/x");
+            assert!(
+                row["b"]["value"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("http://ex/b")
+            );
+        }
+        // Ohne LIMIT: alle 5.
+        let q_all = format!("SELECT ?s ?b ?x WHERE {{ ?s <{k}> ?b . ?b <{k}> ?x }}");
+        let r2: Value =
+            serde_json::from_str(&execute_sparql(&store, &engine, &q_all).unwrap()).unwrap();
+        assert_eq!(r2["results"]["bindings"].as_array().unwrap().len(), 5);
     }
 
     #[test]

@@ -64,6 +64,8 @@ def main():
     ap.add_argument("endpoint_url")
     ap.add_argument("query_dir")
     ap.add_argument("--timeout", type=float, default=60.0, help="Timeout je Query in s (Referenz: 60)")
+    ap.add_argument("--out-limit", type=int, default=100000,
+                    help="Output-Cap je Query wie WDBench (0 = aus). Wird als LIMIT angehängt.")
     ap.add_argument("--label", default="trillian")
     ap.add_argument("--csv", help="optional: Pfad für per-Query-CSV (query,status,ms,results)")
     args = ap.parse_args()
@@ -76,7 +78,12 @@ def main():
     ok_ms, n_to, n_err = [], 0, 0
     csv_rows = []
     for qf in queries:
-        status, ms, nres = run_query(args.endpoint_url, qf.read_text(), args.timeout)
+        query = qf.read_text().rstrip()
+        # WDBench-Methodik: Output je Query auf 100k Zeilen begrenzen. Unser
+        # Executor pusht das LIMIT in den BGP-Join (Früh-Terminierung).
+        if args.out_limit and "limit" not in query.lower():
+            query = f"{query}\nLIMIT {args.out_limit}"
+        status, ms, nres = run_query(args.endpoint_url, query, args.timeout)
         if status == "OK":
             ok_ms.append(ms)
         elif status == "TIMEOUT":

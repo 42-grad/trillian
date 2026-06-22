@@ -1,6 +1,6 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::executor::{RowBlock, execute_plan, execute_wcoj};
+use super::executor::{RowBlock, execute_plan_limited, execute_wcoj_limited};
 use super::planner::GraphPattern;
 use super::query::TripleStore;
 
@@ -27,11 +27,23 @@ impl HybridEngine {
     /// Gibt `Err` zurück, wenn die Ergebnismenge den Row-Cap übersteigt
     /// (Schutz vor OOM bei entarteten Queries), siehe `executor::max_result_rows`.
     pub fn execute(&self, store: &TripleStore, pattern: &GraphPattern) -> Result<RowBlock, String> {
+        self.execute_limited(store, pattern, None)
+    }
+
+    /// Wie [`execute`](Self::execute), terminiert aber früh, sobald `limit`
+    /// Endzeilen produziert sind (LIMIT-Pushdown — beschränkt Speicher + Zeit;
+    /// nur gültig, wenn kein ORDER BY/DISTINCT darüber liegt).
+    pub fn execute_limited(
+        &self,
+        store: &TripleStore,
+        pattern: &GraphPattern,
+        limit: Option<usize>,
+    ) -> Result<RowBlock, String> {
         if has_cycle(pattern) {
-            execute_wcoj(store, pattern)
+            execute_wcoj_limited(store, pattern, limit)
         } else {
             let plan = pattern.optimize(store);
-            execute_plan(store, pattern, &plan)
+            execute_plan_limited(store, pattern, &plan, limit)
         }
     }
 }

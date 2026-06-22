@@ -212,10 +212,25 @@ impl<'a> Iterator for RowIter<'a> {
 // ---------------------------------------------------------------------------
 
 /// Führt einen `ExecutionPlan` für ein `GraphPattern` aus.
+///
+/// **Pipelined (DFS):** statt jede Join-Ebene vollständig zu materialisieren,
+/// wird je Teil-Zeile tiefenrekursiv bis zur fertigen Zeile durchgereicht. Damit
+/// bleibt der Speicher auf ~Endzeilen + Rekursionstiefe beschränkt (kein
+/// aufgeblähter Zwischen-Join), und ein `limit` terminiert früh — exakt das, was
+/// WDBench (Output-Cap 100k) misst. `limit=None` produziert alles bis zum Cap.
 pub fn execute_plan(
     store: &TripleStore,
     pattern: &GraphPattern,
     plan: &ExecutionPlan,
+) -> Result<RowBlock, String> {
+    execute_plan_limited(store, pattern, plan, None)
+}
+
+pub fn execute_plan_limited(
+    store: &TripleStore,
+    pattern: &GraphPattern,
+    plan: &ExecutionPlan,
+    limit: Option<usize>,
 ) -> Result<RowBlock, String> {
     let mut var_map: FxHashMap<String, usize> = FxHashMap::default();
     for pat in &pattern.patterns {
@@ -225,38 +240,111 @@ pub fn execute_plan(
     }
     let n_vars = var_map.len();
     let cap = max_result_rows();
+    // Sobald so viele Zeilen da sind, wird gestoppt: das LIMIT (sauberer Stopp)
+    // oder cap+1 (dann meldet der Aufrufer "too large"). saturating gegen MAX.
+    let stop = limit
+        .map(|l| l.min(cap.saturating_add(1)))
+        .unwrap_or(cap.saturating_add(1));
 
+    let mut out = RowBlock::new(n_vars);
     if plan.steps.is_empty() {
-        return Ok(RowBlock::new(n_vars));
+        return Ok(out);
     }
 
-    let mut results = RowBlock::new(n_vars);
-    for (step_idx, step) in plan.steps.iter().enumerate() {
-        let triple_pattern = &pattern.patterns[step.pattern_index];
-        if step_idx == 0 {
-            extend_pattern(store, triple_pattern, None, &var_map, n_vars, &mut results);
-        } else {
-            let mut next = RowBlock::new(n_vars);
-            for i in 0..results.n_rows() {
-                extend_pattern(
-                    store,
-                    triple_pattern,
-                    Some(results.row(i)),
-                    &var_map,
-                    n_vars,
-                    &mut next,
-                );
-                if next.n_rows() > cap {
-                    return Err(result_too_large(cap));
-                }
-            }
-            results = next;
+    // Seed: selektivstes (erstes) Muster materialisieren. Der Planner wählt es
+    // als das selektivste -> klein; ein entarteter Voll-Scan wird per Cap erfasst.
+    let mut seed = RowBlock::new(n_vars);
+    extend_pattern(
+        store,
+        &pattern.patterns[plan.steps[0].pattern_index],
+        None,
+        &var_map,
+        n_vars,
+        &mut seed,
+    );
+    if seed.n_rows() > cap {
+        return Err(result_too_large(cap));
+    }
+
+    if plan.steps.len() == 1 {
+        // Einzelmuster: direkt bis `stop` übernehmen.
+        for i in 0..seed.n_rows().min(stop) {
+            out.push_row(seed.row(i));
         }
-        if results.n_rows() > cap {
-            return Err(result_too_large(cap));
+    } else {
+        for i in 0..seed.n_rows() {
+            if out.n_rows() >= stop {
+                break;
+            }
+            plan_dfs(
+                store,
+                pattern,
+                plan,
+                &var_map,
+                n_vars,
+                seed.row(i),
+                1,
+                &mut out,
+                stop,
+            );
         }
     }
-    Ok(results)
+
+    if out.n_rows() > cap {
+        return Err(result_too_large(cap));
+    }
+    Ok(out)
+}
+
+/// Reicht eine Teil-Zeile durch die restlichen Plan-Schritte (Tiefensuche) und
+/// hängt fertige Zeilen an `out` an, bis `stop` erreicht ist.
+#[allow(clippy::too_many_arguments)]
+fn plan_dfs(
+    store: &TripleStore,
+    pattern: &GraphPattern,
+    plan: &ExecutionPlan,
+    var_map: &FxHashMap<String, usize>,
+    n_vars: usize,
+    partial: &[u32],
+    step: usize,
+    out: &mut RowBlock,
+    stop: usize,
+) {
+    if out.n_rows() >= stop {
+        return;
+    }
+    if step == plan.steps.len() {
+        out.push_row(partial);
+        return;
+    }
+    // Erweiterungen der Teil-Zeile um EIN Muster (beschränkt durch den Fan-out
+    // dieses Knotens, nicht durch die globale Zwischenmenge).
+    let mut tmp = RowBlock::new(n_vars);
+    extend_pattern(
+        store,
+        &pattern.patterns[plan.steps[step].pattern_index],
+        Some(partial),
+        var_map,
+        n_vars,
+        &mut tmp,
+    );
+    for j in 0..tmp.n_rows() {
+        if out.n_rows() >= stop {
+            break;
+        }
+        // `tmp` wird in der Rekursion nicht mutiert -> Slice direkt durchreichen.
+        plan_dfs(
+            store,
+            pattern,
+            plan,
+            var_map,
+            n_vars,
+            tmp.row(j),
+            step + 1,
+            out,
+            stop,
+        );
+    }
 }
 
 fn result_too_large(cap: usize) -> String {
@@ -394,9 +482,17 @@ impl PatternTerm {
 
 /// Führt ein Graph-Pattern mit Worst-Case-Optimal Join aus.
 pub fn execute_wcoj(store: &TripleStore, pattern: &GraphPattern) -> Result<RowBlock, String> {
+    execute_wcoj_limited(store, pattern, None)
+}
+
+pub fn execute_wcoj_limited(
+    store: &TripleStore,
+    pattern: &GraphPattern,
+    limit: Option<usize>,
+) -> Result<RowBlock, String> {
     if !is_wcoj_applicable(pattern, store) {
         let plan = pattern.optimize(store);
-        return execute_plan(store, pattern, &plan);
+        return execute_plan_limited(store, pattern, &plan, limit);
     }
 
     let var_order = determine_variable_order(pattern);
@@ -410,9 +506,12 @@ pub fn execute_wcoj(store: &TripleStore, pattern: &GraphPattern) -> Result<RowBl
     let mut results = RowBlock::new(n);
     let mut binding = vec![UNBOUND; n];
     let cap = max_result_rows();
-    // Geteilter Zähler: bremst die (parallele) Rekursion, SOBALD der Cap
-    // erreicht ist – nicht erst nachträglich. Verhindert OOM bei
-    // entarteten/zyklischen Queries.
+    // Stopp-Schwelle: LIMIT (sauberer Früh-Stopp) oder cap+1 (dann meldet der
+    // Aufrufer "too large"). Bremst die (parallele) Rekursion SOFORT statt
+    // nachträglich -> kein OOM.
+    let stop = limit
+        .map(|l| l.min(cap.saturating_add(1)))
+        .unwrap_or(cap.saturating_add(1));
     let produced = AtomicUsize::new(0);
 
     wcoj_recurse(
@@ -424,7 +523,7 @@ pub fn execute_wcoj(store: &TripleStore, pattern: &GraphPattern) -> Result<RowBl
         &mut binding,
         &mut results,
         true, // erste Ebene parallel
-        cap,
+        stop,
         &produced,
     );
 
