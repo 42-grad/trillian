@@ -123,6 +123,39 @@ implementiert. Probe auf echten WDBench-Daten: alle 5 Query-Klassen führen aus
 logisch** @1,26 Mrd. (Tentris-Referenz ~340 B → ~400 GB). Voller Duell-Lauf via
 `infra/aws/` (Big-RAM-EC2). Harness: `wdbench_{queries.py,probe.sh,duel.sh}`.
 
+### WDBench-Lauf auf AWS (2026-06-22) — echter Wikidata-Slice, 49,3M Tripel
+
+Lauf auf r6i.4xlarge (stride 10), je 50 Queries/Klasse. Ergebnis: **unsere
+Engine ist robust über alle fünf WDBench-Klassen — kein einziger Crash.**
+
+| Klasse | ausgeführt | Cap (sauberer Fehler) | Crash |
+| :-- | :-- | :-- | :-- |
+| single_bgps | 50/50 (IDENTICAL zu Tentris) | 0 | 0 |
+| multiple_bgps | 44/50 | 6 | 0 |
+| opts | 48/50 | 2 | 0 |
+| paths | **50/50** (bis 1,36M Zeilen) | 0 | 0 |
+| c2rpqs | **50/50** | 0 | 0 |
+
+Jede Query liefert ein Ergebnis (bis 1,78M Zeilen) oder einen sauberen
+`result exceeds`-Fehler bei den 8 Cross-Product-Mustern (Row-Cap, `3e6c635`).
+**single_bgps 50/50 identisch** zu Tentris, dort Rust ~2× schneller (q43 79 vs
+160 ms). Ingest 124 s vs Tentris 403 s.
+
+Befunde:
+- **Tentris ist hier das fragile System**: OOM/Timeout-Crash bei `multiple_bgps`
+  q29, kein Wiederanlauf → opts/paths/c2rpqs alle `TENTRIS_ERR` (connection
+  refused). Tentris hat keinen Row-Cap/OOM-Schutz. Ein echter
+  paths/c2rpqs-Vergleich braucht daher Tentris-Restart-on-Crash im Harness.
+- **OPTIONAL-Divergenz geklärt** (Reproduktionstest `chained_optional…`): bei
+  einem OPTIONAL, das eine nur in einem früheren OPTIONAL gebundene Variable
+  referenziert (`?x3 NULL → ?x5 NULL`), liefern wir die korrekte left-deep-
+  Semantik; Tentris bildet ein Kreuzprodukt gegen alle P625-Tripel (6,77M
+  Geister-Zeilen). Wie FILTER/ORDER BY: wir sind spec-konformer.
+- **Caveat:** c2rpqs lieferten 0 Zeilen — der stride-10-Subset enthält die
+  konkret referenzierten Entities meist nicht; sie parsen/laufen fehlerfrei,
+  echte Treffer brauchen den Volldatensatz. Rust-RSS-Peak 18,7 GB (Cap erlaubt
+  20M-Zeilen-Zwischenergebnisse).
+
 ## Stufen-Notizen
 
 ### Baseline — `8852869`

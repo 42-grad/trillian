@@ -19,7 +19,9 @@ Mit --perf wird zusätzlich die Warm-Median-Latenz beider Seiten gemessen.
 import argparse
 import http.client
 import json
+import socket
 import statistics
+import subprocess
 import sys
 import time
 from collections import Counter
@@ -65,6 +67,41 @@ def http_get_sparql(url: str, query: str):
     finally:
         if conn is not None:
             conn.close()
+
+
+def port_open(url: str, timeout: float = 2.0) -> bool:
+    """Schneller TCP-Liveness-Check auf den Endpoint-Port."""
+    parts = urlsplit(url)
+    try:
+        with socket.create_connection((parts.hostname, parts.port or 80), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def ensure_up(label: str, url: str, restart_cmd, wait_s: int = 120) -> bool:
+    """Stellt sicher, dass der Endpoint erreichbar ist; startet ihn sonst per
+    `restart_cmd` neu (detached) und wartet bis zum Port. Notwendig, weil Tentris
+    keinen OOM-Schutz hat: eine Cross-Product-Query killt den Server, und ohne
+    Neustart bekämen ALLE folgenden Queries `connection refused`.
+
+    Die killende Query selbst wird NICHT erneut versucht (sie ist bereits als
+    Fehler protokolliert) -> kein Endlos-Crash-Loop."""
+    if port_open(url):
+        return True
+    if not restart_cmd:
+        return False
+    print(f"  [restart] {label} ist unten -> Neustart …", flush=True)
+    subprocess.Popen(
+        restart_cmd, shell=True, start_new_session=True,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    for _ in range(wait_s * 2):
+        if port_open(url):
+            return True
+        time.sleep(0.5)
+    print(f"  [restart] {label} kam nicht zurück", flush=True)
+    return False
 
 
 def norm_term(t: dict):
@@ -286,6 +323,8 @@ def main():
     ap.add_argument("--tentris-disk")
     ap.add_argument("--ingest-rust", type=float, help="Rust Loader+Startup in ms")
     ap.add_argument("--ingest-tentris", type=float, help="Tentris Loader+Startup in ms")
+    ap.add_argument("--rust-restart", help="Shell-Cmd, um den Rust-Server bei Absturz neu zu starten")
+    ap.add_argument("--tentris-restart", help="Shell-Cmd, um Tentris bei Absturz neu zu starten")
     args = ap.parse_args()
 
     queries = sorted(Path(args.query_dir).glob("*.rq")) + sorted(Path(args.query_dir).glob("*.sparql"))
@@ -309,6 +348,11 @@ def main():
     counts = Counter()
     for qf in queries:
         query = qf.read_text()
+        # Vor jeder Query sicherstellen, dass beide Engines leben — startet eine
+        # neu, die eine vorherige (entartete) Query gekillt hat. Die killende
+        # Query selbst wird nicht wiederholt.
+        ensure_up("rust", args.rust_url, args.rust_restart)
+        ensure_up("tentris", args.tentris_url, args.tentris_restart)
         _, rust, rust_raw = http_get_sparql(args.rust_url, query)
         _, tentris, tentris_raw = http_get_sparql(args.tentris_url, query)
         status, detail = compare(query, rust, tentris, rust_raw, tentris_raw)

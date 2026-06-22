@@ -124,11 +124,18 @@ echo "=================== WDBench-Duell (${TRIPLES} Tripel) ==================="
 for cat in single_bgps multiple_bgps opts paths c2rpqs; do
     echo
     echo "########## Kategorie: ${cat} ##########"
+    # Restart-Kommandos mitgeben: Tentris hat keinen OOM-Schutz und stirbt an
+    # Cross-Product-Queries -> der Harness startet die abgestürzte Engine vor der
+    # nächsten Query neu (die killende Query wird nicht wiederholt), sodass
+    # spätere Klassen (paths/c2rpqs) trotzdem verglichen werden.
     python3 "${ROOT}/correctness_duel.py" \
         "http://localhost:${RUST_PORT}/sparql" \
         "http://localhost:${TENTRIS_PORT}/sparql" \
         "${QDIR}/${cat}" \
-        --perf 5 || true
+        --perf 5 \
+        --rust-restart "'${ROOT}/target/release/server' load '${SNAP}' ${RUST_PORT}" \
+        --tentris-restart "'${SERVER}' -s '${TDATA}' -p ${TENTRIS_PORT}" \
+        || true
 done
 
 # --- 6. Ingest + Footprint (einmal, am Ende) --------------------------------
