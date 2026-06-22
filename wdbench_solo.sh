@@ -13,16 +13,18 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DATA_URL="https://ndownloader.figshare.com/files/42078477"
+# Kanonischer, VOLLSTÄNDIGER WDBench-Dump (9,15 GB .nt.bz2 -> ~1,257 Mrd. Tripel).
+# NICHT die truncated latest_truthy_data_filtered.tar.bz2 (gibt nur ~495M her).
+DATA_URL="https://ndownloader.figshare.com/files/34816081"
 REPO_RAW="https://raw.githubusercontent.com/MillenniumDB/WDBench/master/Queries"
-EXPECTED_MD5="d36e25716044787359c0be53c11e40d8"
+EXPECTED_MD5="b3ef85c9106100808a7e6e9315326059"
 STRIDE="${1:-1}"
 TIMEOUT="${2:-60}"
 
 DATADIR="${ROOT}/wdbench_data"
 QSRC="${ROOT}/wdbench_qsrc"
 QDIR="${ROOT}/wdbench_queries_solo"
-ARCHIVE="${DATADIR}/wdbench.tar.bz2"
+ARCHIVE="${DATADIR}/wdbench.nt.bz2"
 FULL="${DATADIR}/wdbench_full.nt"
 NT="${DATADIR}/wdbench_solo.nt"
 SNAP="${DATADIR}/wdbench_solo.bin"
@@ -33,21 +35,19 @@ now_ms() { date +%s%3N; }
 wait_port() { for _ in $(seq 1 600); do (echo > "/dev/tcp/localhost/$1") 2>/dev/null && return 0; sleep 1; done; return 1; }
 md5of() { md5sum "$1" 2>/dev/null | awk '{print $1}'; }
 
-# --- 1. Daten: laden (MD5) + VOLLSTÄNDIG dekomprimieren (bzip2) --------------
+# --- 1. Daten: laden (MD5) + dekomprimieren (reines .nt.bz2, kein tar) -------
 if [ ! -s "${FULL}" ]; then
     if [ ! -s "${ARCHIVE}" ] || [ "$(md5of "${ARCHIVE}")" != "${EXPECTED_MD5}" ]; then
-        log "Lade WDBench-Dump (3,6 GB)..."
+        log "Lade vollständigen WDBench-Dump (9,15 GB)..."
         rm -f "${ARCHIVE}"
         curl -L --fail --retry 6 --retry-delay 5 -o "${ARCHIVE}" "${DATA_URL}"
         [ "$(md5of "${ARCHIVE}")" = "${EXPECTED_MD5}" ] && log "MD5 ok." || log "WARN: MD5 weicht ab."
     fi
-    # bzip2 (NICHT lbzip2): lbzip2 bricht diese Datei bei ~493M Zeilen ab.
-    # Best-effort: gültiges Präfix behalten (ein Fehler ganz am Stream-Ende wird
-    # toleriert). bzip2 ist single-threaded (~40-60 min) aber vollständig.
-    log "Dekomprimiere (bzip2, vollständig) -> ${FULL} ..."
-    set +e
-    bzip2 -dc "${ARCHIVE}" 2>"${DATADIR}/decompress.err" | tar -xO > "${FULL}.partial"
-    set -e
+    # bzip2 (single-threaded, ~40-60 min, aber verlässlich; auf dieser
+    # vollständigen Datei verifiziert). Reines .nt.bz2 -> KEIN tar. Fail-loud:
+    # ein Decompress-Fehler bricht ab, statt still eine Teildatei zu nutzen.
+    log "Dekomprimiere (bzip2) -> ${FULL} ..."
+    bzip2 -dc "${ARCHIVE}" > "${FULL}.partial"
     mv "${FULL}.partial" "${FULL}"
 fi
 FULL_LINES=$(wc -l < "${FULL}" | tr -d ' ')

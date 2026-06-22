@@ -12,7 +12,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DATA_URL="https://ndownloader.figshare.com/files/42078477"   # latest_truthy_data_filtered.tar.bz2 (3.6 GB)
+DATA_URL="https://ndownloader.figshare.com/files/34816081"   # truthy_direct_properties.nt.bz2 (9,15 GB, vollständig)
 REPO_RAW="https://raw.githubusercontent.com/MillenniumDB/WDBench/master/Queries"
 TOTAL_TRIPLES=1257169959
 TENTRIS_BPT=340.3   # gemessenes Tentris-RSS B/Triple (WatDiv-Lauf) als Referenz
@@ -47,7 +47,7 @@ python3 "${ROOT}/wdbench_queries.py" "${QSRC}" "${QDIR}" 25   # Stichprobe: 25/K
 BIG="${DATADIR}/wdbench_${MAXN}.nt"
 if [ ! -f "${BIG}" ]; then
     log "Streame größten Slice (${MAXN} Zeilen) aus dem 3.6-GB-Dump..."
-    curl -sL "${DATA_URL}" | tar -xjOf - | head -n "${MAXN}" > "${BIG}" || true
+    curl -sL "${DATA_URL}" | bzip2 -dc | head -n "${MAXN}" > "${BIG}" || true
 fi
 log "Größter Slice: $(wc -l < "${BIG}") Tripel"
 

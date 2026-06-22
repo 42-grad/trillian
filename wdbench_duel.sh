@@ -4,7 +4,7 @@
 # Big-RAM-Box (≥256 GB für beide Engines); vorher mit ./wdbench_probe.sh die
 # Machbarkeit prüfen.
 #
-# Lädt den WDBench-Dump (Figshare, 3.6 GB .tar.bz2), erzeugt aus den
+# Lädt den WDBench-Dump (Figshare, 9,15 GB .nt.bz2), erzeugt aus den
 # WDBench-Query-Logs ausführbare .rq je Kategorie und vergleicht beide Engines
 # pro Kategorie (Korrektheit als Multimenge + Latenz). Property Paths + C2RPQs
 # sind seit dem Feature-Ausbau abgedeckt.
@@ -16,7 +16,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DATA_URL="https://ndownloader.figshare.com/files/42078477"
+DATA_URL="https://ndownloader.figshare.com/files/34816081"
 REPO_RAW="https://raw.githubusercontent.com/MillenniumDB/WDBench/master/Queries"
 STRIDE="${1:-1}"
 MAXQ="${2:-100}"
@@ -36,22 +36,13 @@ log() { echo "[wdbench] $*"; }
 now_ms() { date +%s%3N; }
 wait_port() { for _ in $(seq 1 600); do (echo > "/dev/tcp/localhost/$1") 2>/dev/null && return 0; sleep 1; done; return 1; }
 
-# --- 1. Daten holen ---------------------------------------------------------
-# Robust: Archiv erst resumebar auf Platte laden (ein einzelner gestreamter
-# curl|tar bricht bei 3,6 GB leicht ab -> "bzip2: ends unexpectedly"), dann
-# atomar dekomprimieren (FULL existiert nur bei vollständigem Erfolg).
-ARCHIVE="${DATADIR}/wdbench.tar.bz2"
-EXPECTED_MD5="d36e25716044787359c0be53c11e40d8"   # Figshare computed_md5
-# Parallel-Dekompressor bevorzugen (lbzip2/pbzip2 nutzen alle Kerne -> Minuten
-# statt ~40 min single-threaded bzip2).
-if command -v lbzip2 >/dev/null 2>&1; then BZCAT="lbzip2 -dc";
-elif command -v pbzip2 >/dev/null 2>&1; then BZCAT="pbzip2 -dc";
-else BZCAT="bzip2 -dc"; fi
+# --- 1. Daten holen (kanonischer, VOLLSTÄNDIGER 9,15-GB-.nt.bz2-Dump) --------
+ARCHIVE="${DATADIR}/wdbench.nt.bz2"
+EXPECTED_MD5="b3ef85c9106100808a7e6e9315326059"   # Figshare computed_md5
 md5of() { md5sum "$1" 2>/dev/null | awk '{print $1}'; }
 if [ ! -s "${FULL}" ]; then
-    # Archiv nur laden, wenn nicht schon korrekt vorhanden (MD5-verifiziert).
     if [ ! -s "${ARCHIVE}" ] || [ "$(md5of "${ARCHIVE}")" != "${EXPECTED_MD5}" ]; then
-        log "Lade WDBench-Dump (3.6 GB)..."
+        log "Lade vollständigen WDBench-Dump (9,15 GB)..."
         rm -f "${ARCHIVE}"
         curl -L --fail --retry 6 --retry-delay 5 -o "${ARCHIVE}" "${DATA_URL}"
         [ "$(md5of "${ARCHIVE}")" = "${EXPECTED_MD5}" ] \
@@ -59,15 +50,10 @@ if [ ! -s "${FULL}" ]; then
     else
         log "Archiv bereits vorhanden + MD5 ok."
     fi
-    # Best-effort: die offizielle WDBench-.tar.bz2 dekomprimiert mit Standard-
-    # bzip2/lbzip2 nicht restlos (Fehler gegen Stream-Ende). Wir behalten die
-    # gültige Teilausgabe (alle Blöcke vor dem Fehler sind korrekt) statt
-    # abzubrechen -> stride/Queries laufen auf dem dekomprimierten Anteil.
-    log "Dekomprimiere (${BZCAT%% *}, best-effort) -> ${FULL}..."
-    set +e
-    ${BZCAT} "${ARCHIVE}" 2>"${DATADIR}/decompress.err" | tar -xO > "${FULL}.partial"
-    set -e
-    log "Dekomprimiert: $(wc -l < "${FULL}.partial") Zeilen (best-effort)."
+    # Reines .nt.bz2 -> KEIN tar. bzip2 verlässlich (vollständige Datei).
+    log "Dekomprimiere (bzip2) -> ${FULL}..."
+    bzip2 -dc "${ARCHIVE}" > "${FULL}.partial"
+    log "Dekomprimiert: $(wc -l < "${FULL}.partial") Zeilen."
     mv "${FULL}.partial" "${FULL}"
 fi
 if [ "${STRIDE}" = "1" ]; then

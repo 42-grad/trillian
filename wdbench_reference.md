@@ -32,7 +32,10 @@ Engine: dieselben Query-Sets, 60-s-Timeout, Median/AVG/Quartile der OK-Zeiten +
 TIMEOUT/ERROR-Zähler. `ERROR` bei uns = Row-Cap (Cross-Product) oder Parse — bei
 den Referenz-Engines würden solche Queries typischerweise als TIMEOUT zählen.
 
-Caveats: andere Hardware, single-thread vs. unsere Parallelität, und für einen
-fairen absoluten Vergleich muss der Lauf auf dem **vollständigen** Datensatz
-laufen (bzip2-Decompress, nicht lbzip2 — letzteres schneidet die Datei bei ~493M
-Zeilen ab). Tentris ist in WDBench nicht enthalten und hier bewusst draußen.
+Datenquelle: der **kanonische** Figshare-Dump `truthy_direct_properties.nt.bz2`
+(Artikel 19599589, 9,15 GB, md5 `b3ef85c9…`) → ~1,257 Mrd. Tripel. **Nicht** die
+truncated `latest_truthy_data_filtered.tar.bz2` (Artikel 23994126, 3,59 GB), die
+mit keinem Tool über ~495M Zeilen hinaus dekomprimiert.
+
+Caveats: andere Hardware, single-thread vs. unsere Parallelität. Tentris ist in
+WDBench nicht enthalten und hier bewusst draußen.
