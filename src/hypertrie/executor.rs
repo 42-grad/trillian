@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rustc_hash::FxHashMap;
 
@@ -408,6 +409,11 @@ pub fn execute_wcoj(store: &TripleStore, pattern: &GraphPattern) -> Result<RowBl
     let n = var_order.len();
     let mut results = RowBlock::new(n);
     let mut binding = vec![UNBOUND; n];
+    let cap = max_result_rows();
+    // Geteilter Zähler: bremst die (parallele) Rekursion, SOBALD der Cap
+    // erreicht ist – nicht erst nachträglich. Verhindert OOM bei
+    // entarteten/zyklischen Queries.
+    let produced = AtomicUsize::new(0);
 
     wcoj_recurse(
         store,
@@ -418,10 +424,11 @@ pub fn execute_wcoj(store: &TripleStore, pattern: &GraphPattern) -> Result<RowBl
         &mut binding,
         &mut results,
         true, // erste Ebene parallel
+        cap,
+        &produced,
     );
 
-    let cap = max_result_rows();
-    if results.n_rows() > cap {
+    if produced.load(Ordering::Relaxed) > cap {
         return Err(result_too_large(cap));
     }
     Ok(results)
@@ -466,9 +473,17 @@ fn wcoj_recurse(
     binding: &mut Vec<u32>,
     results: &mut RowBlock,
     parallel: bool,
+    cap: usize,
+    produced: &AtomicUsize,
 ) {
+    // Globaler Abbruch, sobald der Cap erreicht ist (von irgendeinem Zweig).
+    if produced.load(Ordering::Relaxed) > cap {
+        return;
+    }
+
     if depth == var_order.len() {
         results.push_row(binding);
+        produced.fetch_add(1, Ordering::Relaxed);
         return;
     }
 
@@ -497,6 +512,8 @@ fn wcoj_recurse(
                     &mut local_binding,
                     &mut local_results,
                     false,
+                    cap,
+                    produced,
                 );
                 local_results
             })
@@ -507,6 +524,9 @@ fn wcoj_recurse(
         }
     } else {
         for &val in &candidates {
+            if produced.load(Ordering::Relaxed) > cap {
+                break;
+            }
             binding[var_map[var_name]] = val;
             wcoj_recurse(
                 store,
@@ -517,6 +537,8 @@ fn wcoj_recurse(
                 binding,
                 results,
                 false,
+                cap,
+                produced,
             );
         }
     }
