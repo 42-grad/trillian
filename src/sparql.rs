@@ -516,7 +516,14 @@ fn resolve_path_end(tp: &spargebra::term::TermPattern, dict: &Dictionary) -> Opt
         spargebra::term::TermPattern::Literal(lit) => dict
             .lookup_term(lit.value(), &literal_term_type(lit))
             .map(PathEnd::Bound),
-        spargebra::term::TermPattern::BlankNode(_) => None,
+        // Blank Node = nicht-distinguierte Variable. spargebra zerlegt
+        // Sequenz-Pfade mit Closure (`p1/(p2)*`) in einen Join über einen
+        // Blank-Node-Knoten (`<s> p1 _:b . _:b (p2)* ?x`); ohne diese
+        // Behandlung lieferte eval_path hier fälschlich 0 (WDBench paths-Bug).
+        // Stabiler interner Name wie in translate_term_pattern.
+        spargebra::term::TermPattern::BlankNode(bn) => {
+            Some(PathEnd::Var(format!("__bn_{}", bn.as_str())))
+        }
     }
 }
 
@@ -650,15 +657,16 @@ fn eval_path(
     let s_end = resolve_path_end(subject, &store.dict);
     let o_end = resolve_path_end(object, &store.dict);
 
-    // Variablennamen für leere/Ergebnis-Spalten ableiten.
-    let s_var = match subject {
-        spargebra::term::TermPattern::Variable(v) => Some(v.as_str().to_string()),
-        _ => None,
+    // Variablenname (inkl. Blank Node als __bn_) für Ergebnis-Spalten/Join.
+    let var_name = |tp: &spargebra::term::TermPattern| -> Option<String> {
+        match tp {
+            spargebra::term::TermPattern::Variable(v) => Some(v.as_str().to_string()),
+            spargebra::term::TermPattern::BlankNode(bn) => Some(format!("__bn_{}", bn.as_str())),
+            _ => None,
+        }
     };
-    let o_var = match object {
-        spargebra::term::TermPattern::Variable(v) => Some(v.as_str().to_string()),
-        _ => None,
-    };
+    let s_var = var_name(subject);
+    let o_var = var_name(object);
 
     // Unbekannte Konstante auf einer Seite -> leere Lösung (mit Variablenspalten).
     if (s_var.is_none() && s_end.is_none()) || (o_var.is_none() && o_end.is_none()) {
@@ -2479,6 +2487,44 @@ mod tests {
         let r2: Value =
             serde_json::from_str(&execute_sparql(&store, &engine, &q_all).unwrap()).unwrap();
         assert_eq!(r2["results"]["bindings"].as_array().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn path_sequence_with_closure_rhs() {
+        // WDBench paths-Bug: `<s> (k1/(k2)*) ?x`. spargebra zerlegt das in
+        // Join(<s> k1 _:b, _:b (k2)* ?x) — der Blank-Node-Knoten muss als
+        // Variable wirken, sonst lieferte eval_path fälschlich 0.
+        // Daten: s -k1-> m ; m -k2-> n1 -k2-> n2.  Erwartet ?x = {m,n1,n2}.
+        let e = "http://ex/";
+        let mut store = TripleStore::new();
+        store.ingest_str_triples(&[
+            (&format!("{e}s"), &format!("{e}k1"), &format!("{e}m")),
+            (&format!("{e}m"), &format!("{e}k2"), &format!("{e}n1")),
+            (&format!("{e}n1"), &format!("{e}k2"), &format!("{e}n2")),
+        ]);
+        let engine = HybridEngine::new();
+        let q = format!("SELECT * WHERE {{ <{e}s> (<{e}k1>/(<{e}k2>)*) ?x }}");
+        let r: Value = serde_json::from_str(&execute_sparql(&store, &engine, &q).unwrap()).unwrap();
+        let mut xs: Vec<String> = r["results"]["bindings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["x"]["value"].as_str().unwrap().to_string())
+            .collect();
+        xs.sort();
+        assert_eq!(
+            xs,
+            vec![format!("{e}m"), format!("{e}n1"), format!("{e}n2")],
+            "k1/(k2)* muss m (0×k2) + n1 + n2 liefern"
+        );
+        // __bn_-Variable darf nicht ausgegeben werden.
+        let head: Vec<&str> = r["head"]["vars"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(head, vec!["x"], "nur ?x, kein __bn_ in SELECT *");
     }
 
     #[test]
