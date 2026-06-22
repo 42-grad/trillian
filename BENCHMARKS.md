@@ -156,6 +156,32 @@ Befunde:
   echte Treffer brauchen den Volldatensatz. Rust-RSS-Peak 18,7 GB (Cap erlaubt
   20M-Zeilen-Zwischenergebnisse).
 
+### WDBench mit Tentris-Restart-Harness (2026-06-22) — erster Voll-Vergleich
+
+Zweiter Lauf, gleicher 49,3M-Slice, aber mit Tentris-Restart-on-Crash im
+Harness (`--rust-/--tentris-restart`, `a66b97d`) + Ansible-SSH-Keepalive. Tentris
+ist 2× gecrasht und beide Male neugestartet → **alle fünf Klassen wurden
+durchgängig verglichen** (vorher Totalausfall ab `multiple_bgps`).
+
+| Klasse | IDENTICAL | Haupt-Diffs | Tentris |
+| :-- | :-- | :-- | :-- |
+| single_bgps | 50/50 | — | ok |
+| multiple_bgps | 38/50 | 6 RUST_ERR (Cap), 5 ROWCOUNT, 1 BINDING | ok (2× Restart) |
+| opts | 31/50 | 9 ROWCOUNT, 7 BINDING (OPTIONAL-Kreuzprodukt) | ok |
+| paths | 23/50 | 18 ROWCOUNT (winzig, bnodes) | **9× nicht parsebar** |
+| c2rpqs | 4/50 | — | **46× nicht parsebar** |
+
+**Hauptbefund — Feature-Vorsprung:** die Research-Tentris **kann Property-Path-
+Syntax nicht parsen** (`"Value of query parameter 'query' is not parsable"`):
+55 PARSE_ERR über paths+c2rpqs. Property Paths + C2RPQs sind also ein Feature,
+das uns von Tentris unterscheidet — nicht nur ein Mess-, sondern ein
+Fähigkeitsunterschied (wie FILTER/ORDER BY, die Tentris ignoriert).
+
+**Eigener offener Punkt:** die 18 `paths`-ROWCOUNT_DIFF sind minimal (z. B.
+182301 vs 182307) und betreffen Zeilen mit **Blank Nodes** in der transitiven
+Hülle — kleine semantische Differenz bei Pfaden über Blank Nodes, später zu
+prüfen.
+
 ## Stufen-Notizen
 
 ### Baseline — `8852869`
