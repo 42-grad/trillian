@@ -1,0 +1,43 @@
+---
+# Tentris-freier Solo-Benchmark: nur unsere Engine, kein Tentris-Build.
+- name: Copy project to host (inkl. wdbench_*.sh / *.py)
+  synchronize:
+    src: "{{ playbook_dir }}/../../../"
+    dest: "{{ project_dir }}"
+    delete: yes
+    rsync_opts:
+      - "--exclude=.git"
+      - "--exclude=target"
+      - "--exclude=third_party"
+      - "--exclude=*.nt"
+      - "--exclude=*.bin"
+      - "--exclude=wdbench_data"
+      - "--exclude=infra"
+
+- name: Build the Rust server binary (release)
+  shell: |
+    . $HOME/.cargo/env
+    cargo build --release --bin server
+  args:
+    chdir: "{{ project_dir }}"
+  environment:
+    PATH: "{{ ansible_env.PATH }}:/root/.cargo/bin"
+
+- name: Run solo WDBench benchmark (download + decompress + build + measure)
+  shell: |
+    . $HOME/.cargo/env
+    ./wdbench_solo.sh {{ wdbench_stride }} {{ wdbench_timeout }}
+  args:
+    chdir: "{{ project_dir }}"
+    executable: /bin/bash
+  environment:
+    PATH: "{{ ansible_env.PATH }}:/root/.cargo/bin:/root/.local/bin"
+  register: bench_output
+  timeout: 28800
+  ignore_errors: yes
+
+- name: Save benchmark output to log file
+  copy:
+    content: "{{ bench_output.stdout | default('') }}\n\n=== STDERR ===\n{{ bench_output.stderr | default('') }}"
+    dest: "{{ project_dir }}/wdbench_solo.log"
+    mode: '0644'

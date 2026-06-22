@@ -1,0 +1,19 @@
+---
+# Tentris-FREIER Solo-Benchmark: nur unsere Engine messen (kein Tentris-Build),
+# für den absoluten Vergleich mit den publizierten WDBench-Zahlen.
+- name: Provision AWS host, build the Rust engine, run the solo WDBench benchmark
+  hosts: wdbench
+  become: yes
+  vars:
+    project_dir: /opt/trillian
+    wdbench_stride: 1    # 1 = voller 1,257-Mrd.-Graph
+    wdbench_timeout: 60  # s je Query (wie die Referenz)
+  pre_tasks:
+    - name: Ensure project directory exists
+      file:
+        path: "{{ project_dir }}"
+        state: directory
+        mode: '0755'
+  roles:
+    - common   # geteilt: apt-Deps, Rust (kein Tentris/Conan-Build nötig)
+    - bench     # lokal: Projekt syncen, server bauen, wdbench_solo.sh fahren
