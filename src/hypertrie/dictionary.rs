@@ -1,5 +1,7 @@
 use std::borrow::Cow;
+use std::sync::Arc;
 
+use memmap2::Mmap;
 use string_interner::backend::StringBackend;
 use string_interner::symbol::SymbolU32;
 use string_interner::{StringInterner, Symbol};
@@ -168,15 +170,85 @@ fn decode_type(key: &str) -> TermType {
     }
 }
 
+/// Read-only Dictionary-Basis, **zero-copy aus dem mmap-Snapshot**. Hält keine
+/// Strings im RAM – Schlüssel, Offsets und der sortierte Lookup-Index liegen in
+/// der gemappten Datei (über `Arc<Mmap>` am Leben gehalten). Spiegelt das
+/// base+delta-Pattern des Index: `MappedDict` = Basis, `Interner` = Overlay.
+#[derive(Debug)]
+struct MappedDict {
+    map: Arc<Mmap>,
+    n: usize,
+    keys_off: usize,   // Byte-Offset des Schlüssel-Blobs
+    keys_len: usize,   // Länge des Blobs in Bytes
+    offs_off: usize,   // Byte-Offset des u32-Offset-Arrays (n+1 Einträge)
+    sorted_off: usize, // Byte-Offset des u32-Arrays sortierter IDs (n Einträge, Lookup)
+}
+
+impl MappedDict {
+    #[inline]
+    fn key_offsets(&self) -> &[u32] {
+        bytemuck::cast_slice(&self.map[self.offs_off..self.offs_off + (self.n + 1) * 4])
+    }
+    #[inline]
+    fn sorted_ids(&self) -> &[u32] {
+        bytemuck::cast_slice(&self.map[self.sorted_off..self.sorted_off + self.n * 4])
+    }
+    #[inline]
+    fn key(&self, id: usize) -> &str {
+        let o = self.key_offsets();
+        let blob = &self.map[self.keys_off..self.keys_off + self.keys_len];
+        // SAFETY: serialize schreibt ausschließlich gültige UTF-8-Schlüssel.
+        unsafe { std::str::from_utf8_unchecked(&blob[o[id] as usize..o[id + 1] as usize]) }
+    }
+    /// Binärsuche über die nach Schlüssel sortierten IDs. O(log n).
+    fn lookup(&self, key: &str) -> Option<u32> {
+        let ids = self.sorted_ids();
+        let (mut lo, mut hi) = (0usize, ids.len());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            match self.key(ids[mid] as usize).cmp(key) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => return Some(ids[mid]),
+            }
+        }
+        None
+    }
+}
+
 /// Bidirektionales String ↔ u32 Dictionary mit Term-Typ-Information.
 ///
 /// Strings werden **interniert** (eine Arena, jeder Schlüssel einmal). Der
 /// Term-Typ ist im Schlüssel-Präfix kodiert ([`encode_key`]) und wird bei Bedarf
-/// per [`decode_type`] rekonstruiert – es gibt **keine** parallele `Vec<TermType>`
-/// mehr (sparte bei echten Wikidata-Daten ~270 MB / 10M Tripel: 48 B/Term).
-#[derive(Debug, Clone, Default)]
+/// per [`decode_type`] rekonstruiert – keine parallele `Vec<TermType>`.
+///
+/// Zweimodig: beim Bau/Update liegen alle Terme im `interner` (owned). Aus einem
+/// Snapshot geladen, bildet `mapped` die **zero-copy** Basis (IDs `0..base_n`)
+/// und der `interner` nimmt nur **nach** dem Laden hinzugefügte Terme auf
+/// (IDs ab `base_n`). Das hält den residenten RAM niedrig: die Term-Strings
+/// liegen pageable im mmap statt owned im Heap.
+#[derive(Debug, Default)]
 pub struct Dictionary {
+    mapped: Option<MappedDict>,
     interner: Interner,
+}
+
+impl Clone for Dictionary {
+    fn clone(&self) -> Self {
+        // Geklonte Dictionaries teilen sich die mmap-Basis (Arc), der Overlay
+        // wird kopiert.
+        Self {
+            mapped: self.mapped.as_ref().map(|m| MappedDict {
+                map: m.map.clone(),
+                n: m.n,
+                keys_off: m.keys_off,
+                keys_len: m.keys_len,
+                offs_off: m.offs_off,
+                sorted_off: m.sorted_off,
+            }),
+            interner: self.interner.clone(),
+        }
+    }
 }
 
 impl Dictionary {
@@ -184,16 +256,33 @@ impl Dictionary {
         Self::default()
     }
 
-    /// Liefert den rohen internierten Schlüssel (inkl. Typ-Präfix) zu einer ID.
     #[inline]
-    fn raw_key(&self, id: u32) -> Option<&str> {
-        SymbolU32::try_from_usize(id as usize).and_then(|s| self.interner.resolve(s))
+    fn base_n(&self) -> usize {
+        self.mapped.as_ref().map_or(0, |m| m.n)
     }
 
-    /// Fügt einen Term mit Typ hinzu oder liefert die existierende ID.
+    /// Liefert den rohen Schlüssel (inkl. Typ-Präfix) zu einer ID – aus der
+    /// mmap-Basis (id < base_n) oder dem Overlay-Interner.
+    #[inline]
+    fn raw_key(&self, id: u32) -> Option<&str> {
+        let base = self.base_n();
+        if (id as usize) < base {
+            Some(self.mapped.as_ref().unwrap().key(id as usize))
+        } else {
+            SymbolU32::try_from_usize(id as usize - base).and_then(|s| self.interner.resolve(s))
+        }
+    }
+
+    /// Fügt einen Term mit Typ hinzu oder liefert die existierende ID. Bereits in
+    /// der mmap-Basis vorhandene Terme werden **nicht** dupliziert.
     pub fn insert_with_type(&mut self, term: &str, typ: TermType) -> u32 {
         let key = encode_key(term, &typ);
-        self.interner.get_or_intern(&key).to_usize() as u32
+        if let Some(m) = &self.mapped
+            && let Some(id) = m.lookup(&key)
+        {
+            return id;
+        }
+        self.base_n() as u32 + self.interner.get_or_intern(&key).to_usize() as u32
     }
 
     /// Fügt einen IRI-Term hinzu (Rückwärtskompatibilität).
@@ -204,9 +293,15 @@ impl Dictionary {
     /// Liefert die ID eines Terms anhand von Lexikalwert **und** Typ.
     #[inline]
     pub fn lookup_term(&self, value: &str, typ: &TermType) -> Option<u32> {
+        let key = encode_key(value, typ);
+        if let Some(m) = &self.mapped
+            && let Some(id) = m.lookup(&key)
+        {
+            return Some(id);
+        }
         self.interner
-            .get(encode_key(value, typ))
-            .map(|s| s.to_usize() as u32)
+            .get(&key)
+            .map(|s| self.base_n() as u32 + s.to_usize() as u32)
     }
 
     /// Bequemlichkeit: ID eines IRI-Terms.
@@ -235,57 +330,89 @@ impl Dictionary {
         self.raw_key(id).map(decode_type)
     }
 
-    /// Grobe Byte-Schätzung (für den Memory-Report). Nur noch Arena-Strings
-    /// (Schlüssel inkl. Präfix, einmal) + Symbol-Offsets – keine Typ-Vec mehr.
+    /// Grobe Byte-Schätzung des **owned** RAM (für den Memory-Report). Die
+    /// mmap-Basis zählt nicht (pageable, zero-copy); nur der Overlay-Interner.
     pub fn approx_bytes(&self) -> usize {
-        let n = self.len();
-        let str_bytes: usize = (0..n as u32)
-            .filter_map(|i| self.raw_key(i))
+        let base = self.base_n() as u32;
+        let n_overlay = self.interner.len();
+        let str_bytes: usize = (0..n_overlay)
+            .filter_map(|i| self.raw_key(base + i as u32))
             .map(|s| s.len())
             .sum();
-        str_bytes + n * 8
+        str_bytes + n_overlay * 8
     }
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.interner.len()
+        self.base_n() + self.interner.len()
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.interner.is_empty()
+        self.len() == 0
     }
 
-    /// Serialisiert das Dictionary in `buf` (für den Snapshot): die rohen
-    /// internierten Schlüssel (Typ ist im Präfix), in ID-Reihenfolge.
+    /// Serialisiert das Dictionary mmap-freundlich. Der Aufrufer stellt sicher,
+    /// dass die aktuelle `buf`-Länge **4-Byte-aligned** ist. Layout:
+    /// `[n:u32][key_offsets:(n+1)×u32][keys_blob:bytes][pad4][sorted_ids:n×u32]`.
+    /// `key_offsets` sind kumulative Byte-Offsets in den Blob (ID-Reihenfolge);
+    /// `sorted_ids` sind die nach Schlüssel sortierten IDs (Lookup per Binärsuche).
     pub fn serialize_into(&self, buf: &mut Vec<u8>) {
         let n = self.len();
         buf.extend_from_slice(&(n as u32).to_le_bytes());
+        // key_offsets (kumulativ, n+1 Einträge)
+        let mut offsets: Vec<u32> = Vec::with_capacity(n + 1);
+        let mut acc = 0u32;
+        offsets.push(0);
         for id in 0..n as u32 {
-            let key = self.raw_key(id).unwrap_or("");
-            buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
-            buf.extend_from_slice(key.as_bytes());
+            acc += self.raw_key(id).map_or(0, |k| k.len() as u32);
+            offsets.push(acc);
         }
+        buf.extend_from_slice(bytemuck::cast_slice(&offsets));
+        // keys_blob (in ID-Reihenfolge, direkt geschrieben – kein Zwischenpuffer)
+        for id in 0..n as u32 {
+            buf.extend_from_slice(self.raw_key(id).unwrap_or("").as_bytes());
+        }
+        while !buf.len().is_multiple_of(4) {
+            buf.push(0);
+        }
+        // sorted_ids: IDs nach Schlüssel sortiert
+        let mut ids: Vec<u32> = (0..n as u32).collect();
+        ids.sort_by(|&a, &b| {
+            self.raw_key(a)
+                .unwrap_or("")
+                .cmp(self.raw_key(b).unwrap_or(""))
+        });
+        buf.extend_from_slice(bytemuck::cast_slice(&ids));
     }
 
-    /// Liest ein Dictionary aus einem (Snapshot-)Byteslice: rohe Schlüssel
-    /// direkt re-internieren (ID-Reihenfolge bleibt erhalten).
-    pub fn deserialize(bytes: &[u8]) -> Self {
-        let mut dict = Dictionary::new();
-        let mut p = 0usize;
-        let read_u32 = |b: &[u8], p: &mut usize| -> u32 {
-            let v = u32::from_le_bytes(b[*p..*p + 4].try_into().unwrap());
-            *p += 4;
-            v
-        };
-        let n = read_u32(bytes, &mut p) as usize;
-        for _ in 0..n {
-            let klen = read_u32(bytes, &mut p) as usize;
-            let key = std::str::from_utf8(&bytes[p..p + klen]).unwrap();
-            p += klen;
-            dict.interner.get_or_intern(key);
+    /// Baut ein **mmap-backed** Dictionary aus dem Snapshot (zero-copy, kein
+    /// owned RAM für die Term-Strings). `dict_off` muss 4-Byte-aligned sein.
+    pub fn from_mapped(map: Arc<Mmap>, dict_off: usize) -> Self {
+        let b: &[u8] = &map;
+        let n = u32::from_le_bytes(b[dict_off..dict_off + 4].try_into().unwrap()) as usize;
+        let offs_off = dict_off + 4;
+        let keys_off = offs_off + (n + 1) * 4;
+        let keys_len = u32::from_le_bytes(
+            b[offs_off + n * 4..offs_off + n * 4 + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let mut sorted_off = keys_off + keys_len;
+        while !sorted_off.is_multiple_of(4) {
+            sorted_off += 1;
         }
-        dict
+        Dictionary {
+            mapped: Some(MappedDict {
+                map: map.clone(),
+                n,
+                keys_off,
+                keys_len,
+                offs_off,
+                sorted_off,
+            }),
+            interner: Interner::new(),
+        }
     }
 }
 

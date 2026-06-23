@@ -12,7 +12,7 @@ use super::stats::CardEstimator;
 /// werden beide geprüft, damit ein altes/fremdes Format einen Fehler liefert,
 /// statt still falsche Daten zu mappen.
 const SNAP_MAGIC: &[u8; 8] = b"TTRSNAP1";
-const SNAP_VERSION: u32 = 3; // v3: namespace-gefaltete Dictionary-Schlüssel
+const SNAP_VERSION: u32 = 4; // v4: mmap-backed Dictionary (Offsets+Blob+sortierte IDs)
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Var {
@@ -424,6 +424,9 @@ impl TripleStore {
         for a in &arrays {
             buf.extend_from_slice(bytemuck::cast_slice::<u32, u8>(a));
         }
+        while !buf.len().is_multiple_of(4) {
+            buf.push(0); // Dictionary-Sektion 4-Byte-aligned beginnen (mmap-cast)
+        }
         let dict_off = buf.len() as u64;
         self.dict.serialize_into(&mut buf);
 
@@ -496,7 +499,7 @@ impl TripleStore {
         let pos = LayeredIndex::from_base(take5(&mut it));
         let osp = LayeredIndex::from_base(take5(&mut it));
 
-        let dict = Dictionary::deserialize(&b[dict_off..]);
+        let dict = Dictionary::from_mapped(map.clone(), dict_off);
 
         let mut store = TripleStore::new();
         store.dict = dict;
@@ -845,6 +848,50 @@ mod tests {
 
         // WCOJ-Hilfslisten korrekt abgeleitet
         assert!(loaded.has_predicate(p));
+
+        // mmap-Basis: IRI wird voll (entfaltet) aufgelöst.
+        assert_eq!(
+            loaded.dict.resolve(a).as_deref(),
+            Some("http://example.org/a")
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn snapshot_insert_after_load_uses_overlay() {
+        // Nach dem Laden hinzugefügte Terme landen im owned Overlay (id >= base_n),
+        // ohne die mmap-Basis zu duplizieren; Update bleibt funktional.
+        let mut store = TripleStore::new();
+        store.ingest_str_triples(&[(
+            "http://www.wikidata.org/entity/Q1",
+            "http://www.wikidata.org/prop/direct/P1",
+            "http://www.wikidata.org/entity/Q2",
+        )]);
+        let path = std::env::temp_dir().join("trillian_overlay_snapshot.bin");
+        let ps = path.to_str().unwrap();
+        store.save_snapshot(ps).unwrap();
+        let mut loaded = TripleStore::load_snapshot(ps).unwrap();
+        let base = loaded.dict.len();
+
+        // existierender (gemappter) Term -> selbe ID, kein neuer Eintrag
+        let q1 = loaded.dict.insert("http://www.wikidata.org/entity/Q1");
+        assert!((q1 as usize) < base, "gemappter Term behält Basis-ID");
+        assert_eq!(loaded.dict.len(), base, "kein Duplikat in den Overlay");
+
+        // neuer Term -> Overlay-ID >= base, korrekt auflösbar + auffindbar
+        let q3 = loaded.dict.insert("http://www.wikidata.org/entity/Q3");
+        assert!((q3 as usize) >= base, "neuer Term im Overlay");
+        assert_eq!(
+            loaded.dict.resolve(q3).as_deref(),
+            Some("http://www.wikidata.org/entity/Q3")
+        );
+        assert_eq!(
+            loaded.dict.lookup_iri("http://www.wikidata.org/entity/Q3"),
+            Some(q3)
+        );
+        // ein Insert+Query über den neuen Term
+        loaded.insert_triple(q1, q1, q3);
+        assert!(loaded.spo.contains(q1, q1, q3));
         let _ = std::fs::remove_file(path);
     }
 
