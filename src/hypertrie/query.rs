@@ -394,7 +394,7 @@ impl TripleStore {
     /// Schreibt einen Binär-Snapshot (Dictionary + die 3 flachen CSR-Indizes).
     ///
     /// Die Index-Arrays liegen 4-Byte-aligned hintereinander, sodass sie beim
-    /// Laden zero-copy memory-gemappt werden können (vgl. Tentris/metall).
+    /// Laden zero-copy memory-gemappt werden können.
     pub fn save_snapshot(&mut self, path: &str) -> std::io::Result<()> {
         self.compact_all();
 
@@ -437,7 +437,7 @@ impl TripleStore {
     }
 
     /// Lädt einen Snapshot per `mmap`: die Index-Arrays werden **zero-copy** in
-    /// die Datei gemappt (resident wie bei Tentris), das Dictionary in den RAM
+    /// die Datei gemappt (zero-copy), das Dictionary über die mmap-Basis
     /// gelesen; Statistik und Prädikatlisten werden abgeleitet.
     pub fn load_snapshot(path: &str) -> std::io::Result<TripleStore> {
         let file = std::fs::File::open(path)?;

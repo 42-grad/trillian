@@ -15,7 +15,7 @@ async fn main() {
 
     let args: Vec<String> = std::env::args().collect();
 
-    // Modi (analog zu Tentris' loader/server-Trennung):
+    // Modes (separate loader/server stages):
     //   server build <file.nt> <snapshot.bin>   -> Index bauen + persistieren
     //   server load  <snapshot.bin> [port]      -> Snapshot per mmap laden + serven
     //   server <file.nt> [port]                 -> parsen + bauen + serven (Default)

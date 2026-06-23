@@ -13,8 +13,8 @@ use super::query::TripleStore;
 /// * **Azyklisch** (Stern, Pfad, Baum) → kostenbasierter Binär-Planner
 ///   (`execute_plan` mit `GraphPattern::optimize`).
 ///
-/// Dies spiegelt die Strategie des originalen Tentris wider: lineare Joins
-/// über den kostenbasierten Planer, zyklische Muster über WCOJ/Einsum.
+/// This mirrors common practice for worst-case-optimal join engines: linear joins
+/// via the cost-based planner, cyclic patterns via WCOJ (leapfrog triejoin).
 #[derive(Debug, Clone, Default)]
 pub struct HybridEngine;
 

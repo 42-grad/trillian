@@ -3,8 +3,8 @@
 //! Jede Änderung (neue Dictionary-Terme + Insert/Delete-Operationen) wird
 //! append-only ins Log geschrieben und per `fsync` auf Platte gezwungen. Beim
 //! Start wird das Log nach dem mmap-Snapshot zurückgespielt. Damit überleben
-//! `INSERT/DELETE DATA`-Updates einen Absturz/Neustart – wie bei Tentris –
-//! ohne nach jeder Änderung den gesamten Snapshot neu zu schreiben.
+//! `INSERT/DELETE DATA`-Updates einen Absturz/Neustart, ohne nach jeder
+//! Änderung den gesamten Snapshot neu zu schreiben.
 //!
 //! Record-Format (append-only, little-endian):
 //! * `0x02` Term:   `[len:u32][utf8][type]`  → `dict.insert_with_type` (nächste ID)

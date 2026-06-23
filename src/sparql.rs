@@ -2404,7 +2404,7 @@ mod tests {
 
     #[test]
     fn chained_optional_referencing_prior_optional_var() {
-        // Reproduziert die WDBench-`opts`-q3-Form (Rust 19 vs Tentris 6,77M):
+        // Reproduces the WDBench `opts` q3 shape (a chained OPTIONAL):
         // ein OPTIONAL, dessen Muster eine Variable nutzt, die nur in einem
         // FRÜHEREN OPTIONAL gebunden wird ("nicht wohlgeformtes" Pattern).
         //   ?x1 P102 <O> .
@@ -2425,7 +2425,7 @@ mod tests {
             (&format!("{e}m1"), &format!("{e}P625"), &format!("{e}c1")), // x5 via x3
             (&format!("{e}m2"), &format!("{e}P625"), &format!("{e}c2")),
             // RAUSCHEN: P625 von einem NICHT über x3 erreichbaren Subjekt.
-            // Ein Kreuzprodukt (Tentris-Verdacht) würde das fälschlich einziehen.
+            // A cross-product would wrongly pull this in.
             (&format!("{e}noise"), &format!("{e}P625"), &format!("{e}nc")),
         ]);
         let engine = HybridEngine::new();

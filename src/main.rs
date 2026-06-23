@@ -40,7 +40,7 @@ fn main() {
     // 3. Chain-Join Benchmark (azyklisch)
     // ------------------------------------------------------------------
     // Muster: (?w, predicate_0, ?x) (?x, predicate_1, ?y) (?y, predicate_2, ?z)
-    // Exakt dieselbe Struktur wie chain_query.sparql für Tentris.
+    // A linear chain join over three patterns.
     // ------------------------------------------------------------------
     let pid0 = store
         .dict
@@ -104,7 +104,7 @@ fn main() {
     // 4. Triangle-Join Benchmark (zyklisch)
     // ------------------------------------------------------------------
     // Muster: (?a, predicate_0, ?b) (?b, predicate_0, ?c) (?c, predicate_0, ?a)
-    // Exakt dieselbe Struktur wie triangle_query.sparql für Tentris.
+    // A cyclic triangle join (handled by the WCOJ path).
     // ------------------------------------------------------------------
     let triangle_pattern = GraphPattern {
         patterns: vec![

@@ -9,7 +9,7 @@ use super::dictionary::TermType;
 /// `<http://example.org/subject> <http://example.org/predicate> <http://example.org/object> .`
 ///
 /// Alle Terme werden als URIs behandelt; Literale werden nicht separat
-/// gequotet (für den Tentris-Vergleich ausreichend).
+/// quoted (sufficient for the benchmark suite).
 pub fn export_ntriples(path: &str, triples: &[(&str, &str, &str)]) -> std::io::Result<()> {
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);

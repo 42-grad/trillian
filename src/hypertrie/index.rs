@@ -6,7 +6,7 @@ use rustc_hash::FxHashMap;
 
 /// Ein `u32`-Array, das entweder im RAM liegt (`Owned`) oder **zero-copy** in
 /// eine memory-gemappte Snapshot-Datei zeigt (`Mapped`). Damit kann der Index
-/// beim Laden direkt aus der Datei bedient werden (resident wie bei Tentris),
+/// served directly from the file on load (zero-copy, memory-mapped),
 /// ohne ihn in den RAM zu kopieren.
 #[derive(Debug, Clone)]
 pub enum U32Arena {
