@@ -39,3 +39,5 @@ wdbench_data/
 wdbench_qsrc/
 wdbench_queries/
 wdbench_queries_full/
+infra/aws/solo_csv/
+infra/aws/wdbench_solo.log

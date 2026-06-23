@@ -1,0 +1,31 @@
+---
+- name: Update apt cache
+  apt:
+    update_cache: yes
+    cache_valid_time: 3600
+
+- name: Install build dependencies
+  apt:
+    name:
+      - build-essential
+      - git
+      - curl
+      - python3
+      - libssl-dev
+      - pkg-config
+      - rsync
+      - bzip2
+    state: present
+
+- name: Install Rust via rustup
+  shell: |
+    set -e
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+  args:
+    creates: /root/.cargo/bin/cargo
+
+- name: Add Cargo to PATH in .bashrc
+  lineinfile:
+    path: /root/.bashrc
+    line: 'export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"'
+    create: yes
