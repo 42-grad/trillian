@@ -1,0 +1,2 @@
+# Only needed for the LLM step; retrieval runs with the Python standard library.
+mistralai>=1.0
