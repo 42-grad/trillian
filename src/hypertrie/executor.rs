@@ -6,14 +6,14 @@ use rustc_hash::FxHashMap;
 use super::planner::{ExecutionPlan, GraphPattern, PatternTerm, TriplePattern};
 use super::query::{QueryResult, Term, TripleStore, Var};
 
-/// Sentinel für eine noch ungebundene Variable in einer (partiellen) Zeile.
-/// Alias auf die zentrale [`super::NULL_ID`]-Konstante.
+/// Sentinel for a still-unbound variable in a (partial) row.
+/// Alias for the central [`super::NULL_ID`] constant.
 pub const UNBOUND: u32 = super::NULL_ID;
 
-/// Obergrenze für materialisierte Ergebniszeilen. Schützt den Server davor, bei
-/// einer entarteten Query (Kreuzprodukt disjunkter Muster oder unbeschränkt
-/// großer Zwischen-Join) den gesamten RAM zu allozieren und vom OOM-Killer
-/// beendet zu werden. Per `TRILLIAN_MAX_ROWS` überschreibbar.
+/// Upper bound on materialized result rows. Protects the server from allocating
+/// all of RAM and being killed by the OOM killer on a degenerate query (cross
+/// product of disjoint patterns or an unbounded intermediate join). Overridable
+/// via `TRILLIAN_MAX_ROWS`.
 pub fn max_result_rows() -> usize {
     use std::sync::OnceLock;
     static CAP: OnceLock<usize> = OnceLock::new();
@@ -25,12 +25,11 @@ pub fn max_result_rows() -> usize {
     })
 }
 
-/// Flache, zeilen-orientierte Ergebnis-Matrix.
+/// Flat, row-oriented result matrix.
 ///
-/// Statt `Vec<Vec<u32>>` (eine Heap-Allokation **pro Zeile**) liegen alle
-/// Zeilen row-major in **einem** `Vec<u32>`. Das eliminiert die Millionen
-/// kleiner Allokationen, die zuvor die Query-Latenz und den Query-Peak-Speicher
-/// dominierten.
+/// Instead of `Vec<Vec<u32>>` (one heap allocation **per row**), all rows live
+/// row-major in **a single** `Vec<u32>`. This eliminates the millions of small
+/// allocations that previously dominated query latency and query peak memory.
 #[derive(Debug, Clone, Default)]
 pub struct RowBlock {
     n_vars: usize,
@@ -72,7 +71,7 @@ impl RowBlock {
         RowIter { block: self, i: 0 }
     }
 
-    /// Hängt eine Zeile an (Breite muss `n_vars` sein).
+    /// Appends a row (width must be `n_vars`).
     #[inline]
     pub fn push_row(&mut self, row: &[u32]) {
         debug_assert_eq!(row.len(), self.n_vars);
@@ -80,9 +79,9 @@ impl RowBlock {
         self.n_rows += 1;
     }
 
-    /// Beginnt eine neue Zeile als Kopie von `prior` (oder ganz `UNBOUND`) und
-    /// liefert deren Start-Offset, damit der Aufrufer einzelne Spalten setzt –
-    /// ohne temporäre Zeilen-`Vec`.
+    /// Starts a new row as a copy of `prior` (or all `UNBOUND`) and returns its
+    /// start offset, so the caller can set individual columns – without a
+    /// temporary row `Vec`.
     #[inline]
     fn push_from_prior(&mut self, prior: Option<&[u32]>) -> usize {
         let start = self.data.len();
@@ -94,7 +93,7 @@ impl RowBlock {
         start
     }
 
-    /// Hängt eine Zeile aus `prefix` an, mit `fill` auf `n_vars` aufgefüllt.
+    /// Appends a row from `prefix`, padded to `n_vars` with `fill`.
     pub fn push_row_padded(&mut self, prefix: &[u32], fill: u32) {
         debug_assert!(prefix.len() <= self.n_vars);
         self.data.extend_from_slice(prefix);
@@ -103,7 +102,7 @@ impl RowBlock {
         self.n_rows += 1;
     }
 
-    /// Hängt eine Zeile als Verkettung `prefix ++ suffix` an.
+    /// Appends a row as the concatenation `prefix ++ suffix`.
     pub fn push_row_concat(&mut self, prefix: &[u32], suffix: &[u32]) {
         debug_assert_eq!(prefix.len() + suffix.len(), self.n_vars);
         self.data.extend_from_slice(prefix);
@@ -111,14 +110,14 @@ impl RowBlock {
         self.n_rows += 1;
     }
 
-    /// Hängt alle Zeilen eines anderen Blocks an (gleiche Breite).
+    /// Appends all rows of another block (same width).
     pub fn append(&mut self, other: &RowBlock) {
         debug_assert_eq!(self.n_vars, other.n_vars);
         self.data.extend_from_slice(&other.data);
         self.n_rows += other.n_rows;
     }
 
-    /// Neuer Block mit nur den ausgewählten Spalten (in der gegebenen Reihenfolge).
+    /// New block with only the selected columns (in the given order).
     pub fn project(&self, indices: &[usize]) -> RowBlock {
         let mut out = RowBlock::new(indices.len());
         out.data.reserve(self.n_rows * indices.len());
@@ -131,7 +130,7 @@ impl RowBlock {
         out
     }
 
-    /// Sortiert die Zeilen und entfernt Duplikate (SPARQL `DISTINCT`).
+    /// Sorts the rows and removes duplicates (SPARQL `DISTINCT`).
     pub fn sort_distinct(&mut self) {
         if self.n_vars == 0 {
             self.n_rows = self.n_rows.min(1);
@@ -156,7 +155,7 @@ impl RowBlock {
         self.n_rows = new_rows;
     }
 
-    /// Entfernt Duplikate **ohne** Umsortierung (für DISTINCT nach ORDER BY).
+    /// Removes duplicates **without** reordering (for DISTINCT after ORDER BY).
     pub fn dedup_preserving_order(&mut self) {
         if self.n_vars == 0 {
             self.n_rows = self.n_rows.min(1);
@@ -176,7 +175,7 @@ impl RowBlock {
         self.n_rows = new_rows;
     }
 
-    /// Wendet OFFSET/LIMIT an (in Zeilen).
+    /// Applies OFFSET/LIMIT (in rows).
     pub fn apply_offset_limit(&mut self, offset: usize, limit: Option<usize>) {
         let start = offset.min(self.n_rows);
         let end = match limit {
@@ -208,16 +207,16 @@ impl<'a> Iterator for RowIter<'a> {
 }
 
 // ---------------------------------------------------------------------------
-// Klassischer planbasierter Executor (für nicht-binäre Muster als Fallback)
+// Classic plan-based executor (fallback for non-binary patterns)
 // ---------------------------------------------------------------------------
 
-/// Führt einen `ExecutionPlan` für ein `GraphPattern` aus.
+/// Executes an `ExecutionPlan` for a `GraphPattern`.
 ///
-/// **Pipelined (DFS):** statt jede Join-Ebene vollständig zu materialisieren,
-/// wird je Teil-Zeile tiefenrekursiv bis zur fertigen Zeile durchgereicht. Damit
-/// bleibt der Speicher auf ~Endzeilen + Rekursionstiefe beschränkt (kein
-/// aufgeblähter Zwischen-Join), und ein `limit` terminiert früh — exakt das, was
-/// WDBench (Output-Cap 100k) misst. `limit=None` produziert alles bis zum Cap.
+/// **Pipelined (DFS):** instead of fully materializing each join level, every
+/// partial row is passed down depth-first to a complete row. This keeps memory
+/// bounded to ~final rows + recursion depth (no bloated intermediate join), and
+/// a `limit` terminates early — exactly what WDBench (output cap 100k) measures.
+/// `limit=None` produces everything up to the cap.
 pub fn execute_plan(
     store: &TripleStore,
     pattern: &GraphPattern,
@@ -240,8 +239,8 @@ pub fn execute_plan_limited(
     }
     let n_vars = var_map.len();
     let cap = max_result_rows();
-    // Sobald so viele Zeilen da sind, wird gestoppt: das LIMIT (sauberer Stopp)
-    // oder cap+1 (dann meldet der Aufrufer "too large"). saturating gegen MAX.
+    // Stop once this many rows exist: the LIMIT (clean stop) or cap+1 (then the
+    // caller reports "too large"). Saturating against MAX.
     let stop = limit
         .map(|l| l.min(cap.saturating_add(1)))
         .unwrap_or(cap.saturating_add(1));
@@ -251,8 +250,8 @@ pub fn execute_plan_limited(
         return Ok(out);
     }
 
-    // Seed: selektivstes (erstes) Muster materialisieren. Der Planner wählt es
-    // als das selektivste -> klein; ein entarteter Voll-Scan wird per Cap erfasst.
+    // Seed: materialize the most selective (first) pattern. The planner picks it
+    // as the most selective -> small; a degenerate full scan is caught by the cap.
     let mut seed = RowBlock::new(n_vars);
     extend_pattern(
         store,
@@ -267,7 +266,7 @@ pub fn execute_plan_limited(
     }
 
     if plan.steps.len() == 1 {
-        // Einzelmuster: direkt bis `stop` übernehmen.
+        // Single pattern: take rows directly up to `stop`.
         for i in 0..seed.n_rows().min(stop) {
             out.push_row(seed.row(i));
         }
@@ -296,8 +295,8 @@ pub fn execute_plan_limited(
     Ok(out)
 }
 
-/// Reicht eine Teil-Zeile durch die restlichen Plan-Schritte (Tiefensuche) und
-/// hängt fertige Zeilen an `out` an, bis `stop` erreicht ist.
+/// Passes a partial row through the remaining plan steps (depth-first) and
+/// appends complete rows to `out` until `stop` is reached.
 #[allow(clippy::too_many_arguments)]
 fn plan_dfs(
     store: &TripleStore,
@@ -317,8 +316,8 @@ fn plan_dfs(
         out.push_row(partial);
         return;
     }
-    // Erweiterungen der Teil-Zeile um EIN Muster (beschränkt durch den Fan-out
-    // dieses Knotens, nicht durch die globale Zwischenmenge).
+    // Extensions of the partial row by ONE pattern (bounded by this node's
+    // fan-out, not by the global intermediate set).
     let mut tmp = RowBlock::new(n_vars);
     extend_pattern(
         store,
@@ -332,7 +331,7 @@ fn plan_dfs(
         if out.n_rows() >= stop {
             break;
         }
-        // `tmp` wird in der Rekursion nicht mutiert -> Slice direkt durchreichen.
+        // `tmp` is not mutated in the recursion -> pass the slice straight through.
         plan_dfs(
             store,
             pattern,
@@ -364,8 +363,8 @@ fn collect_vars(term: &PatternTerm, var_map: &mut FxHashMap<String, usize>) {
     }
 }
 
-/// Wertet ein Muster gegen den Store aus und schreibt die (erweiterten) Zeilen
-/// direkt in `out` – ohne temporäre Zeilen-`Vec` pro Ergebniszeile.
+/// Evaluates a pattern against the store and writes the (extended) rows
+/// directly into `out` – without a temporary row `Vec` per result row.
 fn extend_pattern(
     store: &TripleStore,
     pattern: &TriplePattern,
@@ -480,7 +479,7 @@ impl PatternTerm {
 // WCOJ / Leapfrog Triejoin Executor
 // ---------------------------------------------------------------------------
 
-/// Führt ein Graph-Pattern mit Worst-Case-Optimal Join aus.
+/// Executes a graph pattern with a worst-case-optimal join.
 pub fn execute_wcoj(store: &TripleStore, pattern: &GraphPattern) -> Result<RowBlock, String> {
     execute_wcoj_limited(store, pattern, None)
 }
@@ -506,9 +505,9 @@ pub fn execute_wcoj_limited(
     let mut results = RowBlock::new(n);
     let mut binding = vec![UNBOUND; n];
     let cap = max_result_rows();
-    // Stopp-Schwelle: LIMIT (sauberer Früh-Stopp) oder cap+1 (dann meldet der
-    // Aufrufer "too large"). Bremst die (parallele) Rekursion SOFORT statt
-    // nachträglich -> kein OOM.
+    // Stop threshold: LIMIT (clean early stop) or cap+1 (then the caller reports
+    // "too large"). Brakes the (parallel) recursion IMMEDIATELY rather than
+    // after the fact -> no OOM.
     let stop = limit
         .map(|l| l.min(cap.saturating_add(1)))
         .unwrap_or(cap.saturating_add(1));
@@ -522,7 +521,7 @@ pub fn execute_wcoj_limited(
         0,
         &mut binding,
         &mut results,
-        true, // erste Ebene parallel
+        true, // first level in parallel
         stop,
         &produced,
     );
@@ -535,7 +534,7 @@ pub fn execute_wcoj_limited(
 
 fn is_wcoj_applicable(pattern: &GraphPattern, store: &TripleStore) -> bool {
     pattern.patterns.iter().all(|pat| {
-        // Genau ein gebundenes Prädikat und zwei Variablen an Subjekt/Objekt
+        // Exactly one bound predicate and two variables at subject/object
         let pred_bound =
             matches!(pat.predicate, PatternTerm::Bound(pid) if store.has_predicate(pid));
         let two_vars = [pat.subject.is_variable(), pat.object.is_variable()]
@@ -548,7 +547,7 @@ fn is_wcoj_applicable(pattern: &GraphPattern, store: &TripleStore) -> bool {
 }
 
 fn determine_variable_order(pattern: &GraphPattern) -> Vec<String> {
-    // Heuristik: Variablen in ihrer ersten Erscheinungsreihenfolge.
+    // Heuristic: variables in order of first appearance.
     let mut seen = FxHashMap::default();
     let mut order = Vec::new();
     for pat in &pattern.patterns {
@@ -575,7 +574,7 @@ fn wcoj_recurse(
     cap: usize,
     produced: &AtomicUsize,
 ) {
-    // Globaler Abbruch, sobald der Cap erreicht ist (von irgendeinem Zweig).
+    // Global abort once the cap is reached (by any branch).
     if produced.load(Ordering::Relaxed) > cap {
         return;
     }
@@ -643,7 +642,7 @@ fn wcoj_recurse(
     }
 }
 
-/// Schnittmenge der Kandidaten für `var_name` über alle betroffenen Muster.
+/// Intersection of the candidates for `var_name` across all affected patterns.
 fn leapfrog_candidates(
     store: &TripleStore,
     pattern: &GraphPattern,
@@ -663,7 +662,7 @@ fn leapfrog_candidates(
     leapfrog_intersect(&refs)
 }
 
-/// Liefert den sortierten Kandidaten-Slice für eine Variable in einem Muster.
+/// Returns the sorted candidate slice for a variable in a pattern.
 fn pattern_slice_for_var<'a>(
     store: &'a TripleStore,
     pat: &'a TriplePattern,
@@ -699,7 +698,7 @@ fn pattern_slice_for_var<'a>(
     }
 }
 
-/// Leapfrog-Intersektion mehrerer sortierter Slices.
+/// Leapfrog intersection of several sorted slices.
 fn leapfrog_intersect(slices: &[&[u32]]) -> Vec<u32> {
     if slices.is_empty() {
         return Vec::new();
@@ -740,7 +739,7 @@ fn leapfrog_intersect(slices: &[&[u32]]) -> Vec<u32> {
     result
 }
 
-// Hilfs-Methoden für PatternTerm
+// Helper methods for PatternTerm
 impl PatternTerm {
     pub fn is_variable(&self) -> bool {
         matches!(self, PatternTerm::Variable(_))
@@ -753,7 +752,7 @@ impl PatternTerm {
         }
     }
 
-    /// Konkreter u32-Wert, falls Konstante oder bereits gebundene Variable.
+    /// Concrete u32 value, if a constant or an already-bound variable.
     pub fn bound_or_resolved(
         &self,
         binding: &[u32],
@@ -853,7 +852,7 @@ mod rowblock_tests {
 
     #[test]
     fn zero_var_distinct_collapses() {
-        // Ein 0-Variablen-Block (z. B. ASK/Existenz) -> höchstens eine Zeile.
+        // A 0-variable block (e.g. ASK/existence) -> at most one row.
         let mut b = RowBlock::new(0);
         b.push_row(&[]);
         b.push_row(&[]);
@@ -873,7 +872,7 @@ mod wcoj_tests {
             ("alice", "knows", "bob"),
             ("bob", "knows", "charlie"),
             ("charlie", "knows", "alice"),
-            ("alice", "knows", "dave"), // kein Dreieck
+            ("alice", "knows", "dave"), // no triangle
         ]);
 
         let knows = store.dict.lookup_iri("knows").unwrap();
@@ -898,7 +897,7 @@ mod wcoj_tests {
         };
 
         let results = execute_wcoj(&store, &pattern).unwrap();
-        // Jede Rotation des Dreiecks ist ein Ergebnis: (a,b,c), (b,c,a), (c,a,b)
+        // Each rotation of the triangle is a result: (a,b,c), (b,c,a), (c,a,b)
         assert_eq!(results.n_rows(), 3);
     }
 }

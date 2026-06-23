@@ -4,10 +4,10 @@ use std::sync::Arc;
 use memmap2::Mmap;
 use rustc_hash::FxHashMap;
 
-/// Ein `u32`-Array, das entweder im RAM liegt (`Owned`) oder **zero-copy** in
-/// eine memory-gemappte Snapshot-Datei zeigt (`Mapped`). Damit kann der Index
-/// served directly from the file on load (zero-copy, memory-mapped),
-/// ohne ihn in den RAM zu kopieren.
+/// A `u32` array that either lives in RAM (`Owned`) or points **zero-copy**
+/// into a memory-mapped snapshot file (`Mapped`). This lets the index be served
+/// directly from the file on load (zero-copy, memory-mapped) without copying it
+/// into RAM.
 #[derive(Debug, Clone)]
 pub enum U32Arena {
     Owned(Vec<u32>),
@@ -41,23 +41,22 @@ impl U32Arena {
     }
 }
 
-/// Kompakte, **flache CSR-Arena** für eine feste Triple-Permutation
-/// (z. B. SPO, POS, OSP) plus kleines **Delta-Overlay** für inkrementelle
-/// Updates.
+/// Compact, **flat CSR arena** for a fixed triple permutation (e.g. SPO, POS,
+/// OSP) plus a small **delta overlay** for incremental updates.
 ///
-/// Motivation: Die frühere `BTreeMap<u32, BTreeMap<u32, Vec<u32>>>`-Variante
-/// erzeugte Millionen winziger Heap-Allokationen (eine `Vec` pro Blatt +
-/// BTreeMap-Knoten) und dominierte damit den RSS. Die flache CSR-Basis hält
-/// alle Daten in wenigen großen, zusammenhängenden Vektoren.
+/// Motivation: the earlier `BTreeMap<u32, BTreeMap<u32, Vec<u32>>>` variant
+/// produced millions of tiny heap allocations (one `Vec` per leaf + BTreeMap
+/// nodes) and thus dominated RSS. The flat CSR base keeps all data in a few
+/// large, contiguous vectors.
 ///
-/// Damit Updates trotzdem inkrementell und schnell bleiben (flache CSR kann
-/// nicht billig in der Mitte einfügen), liegt darüber ein Delta:
-/// * `ins`: pro `(first, second)` die hinzugefügten, sortierten `third`-Werte
-///   (disjunkt zur Basis).
-/// * `del`: pro `(first, second)` die gelöschten, sortierten `third`-Werte.
+/// So updates still stay incremental and fast (flat CSR cannot cheaply insert
+/// in the middle), a delta sits on top of it:
+/// * `ins`: per `(first, second)` the added, sorted `third` values (disjoint
+///   from the base).
+/// * `del`: per `(first, second)` the deleted, sorted `third` values.
 ///
-/// Wächst das Delta zu groß, wird es per [`compact`](Self::compact) in eine
-/// neue flache Basis gefaltet.
+/// If the delta grows too large, it is folded into a new flat base via
+/// [`compact`](Self::compact).
 #[derive(Debug, Clone, Default)]
 pub struct LayeredIndex {
     base: FlatCsr,
@@ -66,19 +65,19 @@ pub struct LayeredIndex {
     len: usize,
 }
 
-/// Unveränderliche, dreistufige flache CSR-Struktur. Die fünf Arrays liegen
-/// entweder im RAM oder zero-copy in einem mmap-Snapshot ([`U32Arena`]).
+/// Immutable, three-level flat CSR structure. The five arrays live either in
+/// RAM or zero-copy in an mmap snapshot ([`U32Arena`]).
 #[derive(Debug, Clone, Default)]
 pub struct FlatCsr {
-    keys: U32Arena,    // sortierte, distinkte first-Werte
-    key_off: U32Arena, // keys.len()+1; Bereich in l1
-    l1: U32Arena,      // pro first: sortierte distinkte second-Werte
-    l1_off: U32Arena,  // l1.len()+1; Bereich in vals
-    vals: U32Arena,    // pro (first, second): sortierte distinkte thirds
+    keys: U32Arena,    // sorted, distinct first values
+    key_off: U32Arena, // keys.len()+1; range in l1
+    l1: U32Arena,      // per first: sorted distinct second values
+    l1_off: U32Arena,  // l1.len()+1; range in vals
+    vals: U32Arena,    // per (first, second): sorted distinct thirds
 }
 
 impl FlatCsr {
-    /// Baut die flache CSR aus einer (unsortierten) Triple-Liste.
+    /// Builds the flat CSR from an (unsorted) triple list.
     fn build(triples: &[(u32, u32, u32)]) -> Self {
         let mut sorted = triples.to_vec();
         sorted.sort_unstable();
@@ -115,7 +114,7 @@ impl FlatCsr {
         }
     }
 
-    /// Konstruiert eine FlatCsr aus fünf Arenas (z. B. mmap-Slices).
+    /// Constructs a FlatCsr from five arenas (e.g. mmap slices).
     pub fn from_arenas(
         keys: U32Arena,
         key_off: U32Arena,
@@ -132,7 +131,7 @@ impl FlatCsr {
         }
     }
 
-    /// Die fünf Arrays als Slices (für Serialisierung).
+    /// The five arrays as slices (for serialization).
     pub fn arrays(&self) -> [&[u32]; 5] {
         [
             self.keys.as_slice(),
@@ -164,7 +163,7 @@ impl FlatCsr {
         self.vals.as_slice()
     }
 
-    /// Absoluter l1-Index für `(first, second)`, falls vorhanden.
+    /// Absolute l1 index for `(first, second)`, if present.
     #[inline]
     fn leaf_index(&self, first: u32, second: u32) -> Option<usize> {
         let keys = self.keys();
@@ -196,8 +195,8 @@ impl FlatCsr {
         self.query_two(first, second).binary_search(&third).is_ok()
     }
 
-    /// Distinkte, sortierte `second`-Werte unter `first` als zusammenhängender
-    /// Slice (die L1-Ebene). Leer, falls `first` fehlt. Zero-copy.
+    /// Distinct, sorted `second` values under `first` as a contiguous slice
+    /// (the L1 level). Empty if `first` is absent. Zero-copy.
     #[inline]
     fn seconds_of(&self, first: u32) -> &[u32] {
         let keys = self.keys();
@@ -208,8 +207,8 @@ impl FlatCsr {
         &self.l1()[key_off[i] as usize..key_off[i + 1] as usize]
     }
 
-    /// Anzahl `third`-Werte unter `first` über alle `second` (O(log n) Suche,
-    /// O(1) Summe via CSR-Offsets). 0, falls `first` fehlt.
+    /// Number of `third` values under `first` across all `second` (O(log n)
+    /// lookup, O(1) sum via CSR offsets). 0 if `first` is absent.
     #[inline]
     fn count_one(&self, first: u32) -> usize {
         let keys = self.keys();
@@ -256,7 +255,7 @@ impl LayeredIndex {
         Self::default()
     }
 
-    /// Baut den Index (flache Basis, leeres Delta) aus einer Triple-Liste.
+    /// Builds the index (flat base, empty delta) from a triple list.
     pub fn build(triples: &[(u32, u32, u32)]) -> Self {
         let base = FlatCsr::build(triples);
         let len = base.len();
@@ -268,7 +267,7 @@ impl LayeredIndex {
         }
     }
 
-    /// Konstruiert den Index aus einer (z. B. mmap-gemappten) Basis, leeres Delta.
+    /// Constructs the index from a (e.g. mmap-mapped) base, empty delta.
     pub fn from_base(base: FlatCsr) -> Self {
         let len = base.len();
         Self {
@@ -279,26 +278,26 @@ impl LayeredIndex {
         }
     }
 
-    /// Liefert die flache Basis (nur sinnvoll nach [`compact`](Self::compact),
-    /// wenn das Delta leer ist) – für die Snapshot-Serialisierung.
+    /// Returns the flat base (only meaningful after [`compact`](Self::compact),
+    /// when the delta is empty) – for snapshot serialization.
     pub fn base(&self) -> &FlatCsr {
         &self.base
     }
 
-    /// Ob das Delta leer ist (Basis = vollständiger Inhalt).
+    /// Whether the delta is empty (base = full contents).
     pub fn delta_is_empty(&self) -> bool {
         self.ins.is_empty() && self.del.is_empty()
     }
 
-    /// Anzahl Delta-Einträge (für Kompaktierungs-Heuristik).
+    /// Number of delta entries (for the compaction heuristic).
     #[inline]
     fn delta_count(&self) -> usize {
         self.ins.values().map(|v| v.len()).sum::<usize>()
             + self.del.values().map(|v| v.len()).sum::<usize>()
     }
 
-    /// Faltet das Delta in eine frische flache Basis, wenn es relativ zur
-    /// Basis zu groß geworden ist. Hält den Speicher beschränkt.
+    /// Folds the delta into a fresh flat base when it has grown too large
+    /// relative to the base. Keeps memory bounded.
     fn maybe_compact(&mut self) {
         let delta = self.delta_count();
         if delta > 1024 && delta * 4 > self.base.len() {
@@ -306,7 +305,7 @@ impl LayeredIndex {
         }
     }
 
-    /// Faltet das gesamte Delta in eine neue flache Basis.
+    /// Folds the entire delta into a new flat base.
     pub fn compact(&mut self) {
         if self.ins.is_empty() && self.del.is_empty() {
             return;
@@ -318,14 +317,14 @@ impl LayeredIndex {
         self.len = self.base.len();
     }
 
-    /// Fügt `(first, second, third)` ein. Liefert `true`, wenn neu.
+    /// Inserts `(first, second, third)`. Returns `true` if new.
     pub fn insert(&mut self, first: u32, second: u32, third: u32) -> bool {
         if self.contains(first, second, third) {
             return false;
         }
-        // Falls als gelöscht markiert: Löschung zurücknehmen.
+        // If marked as deleted: undo the deletion.
         if remove_from_leaf(&mut self.del, first, second, third) {
-            // war in Basis, jetzt wieder sichtbar
+            // was in the base, now visible again
         } else {
             insert_into_leaf(&mut self.ins, first, second, third);
         }
@@ -334,14 +333,14 @@ impl LayeredIndex {
         true
     }
 
-    /// Entfernt `(first, second, third)`. Liefert `true`, wenn vorhanden.
+    /// Removes `(first, second, third)`. Returns `true` if present.
     pub fn delete(&mut self, first: u32, second: u32, third: u32) -> bool {
         if !self.contains(first, second, third) {
             return false;
         }
-        // Falls als Delta-Insert vorhanden: dort entfernen, sonst in del eintragen.
+        // If present as a delta insert: remove it there, otherwise record in del.
         if remove_from_leaf(&mut self.ins, first, second, third) {
-            // war ein Delta-Insert
+            // was a delta insert
         } else {
             insert_into_leaf(&mut self.del, first, second, third);
         }
@@ -350,7 +349,7 @@ impl LayeredIndex {
         true
     }
 
-    /// Exakte Existenzprüfung.
+    /// Exact existence check.
     pub fn contains(&self, first: u32, second: u32, third: u32) -> bool {
         if leaf_has(&self.del, first, second, third) {
             return false;
@@ -361,11 +360,11 @@ impl LayeredIndex {
         self.base.contains(first, second, third)
     }
 
-    /// Abfrage `(first, second, ?third)` als sortierter Slice.
+    /// Query `(first, second, ?third)` as a sorted slice.
     ///
-    /// Ohne Delta-Treffer an dieser Stelle wird der Basis-Slice **geliehen**
-    /// zurückgegeben (keine Allokation); andernfalls die gemergte Menge
-    /// `(Basis ∪ ins) \ del` als `Cow::Owned`.
+    /// With no delta hit at this position, the base slice is returned
+    /// **borrowed** (no allocation); otherwise the merged set
+    /// `(base ∪ ins) \ del` as `Cow::Owned`.
     pub fn query_two(&self, first: u32, second: u32) -> Cow<'_, [u32]> {
         let base = self.base.query_two(first, second);
         let ins = self.ins.get(&(first, second));
@@ -378,8 +377,8 @@ impl LayeredIndex {
         Cow::Owned(merge_union_minus(base, ins, del))
     }
 
-    /// Distinkte `first`-Werte (Basis-Schlüssel + Delta). Für Property-Paths
-    /// (Startkandidaten) und Aufzählungen.
+    /// Distinct `first` values (base keys + delta). For property paths (start
+    /// candidates) and enumerations.
     pub fn first_keys(&self) -> Vec<u32> {
         let mut ks: Vec<u32> = self.base.keys().to_vec();
         if !self.ins.is_empty() {
@@ -392,18 +391,18 @@ impl LayeredIndex {
         ks
     }
 
-    /// Distinkte, sortierte `second`-Werte unter `first` (die L1-Ebene). Im
-    /// Delta-freien Fall ein zero-copy Borrow der Basis; mit Delta gemergt.
-    /// Ersetzt vorberechnete Prädikat-Listen (z. B. `objects_with_predicate`
-    /// über POS), spart so eine volle owned Kopie der Daten.
+    /// Distinct, sorted `second` values under `first` (the L1 level). In the
+    /// delta-free case a zero-copy borrow of the base; merged when there is a
+    /// delta. Replaces precomputed predicate lists (e.g. `objects_with_predicate`
+    /// over POS), saving a full owned copy of the data.
     pub fn seconds_of(&self, first: u32) -> Cow<'_, [u32]> {
         let base = self.base.seconds_of(first);
         if self.ins.is_empty() && self.del.is_empty() {
             return Cow::Borrowed(base);
         }
-        // Mit Delta: distinkte seconds aus Basis + Inserts, minus vollständig
-        // gelöschte (second, deren alle thirds entfernt wurden) – konservativ
-        // über query_two geprüft.
+        // With a delta: distinct seconds from base + inserts, minus fully
+        // deleted ones (seconds whose every third was removed) – checked
+        // conservatively via query_two.
         let mut out: Vec<u32> = base.to_vec();
         for &(f, s) in self.ins.keys() {
             if f == first {
@@ -416,15 +415,15 @@ impl LayeredIndex {
         Cow::Owned(out)
     }
 
-    /// Anzahl `third`-Werte unter `(first, second)` ohne Materialisierung im
-    /// Delta-freien Fall (dann nur Slice-Länge der Basis).
+    /// Number of `third` values under `(first, second)` without materialization
+    /// in the delta-free case (then just the base slice length).
     #[inline]
     pub fn count_two(&self, first: u32, second: u32) -> usize {
         self.query_two(first, second).len()
     }
 
-    /// Anzahl Triple unter `first` (Basis + Delta-Inserts; gelöschte werden
-    /// für diese **Heuristik** nicht abgezogen). Exakt im Delta-freien Fall.
+    /// Number of triples under `first` (base + delta inserts; deletions are not
+    /// subtracted for this **heuristic**). Exact in the delta-free case.
     pub fn count_one(&self, first: u32) -> usize {
         let mut c = self.base.count_one(first);
         if !self.ins.is_empty() {
@@ -437,9 +436,9 @@ impl LayeredIndex {
         c
     }
 
-    /// Abfrage `(first, ?second, ?third)`: materialisierte `(second, third)`-Paare.
+    /// Query `(first, ?second, ?third)`: materialized `(second, third)` pairs.
     pub fn query_one_pairs(&self, first: u32) -> Vec<(u32, u32)> {
-        // Distinkte second-Werte unter first sammeln (Basis + Delta-Inserts).
+        // Collect distinct second values under first (base + delta inserts).
         let mut seconds: Vec<u32> = Vec::new();
         let base_keys = self.base.keys();
         if let Ok(i) = base_keys.binary_search(&first) {
@@ -465,17 +464,17 @@ impl LayeredIndex {
         out
     }
 
-    /// Alle gespeicherten Triples in Permutations-Reihenfolge.
+    /// All stored triples in permutation order.
     pub fn all_triples(&self) -> Vec<(u32, u32, u32)> {
         if self.ins.is_empty() && self.del.is_empty() {
             return self.base.all_triples();
         }
         let mut out = self.base.all_triples();
-        // Löschungen entfernen.
+        // Remove deletions.
         if !self.del.is_empty() {
             out.retain(|&(f, s, t)| !leaf_has(&self.del, f, s, t));
         }
-        // Delta-Inserts ergänzen.
+        // Add delta inserts.
         for (&(f, s), thirds) in &self.ins {
             for &t in thirds {
                 out.push((f, s, t));
@@ -496,7 +495,7 @@ impl LayeredIndex {
         self.len == 0
     }
 
-    /// Logische Byte-Größe (Basis-Arrays + Delta) – für den Memory-Report.
+    /// Logical byte size (base arrays + delta) – for the memory report.
     pub fn heap_bytes(&self) -> usize {
         let base: usize = self.base.arrays().iter().map(|a| a.len() * 4).sum();
         let delta: usize = self
@@ -509,7 +508,7 @@ impl LayeredIndex {
     }
 }
 
-// --- Delta-Leaf-Hilfsfunktionen (sortierte Vecs pro (first, second)) ---
+// --- Delta-leaf helpers (sorted Vecs per (first, second)) ---
 
 #[inline]
 fn leaf_has(map: &FxHashMap<(u32, u32), Vec<u32>>, first: u32, second: u32, third: u32) -> bool {
@@ -530,7 +529,7 @@ fn insert_into_leaf(
     }
 }
 
-/// Entfernt `third` aus dem Delta-Leaf; gibt `true` zurück, wenn es da war.
+/// Removes `third` from the delta leaf; returns `true` if it was there.
 #[inline]
 fn remove_from_leaf(
     map: &mut FxHashMap<(u32, u32), Vec<u32>>,
@@ -550,8 +549,8 @@ fn remove_from_leaf(
     false
 }
 
-/// `(base ∪ ins) \ del` für drei sortierte, distinkte Slices.
-/// `base` und `ins` sind disjunkt; `del ⊆ base ∪ ins`.
+/// `(base ∪ ins) \ del` for three sorted, distinct slices.
+/// `base` and `ins` are disjoint; `del ⊆ base ∪ ins`.
 fn merge_union_minus(base: &[u32], ins: &[u32], del: &[u32]) -> Vec<u32> {
     let mut out = Vec::with_capacity(base.len() + ins.len());
     let (mut i, mut j) = (0, 0);
@@ -583,7 +582,7 @@ fn merge_union_minus(base: &[u32], ins: &[u32], del: &[u32]) -> Vec<u32> {
     out
 }
 
-/// Schnittmenge zweier sortierter u32-Slices via klassischem Merge.
+/// Intersection of two sorted u32 slices via a classic merge.
 pub fn intersect_sorted(a: &[u32], b: &[u32]) -> Vec<u32> {
     let mut result = Vec::new();
     let mut i = 0;
@@ -602,7 +601,7 @@ pub fn intersect_sorted(a: &[u32], b: &[u32]) -> Vec<u32> {
     result
 }
 
-/// Schnittmenge zweier sortierter u32-Slices via Roaring-Bitmap.
+/// Intersection of two sorted u32 slices via a roaring bitmap.
 pub fn intersect_bitmap(a: &[u32], b: &[u32]) -> Vec<u32> {
     use roaring::RoaringBitmap;
 
@@ -663,30 +662,30 @@ mod tests {
     #[test]
     fn delta_insert_delete_roundtrip() {
         let mut idx = LayeredIndex::build(&[(1, 2, 3), (1, 2, 5)]);
-        // Insert in bestehende Gruppe -> merge.
+        // Insert into existing group -> merge.
         assert!(idx.insert(1, 2, 4));
         assert_eq!(collect(idx.query_two(1, 2)), vec![3, 4, 5]);
-        assert!(!idx.insert(1, 2, 4)); // Duplikat
+        assert!(!idx.insert(1, 2, 4)); // duplicate
         assert_eq!(idx.len(), 3);
 
-        // Insert in neue Gruppe.
+        // Insert into new group.
         assert!(idx.insert(9, 9, 9));
         assert_eq!(collect(idx.query_two(9, 9)), vec![9]);
 
-        // Delete Basis-Wert.
+        // Delete a base value.
         assert!(idx.delete(1, 2, 3));
         assert_eq!(collect(idx.query_two(1, 2)), vec![4, 5]);
         assert!(!idx.contains(1, 2, 3));
 
-        // Delete Delta-Insert.
+        // Delete a delta insert.
         assert!(idx.delete(1, 2, 4));
         assert_eq!(collect(idx.query_two(1, 2)), vec![5]);
 
-        // Re-insert eines gelöschten Basis-Werts.
+        // Re-insert a deleted base value.
         assert!(idx.insert(1, 2, 3));
         assert_eq!(collect(idx.query_two(1, 2)), vec![3, 5]);
 
-        assert!(!idx.delete(1, 2, 999)); // nicht vorhanden
+        assert!(!idx.delete(1, 2, 999)); // not present
     }
 
     #[test]
@@ -703,11 +702,11 @@ mod tests {
     #[test]
     fn compaction_preserves_contents() {
         let mut idx = LayeredIndex::build(&[(1, 1, 1)]);
-        // Genug Inserts erzwingen, um maybe_compact auszulösen.
+        // Force enough inserts to trigger maybe_compact.
         for t in 0..5000u32 {
             idx.insert(2, 2, t);
         }
-        // Nach (eventueller) Kompaktierung müssen alle Daten korrekt sein.
+        // After (any) compaction all data must still be correct.
         idx.compact();
         assert!(idx.ins.is_empty() && idx.del.is_empty());
         assert_eq!(idx.len(), 5001);
