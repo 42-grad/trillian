@@ -52,15 +52,14 @@ pub enum QueryResult<'a> {
 ///
 /// Etappe 1 des Hypertrie-Umbaus: Die früheren Forward/Reverse-CSR-Relationen
 /// pro Prädikat (zwei volle Datenkopien) sind entfernt. WCOJ bezieht
-/// `objects_for`/`subjects_for` direkt aus den Permutationen (SPO/POS) und
-/// braucht zusätzlich nur die sortierten **distinkten** Subjekt-/Objekt-Listen
-/// je Prädikat – hier als `pred_subjects`/`pred_objects` gehalten.
+/// `objects_for`/`subjects_for` direkt aus den Permutationen (SPO/POS).
+/// `objects_with_predicate` kommt zero-copy aus der POS-L1-Ebene; nur
+/// `pred_subjects` (distinkte Subjekte je p) wird noch gehalten – das ist die
+/// einzige Richtung, die kein Index als zusammenhängenden Slice liefert.
 pub struct TripleStore {
     pub dict: Dictionary,
     /// p -> sortierte, distinkte Subjekte mit Prädikat p (für WCOJ-Kandidaten).
     pred_subjects: FxHashMap<u32, Vec<u32>>,
-    /// p -> sortierte, distinkte Objekte mit Prädikat p.
-    pred_objects: FxHashMap<u32, Vec<u32>>,
     spo: LayeredIndex, // Reihenfolge: S, P, O
     pos: LayeredIndex, // Reihenfolge: P, O, S
     osp: LayeredIndex, // Reihenfolge: O, S, P
@@ -71,7 +70,6 @@ impl TripleStore {
         Self {
             dict: Dictionary::new(),
             pred_subjects: FxHashMap::default(),
-            pred_objects: FxHashMap::default(),
             spo: LayeredIndex::empty(),
             pos: LayeredIndex::empty(),
             osp: LayeredIndex::empty(),
@@ -204,7 +202,8 @@ impl TripleStore {
             self.pos.insert(p, o, s);
             self.osp.insert(o, s, p);
             sorted_insert(self.pred_subjects.entry(p).or_default(), s);
-            sorted_insert(self.pred_objects.entry(p).or_default(), o);
+            // pred_objects entfällt: objects_with_predicate kommt zero-copy aus
+            // der POS-L1-Ebene (seconds_of).
         }
         is_new
     }
@@ -226,16 +225,6 @@ impl TripleStore {
                 sorted_remove(subs, s);
                 if subs.is_empty() {
                     self.pred_subjects.remove(&p);
-                }
-            }
-            // o verliert seinen Eintrag in pred_objects[p] nur, wenn (p,o)
-            // kein Subjekt mehr hat.
-            if self.pos.query_two(p, o).is_empty()
-                && let Some(objs) = self.pred_objects.get_mut(&p)
-            {
-                sorted_remove(objs, o);
-                if objs.is_empty() {
-                    self.pred_objects.remove(&p);
                 }
             }
         }
@@ -262,10 +251,11 @@ impl TripleStore {
         self.pred_subjects.get(&p).map_or(&[], |v| v.as_slice())
     }
 
-    /// Sortierte, distinkte Objekte mit Prädikat p.
+    /// Sortierte, distinkte Objekte mit Prädikat p – zero-copy aus der
+    /// POS-L1-Ebene (kein eigener Speicher mehr).
     #[inline]
-    pub fn objects_with_predicate(&self, p: u32) -> &[u32] {
-        self.pred_objects.get(&p).map_or(&[], |v| v.as_slice())
+    pub fn objects_with_predicate(&self, p: u32) -> Cow<'_, [u32]> {
+        self.pos.seconds_of(p)
     }
 
     /// Ob das Prädikat p im Store vorkommt (für WCOJ-Anwendbarkeit).
@@ -351,10 +341,9 @@ impl TripleStore {
     /// mmap-Snapshots. Kardinalitäten kommen on-demand aus dem Index
     /// ([`CardEstimator`]), daher keine vorberechneten Stats-Maps mehr.
     fn rebuild_aux(&mut self) {
-        // Prädikat-Schlüssellisten (distinkte Subjekte/Objekte je Prädikat)
-        // in O(n) ableiten – die Sortierung erlaubt last()-Deduplikation.
+        // Distinkte Subjekte je Prädikat in O(n) ableiten – die Sortierung
+        // erlaubt last()-Deduplikation. (Objekte: on-demand aus POS-L1.)
         self.pred_subjects.clear();
-        self.pred_objects.clear();
         // SPO ist nach (s,p,o) sortiert -> je Prädikat sind die s monoton.
         for (s, p, _o) in self.spo.all_triples() {
             let subs = self.pred_subjects.entry(p).or_default();
@@ -362,13 +351,7 @@ impl TripleStore {
                 subs.push(s);
             }
         }
-        // POS ist nach (p,o,s) sortiert -> je Prädikat sind die o monoton.
-        for (p, o, _s) in self.pos.all_triples() {
-            let objs = self.pred_objects.entry(p).or_default();
-            if objs.last() != Some(&o) {
-                objs.push(o);
-            }
-        }
+        // pred_objects entfällt: objects_with_predicate kommt zero-copy aus POS.
     }
 
     /// Druckt eine logische Speicher-Aufschlüsselung (Komponenten in MB).
@@ -377,16 +360,7 @@ impl TripleStore {
         let mb = |b: usize| b as f64 / 1024.0 / 1024.0;
         let perm = self.spo.heap_bytes() + self.pos.heap_bytes() + self.osp.heap_bytes();
         let dict = self.dict.approx_bytes();
-        let pred: usize = self
-            .pred_subjects
-            .values()
-            .map(|v| v.len() * 4)
-            .sum::<usize>()
-            + self
-                .pred_objects
-                .values()
-                .map(|v| v.len() * 4)
-                .sum::<usize>();
+        let pred: usize = self.pred_subjects.values().map(|v| v.len() * 4).sum::<usize>();
         let total = perm + dict + pred;
         println!(
             "=== Memory-Report (logisch, {} Triples) ===",
@@ -394,7 +368,7 @@ impl TripleStore {
         );
         println!("  3 Permutationen (SPO/POS/OSP): {:.1} MB", mb(perm));
         println!("  Dictionary (interniert + Typen):  {:.1} MB", mb(dict));
-        println!("  Prädikat-Listen:                 {:.1} MB", mb(pred));
+        println!("  Prädikat-Subjekte (nur S):       {:.1} MB", mb(pred));
         println!("  Stats-Maps:                       0.0 MB (on-demand aus Index)");
         println!("  Summe (logisch):                 {:.1} MB", mb(total));
         println!(

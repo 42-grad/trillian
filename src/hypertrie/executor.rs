@@ -692,7 +692,7 @@ fn pattern_slice_for_var<'a>(
         if let Some(bound_sub) = pat.subject.bound_or_resolved(binding, var_map) {
             Some(store.objects_of(bound_sub, pid))
         } else {
-            Some(Cow::Borrowed(store.objects_with_predicate(pid)))
+            Some(store.objects_with_predicate(pid))
         }
     } else {
         None

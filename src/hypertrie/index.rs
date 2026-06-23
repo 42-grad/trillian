@@ -196,6 +196,18 @@ impl FlatCsr {
         self.query_two(first, second).binary_search(&third).is_ok()
     }
 
+    /// Distinkte, sortierte `second`-Werte unter `first` als zusammenhängender
+    /// Slice (die L1-Ebene). Leer, falls `first` fehlt. Zero-copy.
+    #[inline]
+    fn seconds_of(&self, first: u32) -> &[u32] {
+        let keys = self.keys();
+        let Ok(i) = keys.binary_search(&first) else {
+            return &[];
+        };
+        let key_off = self.key_off();
+        &self.l1()[key_off[i] as usize..key_off[i + 1] as usize]
+    }
+
     /// Anzahl `third`-Werte unter `first` über alle `second` (O(log n) Suche,
     /// O(1) Summe via CSR-Offsets). 0, falls `first` fehlt.
     #[inline]
@@ -378,6 +390,30 @@ impl LayeredIndex {
             ks.dedup();
         }
         ks
+    }
+
+    /// Distinkte, sortierte `second`-Werte unter `first` (die L1-Ebene). Im
+    /// Delta-freien Fall ein zero-copy Borrow der Basis; mit Delta gemergt.
+    /// Ersetzt vorberechnete Prädikat-Listen (z. B. `objects_with_predicate`
+    /// über POS), spart so eine volle owned Kopie der Daten.
+    pub fn seconds_of(&self, first: u32) -> Cow<'_, [u32]> {
+        let base = self.base.seconds_of(first);
+        if self.ins.is_empty() && self.del.is_empty() {
+            return Cow::Borrowed(base);
+        }
+        // Mit Delta: distinkte seconds aus Basis + Inserts, minus vollständig
+        // gelöschte (second, deren alle thirds entfernt wurden) – konservativ
+        // über query_two geprüft.
+        let mut out: Vec<u32> = base.to_vec();
+        for &(f, s) in self.ins.keys() {
+            if f == first {
+                out.push(s);
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out.retain(|&s| !self.query_two(first, s).is_empty());
+        Cow::Owned(out)
     }
 
     /// Anzahl `third`-Werte unter `(first, second)` ohne Materialisierung im
