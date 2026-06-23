@@ -771,6 +771,98 @@ impl PatternTerm {
 }
 
 #[cfg(test)]
+mod rowblock_tests {
+    use super::*;
+
+    #[test]
+    fn push_and_iterate() {
+        let mut b = RowBlock::new(2);
+        b.push_row(&[1, 2]);
+        b.push_row(&[3, 4]);
+        assert_eq!(b.n_rows(), 2);
+        assert_eq!(b.n_vars(), 2);
+        assert_eq!(b.row(1), &[3, 4]);
+        let all: Vec<&[u32]> = b.rows().collect();
+        assert_eq!(all, vec![&[1u32, 2][..], &[3, 4][..]]);
+    }
+
+    #[test]
+    fn push_concat_and_padded() {
+        let mut b = RowBlock::new(3);
+        b.push_row_concat(&[1], &[2, 3]); // prefix ++ suffix
+        b.push_row_padded(&[9], UNBOUND); // prefix, rest UNBOUND
+        assert_eq!(b.row(0), &[1, 2, 3]);
+        assert_eq!(b.row(1), &[9, UNBOUND, UNBOUND]);
+    }
+
+    #[test]
+    fn project_selects_columns() {
+        let mut b = RowBlock::new(3);
+        b.push_row(&[10, 20, 30]);
+        b.push_row(&[40, 50, 60]);
+        let p = b.project(&[2, 0]); // (o, s)
+        assert_eq!(p.n_vars(), 2);
+        assert_eq!(p.row(0), &[30, 10]);
+        assert_eq!(p.row(1), &[60, 40]);
+    }
+
+    #[test]
+    fn sort_distinct_dedups_and_orders() {
+        let mut b = RowBlock::new(1);
+        for v in [3u32, 1, 2, 1, 3] {
+            b.push_row(&[v]);
+        }
+        b.sort_distinct();
+        let got: Vec<u32> = b.rows().map(|r| r[0]).collect();
+        assert_eq!(got, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn dedup_preserves_first_seen_order() {
+        let mut b = RowBlock::new(1);
+        for v in [3u32, 1, 3, 2, 1] {
+            b.push_row(&[v]);
+        }
+        b.dedup_preserving_order();
+        let got: Vec<u32> = b.rows().map(|r| r[0]).collect();
+        assert_eq!(got, vec![3, 1, 2]); // order of first occurrence
+    }
+
+    #[test]
+    fn offset_limit_slices() {
+        let mut b = RowBlock::new(1);
+        for v in 0..10u32 {
+            b.push_row(&[v]);
+        }
+        b.apply_offset_limit(3, Some(4));
+        let got: Vec<u32> = b.rows().map(|r| r[0]).collect();
+        assert_eq!(got, vec![3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn append_concatenates() {
+        let mut a = RowBlock::new(1);
+        a.push_row(&[1]);
+        let mut b = RowBlock::new(1);
+        b.push_row(&[2]);
+        b.push_row(&[3]);
+        a.append(&b);
+        assert_eq!(a.n_rows(), 3);
+        assert_eq!(a.row(2), &[3]);
+    }
+
+    #[test]
+    fn zero_var_distinct_collapses() {
+        // Ein 0-Variablen-Block (z. B. ASK/Existenz) -> höchstens eine Zeile.
+        let mut b = RowBlock::new(0);
+        b.push_row(&[]);
+        b.push_row(&[]);
+        b.sort_distinct();
+        assert_eq!(b.n_rows(), 1);
+    }
+}
+
+#[cfg(test)]
 mod wcoj_tests {
     use super::*;
 

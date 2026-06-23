@@ -649,6 +649,34 @@ fn sorted_remove(vec: &mut Vec<u32>, val: u32) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn cardinality_estimator_from_index() {
+        // CardEstimator is served on-demand from the indexes (no stored maps).
+        // s1 -p-> {o1,o2}, s2 -p-> o1, s1 -q-> o1
+        let mut store = TripleStore::new();
+        let s1 = store.dict.insert("s1");
+        let s2 = store.dict.insert("s2");
+        let p = store.dict.insert("p");
+        let q = store.dict.insert("q");
+        let o1 = store.dict.insert("o1");
+        let o2 = store.dict.insert("o2");
+        store.insert_triple(s1, p, o1);
+        store.insert_triple(s1, p, o2);
+        store.insert_triple(s2, p, o1);
+        store.insert_triple(s1, q, o1);
+
+        assert_eq!(store.total(), 4);
+        assert_eq!(store.sp(s1, p), 2); // #objects of (s1,p)
+        assert_eq!(store.sp(s2, p), 1);
+        assert_eq!(store.po(p, o1), 2); // #subjects of (p,o1): s1,s2
+        assert_eq!(store.os(o1, s1), 2); // #predicates of (o1,s1): p,q
+        assert_eq!(store.sdeg(s1), 3); // triples with subject s1
+        assert_eq!(store.pdeg(p), 3); // triples with predicate p
+        assert_eq!(store.odeg(o1), 3); // triples with object o1
+        assert_eq!(store.sp(s1, q), 1);
+        assert_eq!(store.po(q, o2), 0); // none
+    }
+
     fn example_store() -> TripleStore {
         let mut store = TripleStore::new();
         store.ingest_str_triples(&[

@@ -631,6 +631,36 @@ mod tests {
     }
 
     #[test]
+    fn counts_and_keys() {
+        let idx = LayeredIndex::build(&[(1, 2, 3), (1, 2, 4), (1, 5, 6), (7, 8, 9)]);
+        // count_one(first) = total thirds under first, over all seconds
+        assert_eq!(idx.count_one(1), 3); // (1,2,3),(1,2,4),(1,5,6)
+        assert_eq!(idx.count_one(7), 1);
+        assert_eq!(idx.count_one(42), 0);
+        // count_two(first, second) = thirds under (first, second)
+        assert_eq!(idx.count_two(1, 2), 2);
+        assert_eq!(idx.count_two(1, 5), 1);
+        assert_eq!(idx.count_two(1, 9), 0);
+        // first_keys = distinct, sorted firsts
+        assert_eq!(idx.first_keys(), vec![1, 7]);
+        // seconds_of = distinct, sorted seconds under a first (zero-copy base)
+        assert_eq!(collect(idx.seconds_of(1)), vec![2, 5]);
+        assert!(idx.seconds_of(42).is_empty());
+    }
+
+    #[test]
+    fn seconds_of_merges_delta() {
+        let mut idx = LayeredIndex::build(&[(1, 2, 3)]);
+        idx.insert(1, 8, 9); // new second 8 under first 1 (delta)
+        let mut secs = collect(idx.seconds_of(1));
+        secs.sort_unstable();
+        assert_eq!(secs, vec![2, 8]);
+        // after deleting the only third under (1,8), second 8 disappears
+        idx.delete(1, 8, 9);
+        assert_eq!(collect(idx.seconds_of(1)), vec![2]);
+    }
+
+    #[test]
     fn delta_insert_delete_roundtrip() {
         let mut idx = LayeredIndex::build(&[(1, 2, 3), (1, 2, 5)]);
         // Insert in bestehende Gruppe -> merge.
