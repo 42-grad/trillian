@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # run_aws_bench.sh
 #
-# Provisioniert eine EC2-Instanz, deployt NUR unsere Engine (kein Tentris) und
+# Provisioniert eine EC2-Instanz, deployt unsere Engine und
 # fährt den Solo-WDBench-Benchmark (wdbench_solo.sh) für den absoluten Vergleich
 # mit den publizierten Blazegraph/Jena/Virtuoso/Neo4j-Zahlen.
 #
@@ -13,13 +13,13 @@
 #   Box per Env überschreibbar (Default r6i.16xlarge/400 GB):
 #     INSTANCE_TYPE=r6i.4xlarge DISK_GB=120 ./run_aws_bench.sh 10 60
 #
-# KOSTEN: Instanz läuft bis ./destroy.sh. r6i.16xlarge ~4 $/h; ohne Tentris
-#   muss nur eine Engine resident sein -> kleiner/günstiger als der Duell-Lauf.
+# KOSTEN: Instanz läuft bis ./destroy.sh. r6i.16xlarge ~4 $/h; nur eine Engine
+#   resident, daher moderater RAM-Bedarf.
 set -euo pipefail
 
 STRIDE="${1:-1}"
 TIMEOUT="${2:-60}"
-# Default kleinere Box: ohne Tentris muss nur UNSERE Engine resident sein.
+# Default-Box: nur unsere Engine ist resident.
 : "${INSTANCE_TYPE:=r6i.16xlarge}"
 : "${DISK_GB:=400}"
 export INSTANCE_TYPE DISK_GB
@@ -38,7 +38,7 @@ fi
 
 if [ ! -f "$SSH_PRIVATE_KEY" ]; then
     echo "[run_aws_bench] Erzeuge dediziertes SSH-Key-Paar..."
-    ssh-keygen -t ed25519 -f "$SSH_PRIVATE_KEY" -N "" -C "tentris-wdbench"
+    ssh-keygen -t ed25519 -f "$SSH_PRIVATE_KEY" -N "" -C "trillian-wdbench"
 fi
 
 echo "[run_aws_bench] Terraform apply..."

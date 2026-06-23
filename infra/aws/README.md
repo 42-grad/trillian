@@ -1,57 +1,44 @@
-# AWS-Konstrukt für den vollen WDBench-Duell
+# AWS construct for the full-scale WDBench benchmark
 
-Eigenständiges Terraform/Ansible-Setup (parallel zum Hetzner-Setup unter
-`infra/`), um den **vollen WDBench-Vergleich** (Wikidata Truthy, 1,26 Mrd.
-Tripel) Rust-Clone vs. C++ Tentris auf einer Big-RAM-EC2-Instanz zu fahren.
+A self-contained Terraform + Ansible setup to benchmark Trillian on the full
+**WDBench** dataset (Wikidata Truthy, 1,257,169,959 triples) on a single EC2
+instance, and compare the results against the published WDBench numbers.
 
-## Warum AWS / Big-RAM
-Beide Engines laufen beim Duell **gleichzeitig** resident:
-- Rust-Clone ~130 GB logisch (Index davon mmap-pageable),
-- Tentris ~400 GB (≈340 B/Triple),
-- zusammen ~530 GB RAM → Default **r6i.24xlarge** (96 vCPU / 768 GB).
+## Why a big-RAM box
 
-Disk: dekomprimierte `.nt` (~100 GB) + Rust-Snapshot (~50 GB) + Tentris-metall
-(~1,3 TB) → Default **2 TB gp3**.
+Trillian holds the whole graph resident (~44 GB RAM at full scale, snapshot
+~49 GB on disk). The default instance has comfortable headroom for the in-RAM
+build peak and the decompressed ~156 GB `.nt`, so the disk is sized at 2 TB.
 
-## Voraussetzungen
-- `terraform`, `ansible` lokal
-- AWS-Credentials (`aws configure`, `AWS_PROFILE` oder `AWS_ACCESS_KEY_ID`/`SECRET`)
+## Prerequisites
 
-## vCPU-Quota beachten
-`r6i.24xlarge` = 96 vCPU. Neue Accounts haben oft nur 32–64 vCPU
-("Running On-Demand Standard instances", Quota-Code `L-1216C47A`). Prüfen:
+- `terraform`, `ansible` locally
+- AWS credentials (`aws configure`, `AWS_PROFILE`, or access keys)
+
+## Run
+
 ```bash
-aws service-quotas get-service-quota --service-code ec2 \
-  --quota-code L-1216C47A --region us-east-1 --query 'Quota.Value'
+# full dataset, 60 s per-query timeout (default):
+./infra/aws/run_aws_bench.sh
+
+# smaller real warm-up (every 10th triple, on a cheaper box):
+INSTANCE_TYPE=r6i.4xlarge DISK_GB=300 ./infra/aws/run_aws_bench.sh 10 60
 ```
-Reicht es nicht, entweder Erhöhung beantragen
-(`request-service-quota-increase ... --desired-value 96`, Freigabe dauert) oder
-eine kleinere Instanz per Env-Override fahren (siehe unten). Größte Instanz bei
-64 vCPU: `r6i.16xlarge` (512 GB).
 
-## Start
-```bash
-# Voller Datensatz, 100 Queries je Kategorie (braucht 96-vCPU-Quota):
-./infra/aws/run_aws_duel.sh
+The script provisions the instance, builds the Rust engine, downloads the
+WDBench dump, builds a snapshot, runs the five query classes (`wdbench_solo.sh`),
+and fetches `wdbench_solo.log` plus per-query CSVs back. It creates a dedicated
+SSH keypair under `terraform/duel_key` (never committed).
 
-# Günstiger Warm-up auf kleiner Instanz (Env-Override für Typ/Disk):
-INSTANCE_TYPE=r6i.4xlarge DISK_GB=300 ./infra/aws/run_aws_duel.sh 10 50
-```
-`INSTANCE_TYPE` / `DISK_GB` überschreiben die Terraform-Defaults pro Lauf.
-Das Skript erzeugt ein dediziertes SSH-Keypair (`terraform/duel_key`, **nie**
-committen), provisioniert die Instanz, baut beide Engines, lädt den
-WDBench-Dump (Figshare, 3,6 GB → entpackt), fährt `wdbench_duel.sh` und holt
-`wdbench_duel.log` zurück.
+## Tear down (important — the instance bills until destroyed)
 
-## Aufräumen (WICHTIG – Instanz kostet weiter)
 ```bash
 ./infra/aws/destroy.sh
 ```
 
-## Kosten / Knöpfe
-- `instance_type` (variables.tf): r6i.24xlarge (768 GB, ~6 $/h) | r6i.16xlarge
-  (512 GB; dann mit `stride` fahren) | x2iedn.16xlarge (1 TB).
-- `disk_gb`: bei `stride` deutlich kleiner wählbar.
-- `aws_region`, `ssh_ingress_cidrs` (für SSH-Whitelisting eigene IP/32 setzen).
-- Vor dem teuren Lauf lohnt die lokale/kleine Machbarkeits-Probe:
-  `bash wdbench_probe.sh`.
+## Knobs
+
+- `INSTANCE_TYPE` / `DISK_GB` — env overrides per run.
+- `aws_region`, `ssh_ingress_cidrs` (set your own IP/32 to lock down SSH).
+- Results are compared against the published numbers in `wdbench_reference.md`
+  via `wdbench_compare.py`.

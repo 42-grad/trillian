@@ -37,5 +37,5 @@ Datenquelle: der **kanonische** Figshare-Dump `truthy_direct_properties.nt.bz2`
 truncated `latest_truthy_data_filtered.tar.bz2` (Artikel 23994126, 3,59 GB), die
 mit keinem Tool über ~495M Zeilen hinaus dekomprimiert.
 
-Caveats: andere Hardware, single-thread vs. unsere Parallelität. Tentris ist in
-WDBench nicht enthalten und hier bewusst draußen.
+Caveats: andere Hardware, single-thread vs. unsere Parallelität — absolute
+Millisekunden sind daher indikativ, kein kontrollierter Head-to-Head.

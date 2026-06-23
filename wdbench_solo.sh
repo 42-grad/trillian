@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# wdbench_solo.sh — Tentris-FREIER WDBench-Lauf nur für unsere Engine, im
+# wdbench_solo.sh — WDBench-Lauf für unsere Engine, im
 # publizierten Format, für den absoluten Vergleich mit den offiziellen
 # Blazegraph/Jena/Virtuoso/Neo4j-Zahlen (Results/*.xlsx, 60-s-Timeout, ms).
 #

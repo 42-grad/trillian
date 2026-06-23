@@ -6,7 +6,7 @@
 # wachsender Tripelzahl und projiziert auf den Volldatensatz. Lädt zusätzlich
 # die WDBench-Query-Logs, konvertiert sie und führt eine Stichprobe (inkl.
 # Property-Paths + C2RPQs) gegen unseren Server aus — End-to-End-Validierung der
-# neuen Features auf realen Wikidata-Shapes, ohne dass Tentris/Big-RAM nötig ist.
+# neuen Features auf realen Wikidata-Shapes, ohne Big-RAM-Box.
 #
 # Aufruf:  ./wdbench_probe.sh ["N1 N2 N3"]   # Slice-Größen (Zeilen), default unten
 set -euo pipefail
@@ -15,7 +15,6 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA_URL="https://ndownloader.figshare.com/files/34816081"   # truthy_direct_properties.nt.bz2 (9,15 GB, vollständig)
 REPO_RAW="https://raw.githubusercontent.com/MillenniumDB/WDBench/master/Queries"
 TOTAL_TRIPLES=1257169959
-TENTRIS_BPT=340.3   # gemessenes Tentris-RSS B/Triple (WatDiv-Lauf) als Referenz
 
 SIZES="${1:-2000000 8000000 32000000}"
 MAXN=$(echo "$SIZES" | tr ' ' '\n' | sort -n | tail -1)
@@ -132,8 +131,7 @@ if [ "${LAST_BPT:-}" != "" ]; then
     echo "    Rust logisch:  ~${PROJ_LOG} GB"
     if [ "$RSS_BPT" != "n/a" ]; then
         PROJ_RSS=$(awk "BEGIN{printf \"%.1f\", ${RSS_BPT}*${TOTAL_TRIPLES}/1024/1024/1024}")
-        PROJ_TEN=$(awk "BEGIN{printf \"%.1f\", ${TENTRIS_BPT}*${TOTAL_TRIPLES}/1024/1024/1024}")
-        echo "    Rust RSS:      ~${PROJ_RSS} GB   (Tentris-Referenz @${TENTRIS_BPT} B: ~${PROJ_TEN} GB)"
+        echo "    Rust RSS:      ~${PROJ_RSS} GB"
     fi
     echo "  Hinweis: B/Triple sinkt mit N (Term-Wiederverwendung im Dict) -> obige"
     echo "           Projektion ist eine OBERGRENZE; echter Vollwert liegt darunter."
