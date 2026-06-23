@@ -12,7 +12,7 @@ use super::stats::CardEstimator;
 /// werden beide geprüft, damit ein altes/fremdes Format einen Fehler liefert,
 /// statt still falsche Daten zu mappen.
 const SNAP_MAGIC: &[u8; 8] = b"TTRSNAP1";
-const SNAP_VERSION: u32 = 1;
+const SNAP_VERSION: u32 = 2; // v2: Dictionary serialisiert rohe Schlüssel (Typ im Präfix)
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Var {
@@ -323,9 +323,11 @@ impl TripleStore {
 
     fn serialize_id(&self, id: u32) -> String {
         let value = self.dict.resolve(id).unwrap_or("");
-        let default = super::dictionary::TermType::Iri;
-        let typ = self.dict.resolve_type(id).unwrap_or(&default);
-        super::export::serialize_term(value, typ)
+        let typ = self
+            .dict
+            .resolve_type(id)
+            .unwrap_or(super::dictionary::TermType::Iri);
+        super::export::serialize_term(value, &typ)
     }
 
     /// Baut alle Indizes aus einer Triple-Liste neu auf (Bulk-Load).

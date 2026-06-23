@@ -87,15 +87,38 @@ fn decode_value(key: &str) -> &str {
     }
 }
 
+/// Rekonstruiert den Term-Typ aus dem Präfix eines internierten Schlüssels.
+/// Der Typ ist vollständig im Schlüssel kodiert (siehe [`encode_key`]) – eine
+/// separate `Vec<TermType>` (48 B/Term + eigene Strings) ist damit überflüssig.
+fn decode_type(key: &str) -> TermType {
+    let bytes = key.as_bytes();
+    match bytes.first() {
+        Some(b'I') => TermType::Iri,
+        Some(b'B') => TermType::BlankNode,
+        Some(b'L') => TermType::literal_plain(),
+        Some(b'G') => {
+            // G<lang>\x01<value>  -> Sprach-Literal
+            let sep = key.find(SEP).unwrap_or(key.len());
+            TermType::literal_lang(&key[1..sep])
+        }
+        Some(b'D') => {
+            // D<datatype>\x01<value>  -> typisiertes Literal
+            let sep = key.find(SEP).unwrap_or(key.len());
+            TermType::literal_datatype(&key[1..sep])
+        }
+        _ => TermType::Iri, // defensiv
+    }
+}
+
 /// Bidirektionales String ↔ u32 Dictionary mit Term-Typ-Information.
 ///
-/// Strings werden **interniert** (eine Arena, jeder String einmal) statt als
-/// Millionen einzelner `String`s × 2 gehalten. `id_to_type` ist parallel zu den
-/// fortlaufenden Interner-IDs (0-basiert).
+/// Strings werden **interniert** (eine Arena, jeder Schlüssel einmal). Der
+/// Term-Typ ist im Schlüssel-Präfix kodiert ([`encode_key`]) und wird bei Bedarf
+/// per [`decode_type`] rekonstruiert – es gibt **keine** parallele `Vec<TermType>`
+/// mehr (sparte bei echten Wikidata-Daten ~270 MB / 10M Tripel: 48 B/Term).
 #[derive(Debug, Clone, Default)]
 pub struct Dictionary {
     interner: Interner,
-    id_to_type: Vec<TermType>,
 }
 
 impl Dictionary {
@@ -103,15 +126,16 @@ impl Dictionary {
         Self::default()
     }
 
+    /// Liefert den rohen internierten Schlüssel (inkl. Typ-Präfix) zu einer ID.
+    #[inline]
+    fn raw_key(&self, id: u32) -> Option<&str> {
+        SymbolU32::try_from_usize(id as usize).and_then(|s| self.interner.resolve(s))
+    }
+
     /// Fügt einen Term mit Typ hinzu oder liefert die existierende ID.
     pub fn insert_with_type(&mut self, term: &str, typ: TermType) -> u32 {
         let key = encode_key(term, &typ);
-        let id = self.interner.get_or_intern(&key).to_usize() as u32;
-        // Neuer Term -> ID == bisherige Länge; Typ parallel anhängen.
-        if id as usize == self.id_to_type.len() {
-            self.id_to_type.push(typ);
-        }
-        id
+        self.interner.get_or_intern(&key).to_usize() as u32
     }
 
     /// Fügt einen IRI-Term hinzu (Rückwärtskompatibilität).
@@ -136,73 +160,50 @@ impl Dictionary {
     /// Löst eine ID in den ursprünglichen Lexikalwert auf (ohne Typ-Präfix).
     #[inline]
     pub fn resolve(&self, id: u32) -> Option<&str> {
-        SymbolU32::try_from_usize(id as usize)
-            .and_then(|s| self.interner.resolve(s))
-            .map(decode_value)
+        self.raw_key(id).map(decode_value)
     }
 
-    /// Liefert den Typ eines Terms.
+    /// Liefert den Typ eines Terms (aus dem Schlüssel-Präfix rekonstruiert).
     #[inline]
-    pub fn resolve_type(&self, id: u32) -> Option<&TermType> {
-        self.id_to_type.get(id as usize)
+    pub fn resolve_type(&self, id: u32) -> Option<TermType> {
+        self.raw_key(id).map(decode_type)
     }
 
-    /// Grobe Byte-Schätzung (für den Memory-Report). Strings liegen jetzt
-    /// **einmal** in der Interner-Arena.
+    /// Grobe Byte-Schätzung (für den Memory-Report). Nur noch Arena-Strings
+    /// (Schlüssel inkl. Präfix, einmal) + Symbol-Offsets – keine Typ-Vec mehr.
     pub fn approx_bytes(&self) -> usize {
-        let n = self.id_to_type.len();
+        let n = self.len();
         let str_bytes: usize = (0..n as u32)
-            .filter_map(|i| self.resolve(i))
+            .filter_map(|i| self.raw_key(i))
             .map(|s| s.len())
             .sum();
-        // Arena-Strings (einmal) + Offsets (~8 B/Eintrag) + Typ-Vec.
-        str_bytes + n * 8 + n * std::mem::size_of::<TermType>()
+        str_bytes + n * 8
     }
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.id_to_type.len()
+        self.interner.len()
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.id_to_type.is_empty()
+        self.interner.is_empty()
     }
 
-    /// Serialisiert das Dictionary in `buf` (für den Snapshot).
+    /// Serialisiert das Dictionary in `buf` (für den Snapshot): die rohen
+    /// internierten Schlüssel (Typ ist im Präfix), in ID-Reihenfolge.
     pub fn serialize_into(&self, buf: &mut Vec<u8>) {
-        let n = self.id_to_type.len();
+        let n = self.len();
         buf.extend_from_slice(&(n as u32).to_le_bytes());
         for id in 0..n as u32 {
-            let s = self.resolve(id).unwrap_or("");
-            let t = &self.id_to_type[id as usize];
-            buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
-            buf.extend_from_slice(s.as_bytes());
-            match t {
-                TermType::Iri => buf.push(0),
-                TermType::BlankNode => buf.push(1),
-                TermType::Literal {
-                    datatype: None,
-                    lang: None,
-                } => buf.push(2),
-                TermType::Literal { lang: Some(l), .. } => {
-                    buf.push(3);
-                    buf.extend_from_slice(&(l.len() as u32).to_le_bytes());
-                    buf.extend_from_slice(l.as_bytes());
-                }
-                TermType::Literal {
-                    datatype: Some(d),
-                    lang: None,
-                } => {
-                    buf.push(4);
-                    buf.extend_from_slice(&(d.len() as u32).to_le_bytes());
-                    buf.extend_from_slice(d.as_bytes());
-                }
-            }
+            let key = self.raw_key(id).unwrap_or("");
+            buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            buf.extend_from_slice(key.as_bytes());
         }
     }
 
-    /// Liest ein Dictionary aus einem (Snapshot-)Byteslice.
+    /// Liest ein Dictionary aus einem (Snapshot-)Byteslice: rohe Schlüssel
+    /// direkt re-internieren (ID-Reihenfolge bleibt erhalten).
     pub fn deserialize(bytes: &[u8]) -> Self {
         let mut dict = Dictionary::new();
         let mut p = 0usize;
@@ -212,36 +213,11 @@ impl Dictionary {
             v
         };
         let n = read_u32(bytes, &mut p) as usize;
-        dict.id_to_type.reserve(n);
         for _ in 0..n {
-            let slen = read_u32(bytes, &mut p) as usize;
-            let s = std::str::from_utf8(&bytes[p..p + slen]).unwrap();
-            p += slen;
-            let tag = bytes[p];
-            p += 1;
-            let typ = match tag {
-                0 => TermType::Iri,
-                1 => TermType::BlankNode,
-                2 => TermType::literal_plain(),
-                3 => {
-                    let llen = read_u32(bytes, &mut p) as usize;
-                    let l = std::str::from_utf8(&bytes[p..p + llen])
-                        .unwrap()
-                        .to_string();
-                    p += llen;
-                    TermType::literal_lang(l)
-                }
-                4 => {
-                    let dlen = read_u32(bytes, &mut p) as usize;
-                    let d = std::str::from_utf8(&bytes[p..p + dlen])
-                        .unwrap()
-                        .to_string();
-                    p += dlen;
-                    TermType::literal_datatype(d)
-                }
-                _ => TermType::Iri,
-            };
-            dict.insert_with_type(s, typ);
+            let klen = read_u32(bytes, &mut p) as usize;
+            let key = std::str::from_utf8(&bytes[p..p + klen]).unwrap();
+            p += klen;
+            dict.interner.get_or_intern(key);
         }
         dict
     }

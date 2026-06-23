@@ -1109,11 +1109,11 @@ fn append_term(out: &mut String, id: u32, dict: &Dictionary) {
         (Some(v), Some(TermType::Literal { datatype, lang })) => {
             out.push_str("{\"type\":\"literal\",\"value\":");
             append_json_str(out, v);
-            if let Some(dt) = datatype {
+            if let Some(dt) = &datatype {
                 out.push_str(",\"datatype\":");
                 append_json_str(out, dt);
             }
-            if let Some(l) = lang {
+            if let Some(l) = &lang {
                 out.push_str(",\"xml:lang\":");
                 append_json_str(out, l);
             }
