@@ -86,7 +86,7 @@ th{font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:up
   <div class="chips">
     <div class="chip"><div class="big acc">1 ms</div><div class="lbl">Single-BGP median latency — best published: 69 ms (Blazegraph)</div></div>
     <div class="chip"><div class="big">100%</div><div class="lbl">BGP result counts matching the published engines (930/930)</div></div>
-    <div class="chip"><div class="big">78 GB</div><div class="lbl">resident RAM, fully in-memory — others are disk-backed stores</div></div>
+    <div class="chip"><div class="big">42 B</div><div class="lbl">per triple on disk — smallest store of the field (49 GiB); RAM-resident, though (≈ 80 GB)</div></div>
   </div>
 
   <section>
@@ -328,14 +328,23 @@ th{font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:up
 
   <section>
     <h2>Footprint &amp; ingest</h2>
-    <p class="sub">Trillian holds everything in RAM; the published engines are disk-backed stores. The
-    numbers below are therefore different quantities — compare in kind, not one-to-one.</p>
+    <p class="sub">On-disk store size is directly comparable (all are “database size after loading”). RAM is
+    not: Trillian holds the whole graph resident; the published engines are disk-backed and were given a
+    fixed RAM budget to page a larger store.</p>
     <div class="fchips">
-      <div class="fc"><div class="v acc">78 GB</div><div class="k">Trillian resident RAM (in-memory) · ≈ 66 B / triple</div></div>
-      <div class="fc"><div class="v">49 GB</div><div class="k">Trillian on-disk snapshot (zero-copy mmap)</div></div>
-      <div class="fc"><div class="v">34 min</div><div class="k">ingest + load of all 1.257 B triples</div></div>
-      <div class="fc"><div class="v">70–112 GB</div><div class="k">published engines’ on-disk store (Blaze/Virtuoso 70, Jena 110, Neo4j 112)</div></div>
+      <div class="fc"><div class="v acc">42 B</div><div class="k">Trillian per triple on disk — 49 GiB snapshot, the smallest store of the field</div></div>
+      <div class="fc"><div class="v">56–89 B</div><div class="k">published engines per triple on disk (Blaze/Virtuoso 70 GB, Jena 110, Neo4j 112)</div></div>
+      <div class="fc"><div class="v">80 GB</div><div class="k">Trillian resident RAM — the whole graph in memory (≈ 64 B / triple), no paging</div></div>
+      <div class="fc"><div class="v">64 GB</div><div class="k">RAM the published engines were given (per the paper), paging a 70–112 GB store</div></div>
+      <div class="fc"><div class="v">34 min</div><div class="k">Trillian ingest + load of all 1.257 B triples</div></div>
     </div>
+    <p class="note" style="margin-top:18px"><b>The honest trade-off.</b> Trillian’s on-disk format is the
+    most compact here (42 B/triple). But its in-memory design wants the whole graph resident — ~80 GB —
+    where the disk-backed engines run in a 64 GB budget and pay with disk I/O (much of their latency gap).
+    The snapshot is a zero-copy mmap, so under RAM pressure the OS can evict cold index pages and Trillian
+    still serves from a smaller resident set — at the cost of paging on cold queries. RAM efficiency, not
+    speed, is the axis where the in-memory design costs more: three full permutations (SPO/POS/OSP) plus an
+    in-RAM term dictionary, versus a structure-sharing hypertrie.</p>
   </section>
 
   <section>
