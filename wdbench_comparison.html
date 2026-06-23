@@ -343,7 +343,7 @@ th{font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:up
     <div class="caveats">
       <ul>
         <li><b>Different hardware &amp; setup.</b> The published numbers are from the WDBench paper’s machine; Trillian ran on an AWS r6i.16xlarge. Absolute milliseconds are indicative, not a controlled head-to-head.</li>
-        <li><b>In-memory vs. disk-backed.</b> Much of the latency gap is architectural — Trillian is a read-only in-RAM store with flat-CSR indexes and u32 IDs; the others are general-purpose DBMSs paging from disk with full transactional machinery.</li>
+        <li><b>In-memory vs. disk-backed.</b> Much of the latency gap is architectural — Trillian keeps everything in RAM (flat-CSR indexes, u32 IDs) and, for this benchmark, loads once and only queries; the others are general-purpose DBMSs paging from disk under full transactional machinery. Trillian does support durable incremental updates (SPARQL <code>INSERT DATA</code>/<code>DELETE DATA</code> via a write-ahead log) — it just isn’t exercised here.</li>
         <li><b>Our error = their timeout.</b> Where Trillian shows “error” it’s the row-cap firing on operators we haven’t pipelined yet; a comparable engine would typically time out instead. Both mean “did not complete.”</li>
         <li><b>Same queries, verified.</b> Identical WDBench query sets (280/681/498/660/539), 60 s timeout, 100 k output cap — and BGP result counts checked one-by-one against the published engines.</li>
         <li><b>Single run.</b> One measured pass per query (warm), no averaging across runs.</li>
