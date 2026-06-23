@@ -819,13 +819,20 @@ fn hash_join(
     new_var_order.extend(new_vars.iter().cloned());
     let new_arity = new_vars.len();
 
-    // Rechte Seite nach Join-Schlüssel indizieren (neue Spalten flach).
-    let mut index: rustc_hash::FxHashMap<Vec<u32>, Vec<u32>> = rustc_hash::FxHashMap::default();
+    // Rechte Seite nach Join-Schlüssel indizieren: (Anzahl Treffer, neue Spalten
+    // flach). Die Trefferzahl wird separat geführt, weil bei `new_arity == 0`
+    // (Semi-Join: alle rechten Variablen sind Join-Keys) sonst nicht zwischen
+    // "Key fehlt" und "Key trifft, aber 0 neue Spalten" unterschieden werden
+    // kann – das verschluckte zuvor alle solchen Joins (z. B. c2rpq-Pfade mit
+    // gebundenem Objekt -> Join über den Blank-Node-Knoten).
+    let mut index: rustc_hash::FxHashMap<Vec<u32>, (usize, Vec<u32>)> =
+        rustc_hash::FxHashMap::default();
     for rrow in right.rows() {
         let key: Vec<u32> = shared.iter().map(|&(_, rp)| rrow[rp]).collect();
-        let bucket = index.entry(key).or_default();
+        let bucket = index.entry(key).or_insert((0, Vec::new()));
+        bucket.0 += 1;
         for &p in &new_positions {
-            bucket.push(rrow[p]);
+            bucket.1.push(rrow[p]);
         }
     }
 
@@ -833,16 +840,19 @@ fn hash_join(
     for row in left.rows() {
         let key: Vec<u32> = shared.iter().map(|&(lp, _)| row[lp]).collect();
         match index.get(&key) {
-            Some(flat) if !flat.is_empty() => {
+            Some(&(count, ref flat)) => {
                 if new_arity == 0 {
-                    out.push_row_padded(row, NULL_ID); // Match, aber keine neuen Spalten
+                    // Match ohne neue Spalten -> eine Zeile je rechtem Treffer.
+                    for _ in 0..count {
+                        out.push_row_padded(row, NULL_ID);
+                    }
                 } else {
                     for chunk in flat.chunks(new_arity) {
                         out.push_row_concat(row, chunk);
                     }
                 }
             }
-            _ => {
+            None => {
                 if left_outer {
                     out.push_row_padded(row, NULL_ID);
                 }
@@ -2525,6 +2535,59 @@ mod tests {
             .map(|v| v.as_str().unwrap())
             .collect();
         assert_eq!(head, vec!["x"], "nur ?x, kein __bn_ in SELECT *");
+    }
+
+    #[test]
+    fn semijoin_over_blank_node_path_bound_object() {
+        // c2rpq-Form: `?x (k1/(k2)*) <const>` (gebundenes Objekt). spargebra ->
+        // Join(?x k1 _:b, _:b (k2)* <const>); die rechte Seite hat NUR den
+        // Join-Key als Variable (Semi-Join, new_arity=0). Vorher verschluckte
+        // hash_join das (leerer Bucket) -> 0 Zeilen. Jetzt korrekt.
+        // s -k1-> m -k2-> n1 -k2-> n2.
+        let e = "http://ex/";
+        let mut store = TripleStore::new();
+        store.ingest_str_triples(&[
+            (&format!("{e}s"), &format!("{e}k1"), &format!("{e}m")),
+            (&format!("{e}m"), &format!("{e}k2"), &format!("{e}n1")),
+            (&format!("{e}n1"), &format!("{e}k2"), &format!("{e}n2")),
+        ]);
+        let engine = HybridEngine::new();
+        for target in ["m", "n1", "n2"] {
+            // s erreicht jedes Ziel über k1 dann k2* -> genau {s}.
+            let q = format!("SELECT * WHERE {{ ?x (<{e}k1>/(<{e}k2>)*) <{e}{target}> }}");
+            let r: Value =
+                serde_json::from_str(&execute_sparql(&store, &engine, &q).unwrap()).unwrap();
+            let rows = r["results"]["bindings"].as_array().unwrap();
+            assert_eq!(rows.len(), 1, "Ziel {target}: genau ein ?x");
+            assert_eq!(
+                rows[0]["x"]["value"],
+                format!("{e}s"),
+                "Ziel {target}: ?x=s"
+            );
+        }
+    }
+
+    #[test]
+    fn semijoin_counts_multiple_right_matches() {
+        // Semi-Join muss die Trefferzahl bewahren: zwei Wege a->c über b1/b2.
+        // `?x knows/knows <c>` (gebundenes Objekt) -> a über b1 UND über b2 = 2 Zeilen.
+        let e = "http://ex/";
+        let k = format!("{e}knows");
+        let mut store = TripleStore::new();
+        store.ingest_str_triples(&[
+            (&format!("{e}a"), &k, &format!("{e}b1")),
+            (&format!("{e}a"), &k, &format!("{e}b2")),
+            (&format!("{e}b1"), &k, &format!("{e}c")),
+            (&format!("{e}b2"), &k, &format!("{e}c")),
+        ]);
+        let engine = HybridEngine::new();
+        let q = format!("SELECT * WHERE {{ ?x <{k}>/<{k}> <{e}c> }}");
+        let r: Value = serde_json::from_str(&execute_sparql(&store, &engine, &q).unwrap()).unwrap();
+        let rows = r["results"]["bindings"].as_array().unwrap();
+        assert_eq!(rows.len(), 2, "zwei Pfade a->c (über b1 und b2)");
+        for row in rows {
+            assert_eq!(row["x"]["value"], format!("{e}a"));
+        }
     }
 
     #[test]
