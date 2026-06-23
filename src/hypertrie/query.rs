@@ -12,7 +12,7 @@ use super::stats::CardEstimator;
 /// werden beide geprüft, damit ein altes/fremdes Format einen Fehler liefert,
 /// statt still falsche Daten zu mappen.
 const SNAP_MAGIC: &[u8; 8] = b"TTRSNAP1";
-const SNAP_VERSION: u32 = 4; // v4: mmap-backed Dictionary (Offsets+Blob+sortierte IDs)
+const SNAP_VERSION: u32 = 5; // v5: mmap-Dictionary mit u64-Offsets (>4 GB Blob)
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Var {
@@ -424,8 +424,8 @@ impl TripleStore {
         for a in &arrays {
             buf.extend_from_slice(bytemuck::cast_slice::<u32, u8>(a));
         }
-        while !buf.len().is_multiple_of(4) {
-            buf.push(0); // Dictionary-Sektion 4-Byte-aligned beginnen (mmap-cast)
+        while !buf.len().is_multiple_of(8) {
+            buf.push(0); // Dictionary-Sektion 8-Byte-aligned beginnen (u64-Offsets)
         }
         let dict_off = buf.len() as u64;
         self.dict.serialize_into(&mut buf);

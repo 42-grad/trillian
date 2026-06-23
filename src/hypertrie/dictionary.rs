@@ -186,8 +186,10 @@ struct MappedDict {
 
 impl MappedDict {
     #[inline]
-    fn key_offsets(&self) -> &[u32] {
-        bytemuck::cast_slice(&self.map[self.offs_off..self.offs_off + (self.n + 1) * 4])
+    fn key_offsets(&self) -> &[u64] {
+        // u64: der Blob übersteigt bei Vollskala 4 GB -> u32-Offsets würden
+        // überlaufen (365M Terme × ~20 B ≈ 7 GB).
+        bytemuck::cast_slice(&self.map[self.offs_off..self.offs_off + (self.n + 1) * 8])
     }
     #[inline]
     fn sorted_ids(&self) -> &[u32] {
@@ -360,12 +362,15 @@ impl Dictionary {
     pub fn serialize_into(&self, buf: &mut Vec<u8>) {
         let n = self.len();
         buf.extend_from_slice(&(n as u32).to_le_bytes());
-        // key_offsets (kumulativ, n+1 Einträge)
-        let mut offsets: Vec<u32> = Vec::with_capacity(n + 1);
-        let mut acc = 0u32;
+        while !buf.len().is_multiple_of(8) {
+            buf.push(0); // u64-Offset-Array 8-Byte-aligned beginnen
+        }
+        // key_offsets (kumulativ, n+1 Einträge, u64 wegen >4 GB Blob bei Vollskala)
+        let mut offsets: Vec<u64> = Vec::with_capacity(n + 1);
+        let mut acc = 0u64;
         offsets.push(0);
         for id in 0..n as u32 {
-            acc += self.raw_key(id).map_or(0, |k| k.len() as u32);
+            acc += self.raw_key(id).map_or(0, |k| k.len() as u64);
             offsets.push(acc);
         }
         buf.extend_from_slice(bytemuck::cast_slice(&offsets));
@@ -387,14 +392,15 @@ impl Dictionary {
     }
 
     /// Baut ein **mmap-backed** Dictionary aus dem Snapshot (zero-copy, kein
-    /// owned RAM für die Term-Strings). `dict_off` muss 4-Byte-aligned sein.
+    /// owned RAM für die Term-Strings). `dict_off` muss 8-Byte-aligned sein.
     pub fn from_mapped(map: Arc<Mmap>, dict_off: usize) -> Self {
         let b: &[u8] = &map;
         let n = u32::from_le_bytes(b[dict_off..dict_off + 4].try_into().unwrap()) as usize;
-        let offs_off = dict_off + 4;
-        let keys_off = offs_off + (n + 1) * 4;
-        let keys_len = u32::from_le_bytes(
-            b[offs_off + n * 4..offs_off + n * 4 + 4]
+        // n:u32 + Padding -> u64-Offset-Array beginnt 8-aligned bei dict_off+8.
+        let offs_off = dict_off + 8;
+        let keys_off = offs_off + (n + 1) * 8;
+        let keys_len = u64::from_le_bytes(
+            b[offs_off + n * 8..offs_off + n * 8 + 8]
                 .try_into()
                 .unwrap(),
         ) as usize;
