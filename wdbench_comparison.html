@@ -82,11 +82,12 @@ th{font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:up
   <p class="thesis">On the <b>930 basic-graph-pattern queries</b> — the ones where Trillian returns the
   <b>exact same result counts</b> as every published engine — its median answer is <b>1 ms</b> (single)
   and <b>132 ms</b> (multiple): roughly <b>9× to 70× under</b> the fastest of Blazegraph, Jena, Virtuoso
-  and Neo4j. On property paths and C2RPQs it’s fast but currently under-produces — shown honestly below.</p>
+  and Neo4j. Property paths and C2RPQs — after fixing a result-correctness bug — now match the published
+  result counts on 97% / 82% of comparable queries. And it holds the whole 1.26 B-triple graph in 44 GB RAM.</p>
   <div class="chips">
     <div class="chip"><div class="big acc">1 ms</div><div class="lbl">Single-BGP median latency — best published: 69 ms (Blazegraph)</div></div>
     <div class="chip"><div class="big">100%</div><div class="lbl">BGP result counts matching the published engines (930/930)</div></div>
-    <div class="chip"><div class="big">42 B</div><div class="lbl">per triple on disk — smallest store of the field (49 GiB); RAM-resident, though (≈ 80 GB)</div></div>
+    <div class="chip"><div class="big">44 GB</div><div class="lbl">resident RAM for the whole 1.26 B-triple graph — under the 64 GB the disk-backed engines were given</div></div>
   </div>
 
   <section>
@@ -297,33 +298,35 @@ th{font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:up
 <tr class="cwarn">
   <td class="ccat">Optional</td>
   <td class="cnum">315</td>
-  <td class="cnum">240</td>
+  <td class="cnum">239</td>
   <td class="cpct">76%</td>
-  <td class="cbadge"><span>75 Abw.</span></td>
-  <td class="cnote">teils wir korrekter (kein OPTIONAL-Kreuzprodukt), teils Blank-Node-Diffs</td>
+  <td class="cbadge"><span>76 Abw.</span></td>
+  <td class="cnote">meist wir korrekter (kein OPTIONAL-Kreuzprodukt), Rest Blank-Node-Diffs</td>
 </tr>
-<tr class="cbad">
+<tr class="cwarn">
   <td class="ccat">Property Paths</td>
-  <td class="cnum">454</td>
-  <td class="cnum">358</td>
-  <td class="cpct">79%</td>
-  <td class="cbadge"><span>96 Abw.</span></td>
-  <td class="cnote">Unter-Produktion: liefert teils 0 statt Treffer</td>
+  <td class="cnum">402</td>
+  <td class="cnum">390</td>
+  <td class="cpct">97%</td>
+  <td class="cbadge"><span>12 Abw.</span></td>
+  <td class="cnote">nach Blank-Node-/Semi-Join-Fix: 96 → 12 Abweichungen</td>
 </tr>
-<tr class="cbad">
+<tr class="cwarn">
   <td class="ccat">C2RPQ</td>
-  <td class="cnum">318</td>
-  <td class="cnum">36</td>
-  <td class="cpct">11%</td>
-  <td class="cbadge"><span>282 Abw.</span></td>
-  <td class="cnote">Unter-Produktion: liefert überwiegend 0 statt Treffer</td>
+  <td class="cnum">283</td>
+  <td class="cnum">232</td>
+  <td class="cpct">82%</td>
+  <td class="cbadge"><span>51 Abw.</span></td>
+  <td class="cnote">nach Semi-Join-Fix: 282 → 51 (Rest kleiner Long-Tail, nicht mehr 0)</td>
 </tr>
       </tbody>
     </table>
     <p class="note"><b>BGP is provably correct</b> — 930 queries, zero deviations — so the latency win on
     those classes is real. <b>Optional</b> mostly differs because we don’t cross-product unbound OPTIONALs
-    (we’re arguably more correct there). <b>Paths/C2RPQ under-produce</b> at full scale (return 0 where
-    others find matches) — a known open bug in the path traversal, not yet fixed.</p>
+    (we’re arguably more correct there). <b>Paths and C2RPQ</b> had a systemic “returns 0” bug at full
+    scale (blank-node path endpoints + a semi-join that dropped rows); after fixing both, deviations fell
+    from 96 → 12 on paths (97% match) and 282 → 51 on C2RPQ (82% match). The remaining deviations are a
+    small long tail (off-by-a-few counts, a handful of genuine gaps), not a systemic zero.</p>
   </section>
 
   <section>
@@ -334,13 +337,16 @@ th{font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:up
     <div class="fchips">
       <div class="fc"><div class="v acc">42 B</div><div class="k">Trillian per triple on disk — 49 GiB snapshot, the smallest store of the field</div></div>
       <div class="fc"><div class="v">56–89 B</div><div class="k">published engines per triple on disk (Blaze/Virtuoso 70 GB, Jena 110, Neo4j 112)</div></div>
-      <div class="fc"><div class="v">80 GB</div><div class="k">Trillian resident RAM — the whole graph in memory (≈ 64 B / triple), no paging</div></div>
+      <div class="fc"><div class="v">44 GB</div><div class="k">Trillian resident RAM — the whole graph in memory (≈ 35 B / triple), no paging</div></div>
       <div class="fc"><div class="v">64 GB</div><div class="k">RAM the published engines were given (per the paper), paging a 70–112 GB store</div></div>
-      <div class="fc"><div class="v">34 min</div><div class="k">Trillian ingest + load of all 1.257 B triples</div></div>
+      <div class="fc"><div class="v">28 min</div><div class="k">Trillian ingest + load of all 1.257 B triples</div></div>
     </div>
-    <p class="note" style="margin-top:18px"><b>The honest trade-off.</b> Trillian’s on-disk format is the
-    most compact here (42 B/triple). But its in-memory design wants the whole graph resident — ~80 GB —
-    where the disk-backed engines run in a 64 GB budget and pay with disk I/O (much of their latency gap).
+    <p class="note" style="margin-top:18px"><b>The trade-off, after the RAM work.</b> Trillian’s on-disk
+    format is the most compact here (42 B/triple), and resident RAM is now <b>44 GB</b> (35 B/triple, down
+    from 80 GB / 64 B before three dictionary/index quick wins) — it holds the entire graph in memory in
+    <b>less RAM than the 64 GB the disk-backed engines were given</b> to page a 70–112 GB store. The
+    in-memory design no longer costs more RAM than the field; it just keeps everything resident rather
+    than paging from disk.
     The snapshot is a zero-copy mmap, so under RAM pressure the OS can evict cold index pages and Trillian
     still serves from a smaller resident set — at the cost of paging on cold queries. RAM efficiency, not
     speed, is the axis where the in-memory design costs more: three full permutations (SPO/POS/OSP) plus an
