@@ -1,7 +1,6 @@
 /target
 *.nt
 *.bin
-/third_party
 __pycache__/
 *.pyc
 .claude/

@@ -8,7 +8,6 @@
     rsync_opts:
       - "--exclude=.git"
       - "--exclude=target"
-      - "--exclude=third_party"
       - "--exclude=*.nt"
       - "--exclude=*.bin"
       - "--exclude=wdbench_data"
