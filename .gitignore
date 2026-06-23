@@ -5,6 +5,10 @@
 __pycache__/
 *.pyc
 .claude/
+# Editor / OS junk
+.DS_Store
+*.swp
+*.swo
 chain_query.sparql
 triangle_query.sparql
 duel_output.log
