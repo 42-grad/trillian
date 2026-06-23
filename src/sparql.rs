@@ -27,10 +27,10 @@ const DEFAULT_CACHE_SIZE: usize = 256;
 pub struct AppState {
     pub store: RwLock<TripleStore>,
     pub engine: HybridEngine,
-    /// Query-String -> fertig serialisierter JSON-Antwort-Body.
+    /// Query string -> fully serialized JSON response body.
     pub cache: Mutex<LruCache<String, String>>,
-    /// Optionales Write-Ahead-Log. Ist es gesetzt, werden Updates durabel
-    /// (append + fsync) protokolliert, sodass sie einen Neustart überleben.
+    /// Optional write-ahead log. If set, updates are logged durably
+    /// (append + fsync) so they survive a restart.
     pub wal: Option<Mutex<crate::wal::Wal>>,
 }
 
@@ -57,12 +57,12 @@ impl AppState {
     }
 }
 
-/// Start the SPARQL HTTP endpoint on the given port (ohne Durabilität).
+/// Start the SPARQL HTTP endpoint on the given port (without durability).
 pub async fn serve(store: TripleStore, port: u16) {
     serve_durable(store, port, None).await
 }
 
-/// Wie [`serve`], aber mit optionalem Write-Ahead-Log für durable Updates.
+/// Like [`serve`], but with an optional write-ahead log for durable updates.
 pub async fn serve_durable(store: TripleStore, port: u16, wal: Option<crate::wal::Wal>) {
     let state = Arc::new(AppState::with_wal(store, wal));
 
@@ -76,14 +76,14 @@ pub async fn serve_durable(store: TripleStore, port: u16, wal: Option<crate::wal
     let addr = format!("0.0.0.0:{}", port);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
-        .unwrap_or_else(|e| panic!("konnte nicht an {addr} binden: {e}"));
+        .unwrap_or_else(|e| panic!("could not bind to {addr}: {e}"));
     println!(
         "SPARQL endpoint listening on http://{}/sparql, /stream, /count, /update",
         addr
     );
     axum::serve(listener, app)
         .await
-        .expect("HTTP-Server unerwartet beendet");
+        .expect("HTTP server terminated unexpectedly");
 }
 
 #[derive(serde::Deserialize, Debug, Default)]
@@ -109,7 +109,7 @@ pub async fn sparql_handler(
         );
     }
 
-    // Cache-Lookup (fertiger JSON-Body).
+    // Cache lookup (finished JSON body).
     {
         if let Ok(cache) = state.cache.lock()
             && let Some(body) = cache.peek(&query_str)
@@ -143,8 +143,8 @@ pub async fn stream_handler(
         );
     }
 
-    // Stream materialisiert die Ergebnisse intern, sendet sie aber als NDJSON
-    // chunked, bevor der Gesamt-JSON-Body aufgebaut wird.
+    // The stream materializes the results internally, but sends them chunked as
+    // NDJSON before the full JSON body is built.
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::convert::Infallible>>(128);
     let state = Arc::clone(&state);
 
@@ -161,7 +161,7 @@ pub async fn stream_handler(
                     var_indices.push(pos);
                 }
 
-                // Header-Zeile mit Variablennamen als NDJSON-Objekt.
+                // Header line with the variable names as an NDJSON object.
                 let header = json!({ "head": { "vars": vars } }).to_string();
                 let _ = tx.blocking_send(Ok(Bytes::from(header + "\n")));
 
@@ -236,14 +236,14 @@ pub async fn update_handler(
     }
 
     let mut store = state.store.write().unwrap_or_else(|e| e.into_inner());
-    // WAL für die Dauer des Updates sperren (durabel protokollieren).
+    // Lock the WAL for the duration of the update (log durably).
     let mut wal_guard = state
         .wal
         .as_ref()
         .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
     match execute_update(&mut store, &update_str, wal_guard.as_deref_mut()) {
         Ok(()) => {
-            // Write-Ahead-Log auf Platte zwingen, BEVOR wir Erfolg melden.
+            // Force the write-ahead log to disk BEFORE we report success.
             if let Some(w) = wal_guard.as_deref_mut()
                 && let Err(e) = w.sync()
             {
@@ -273,7 +273,7 @@ fn sparql_error(msg: &str, status: StatusCode) -> Response {
     (status, axum::Json(body)).into_response()
 }
 
-/// Baut die HTTP-Antwort aus einem bereits serialisierten JSON-Body.
+/// Builds the HTTP response from an already-serialized JSON body.
 fn json_response(body: String) -> Response {
     (
         StatusCode::OK,
@@ -296,9 +296,9 @@ struct SelectResult {
     var_order: Vec<String>,
 }
 
-/// Profiling: führt eine SELECT-Query `runs`-mal aus und gibt die Median-Zeiten
-/// der Phasen Parse / Eval (Plan+Join) / Serialize (SPARQL-JSON) aus. Trennt so,
-/// wo die Zeit großer Queries hingeht.
+/// Profiling: runs a SELECT query `runs` times and reports the median times of
+/// the parse / eval (plan+join) / serialize (SPARQL-JSON) phases. This separates
+/// where the time of large queries goes.
 pub fn profile_query(store: &TripleStore, engine: &HybridEngine, query_str: &str, runs: usize) {
     use std::time::Instant;
     let (mut parse, mut eval, mut ser) = (Vec::new(), Vec::new(), Vec::new());
@@ -308,7 +308,7 @@ pub fn profile_query(store: &TripleStore, engine: &HybridEngine, query_str: &str
         let query = SparqlParser::new().parse_query(query_str).expect("parse");
         parse.push(t.elapsed().as_secs_f64() * 1000.0);
         let SparqlQuery::Select { pattern, .. } = query else {
-            eprintln!("profile_query: nur SELECT");
+            eprintln!("profile_query: SELECT only");
             return;
         };
         let m = peel_modifiers(&pattern);
@@ -325,11 +325,11 @@ pub fn profile_query(store: &TripleStore, engine: &HybridEngine, query_str: &str
         v[v.len() / 2]
     };
     let (p, e, s) = (med(parse), med(eval), med(ser));
-    println!("=== Profil ({} runs, {} rows) ===", runs, rows);
+    println!("=== Profile ({} runs, {} rows) ===", runs, rows);
     println!("  parse:     {:.3} ms", p);
-    println!("  eval:      {:.3} ms  (Plan + Join + Materialisierung)", e);
+    println!("  eval:      {:.3} ms  (plan + join + materialization)", e);
     println!("  serialize: {:.3} ms  (SPARQL-JSON)", s);
-    println!("  gesamt:    {:.3} ms", p + e + s);
+    println!("  total:     {:.3} ms", p + e + s);
 }
 
 fn evaluate_select(
@@ -365,7 +365,7 @@ fn execute_sparql(
             Ok(write_sparql_json(&result, store))
         }
         SparqlQuery::Ask { pattern, .. } => {
-            // ASK über den vollen WHERE-Pfad (inkl. OPTIONAL/FILTER/UNION) -> ≥1 Lösung?
+            // ASK over the full WHERE path (incl. OPTIONAL/FILTER/UNION) -> ≥1 solution?
             let m = peel_modifiers(&pattern);
             let result = evaluate_select_with_modifiers(store, engine, &m)?;
             Ok(format!(
@@ -377,18 +377,18 @@ fn execute_sparql(
     }
 }
 
-/// SELECT-Modifier (peeled von der Algebra), plus das innere WHERE-Pattern.
+/// SELECT modifiers (peeled off the algebra), plus the inner WHERE pattern.
 struct Modifiers<'a> {
     where_pat: &'a spargebra::algebra::GraphPattern,
     projection: Option<Vec<String>>,
     distinct: bool,
-    order_by: Vec<(&'a Expression, bool)>, // (Ausdruck, absteigend?)
+    order_by: Vec<(&'a Expression, bool)>, // (expression, descending?)
     limit: Option<usize>,
     offset: Option<usize>,
 }
 
-/// Schält Project/Distinct/Reduced/Slice/OrderBy von der Algebra ab und liefert
-/// das innere WHERE-Pattern (Bgp/Filter/LeftJoin/Join/Union) + die Modifier.
+/// Peels Project/Distinct/Reduced/Slice/OrderBy off the algebra and returns the
+/// inner WHERE pattern (Bgp/Filter/LeftJoin/Join/Union) + the modifiers.
 fn peel_modifiers(pattern: &spargebra::algebra::GraphPattern) -> Modifiers<'_> {
     use spargebra::algebra::{GraphPattern as GP, OrderExpression};
     let mut projection = None;
@@ -438,8 +438,8 @@ fn peel_modifiers(pattern: &spargebra::algebra::GraphPattern) -> Modifiers<'_> {
     }
 }
 
-/// Wertet ein WHERE-Pattern rekursiv aus: BGP, FILTER, OPTIONAL (LeftJoin),
-/// Join, UNION. Liefert (Zeilen, Variablen-Reihenfolge).
+/// Recursively evaluates a WHERE pattern: BGP, FILTER, OPTIONAL (LeftJoin),
+/// Join, UNION. Returns (rows, variable order).
 fn eval_where(
     gp: &spargebra::algebra::GraphPattern,
     store: &TripleStore,
@@ -447,9 +447,9 @@ fn eval_where(
     limit: Option<usize>,
 ) -> Result<(RowBlock, Vec<String>), String> {
     use spargebra::algebra::GraphPattern as GP;
-    // `limit` darf NUR in ein direktes BGP gepusht werden. Über Join/LeftJoin/
-    // Union/Filter/Path hinweg ist Früh-Terminierung der Teilbäume nicht
-    // ergebnis-erhaltend -> Kinder erhalten None, das Limit wirkt post-hoc.
+    // `limit` may ONLY be pushed into a direct BGP. Across Join/LeftJoin/
+    // Union/Filter/Path, early termination of the subtrees is not
+    // result-preserving -> children get None, the limit applies post hoc.
     match gp {
         GP::Bgp { patterns } => eval_bgp(patterns, store, engine, limit),
         GP::Filter { expr, inner } => {
@@ -492,13 +492,13 @@ fn eval_where(
 // Property Paths (SPARQL 1.1): /, ^, |, *, +, ?, !{…}
 // ---------------------------------------------------------------------------
 //
-// Evaluierung als gerichtete Mengen-Propagation: ausgehend von einer bekannten
-// Knotenmenge liefert `step_forward`/`step_backward` die über den Pfad
-// erreichbaren Knoten. `*`/`+` sind transitive Hüllen (BFS bis Fixpunkt).
-// Bei genau einem gebundenen Endpunkt ist das effizient (Closure nur vom
-// gebundenen Knoten aus); bei zwei Variablen wird über alle Startknoten
-// aufgezählt (korrekt, aber potenziell teuer – für `*` mit beiden Variablen
-// die degenerierte Identitätsmenge über alle Knoten).
+// Evaluated as directed set propagation: starting from a known node set,
+// `step_forward`/`step_backward` return the nodes reachable over the path.
+// `*`/`+` are transitive closures (BFS to fixpoint). With exactly one bound
+// endpoint this is efficient (closure only from the bound node); with two
+// variables it enumerates over all start nodes (correct, but potentially
+// expensive – for `*` with both variables the degenerate identity set over all
+// nodes).
 
 use rustc_hash::FxHashSet;
 
@@ -516,18 +516,18 @@ fn resolve_path_end(tp: &spargebra::term::TermPattern, dict: &Dictionary) -> Opt
         spargebra::term::TermPattern::Literal(lit) => dict
             .lookup_term(lit.value(), &literal_term_type(lit))
             .map(PathEnd::Bound),
-        // Blank Node = nicht-distinguierte Variable. spargebra zerlegt
-        // Sequenz-Pfade mit Closure (`p1/(p2)*`) in einen Join über einen
-        // Blank-Node-Knoten (`<s> p1 _:b . _:b (p2)* ?x`); ohne diese
-        // Behandlung lieferte eval_path hier fälschlich 0 (WDBench paths-Bug).
-        // Stabiler interner Name wie in translate_term_pattern.
+        // Blank node = non-distinguished variable. spargebra decomposes
+        // sequence paths with a closure (`p1/(p2)*`) into a join over a
+        // blank-node node (`<s> p1 _:b . _:b (p2)* ?x`); without this handling
+        // eval_path would wrongly return 0 here (WDBench paths bug).
+        // Stable internal name as in translate_term_pattern.
         spargebra::term::TermPattern::BlankNode(bn) => {
             Some(PathEnd::Var(format!("__bn_{}", bn.as_str())))
         }
     }
 }
 
-/// Über `path` von `from` aus erreichbare Knoten (vorwärts).
+/// Nodes reachable over `path` from `from` (forward).
 fn step_forward(store: &TripleStore, path: &Ppe, from: &FxHashSet<u32>) -> FxHashSet<u32> {
     let mut out = FxHashSet::default();
     match path {
@@ -571,7 +571,7 @@ fn step_forward(store: &TripleStore, path: &Ppe, from: &FxHashSet<u32>) -> FxHas
     out
 }
 
-/// Über `path` zu `from` führende Knoten (rückwärts).
+/// Nodes leading to `from` over `path` (backward).
 fn step_backward(store: &TripleStore, path: &Ppe, from: &FxHashSet<u32>) -> FxHashSet<u32> {
     let mut out = FxHashSet::default();
     match path {
@@ -584,7 +584,7 @@ fn step_backward(store: &TripleStore, path: &Ppe, from: &FxHashSet<u32>) -> FxHa
         }
         Ppe::Reverse(e) => return step_forward(store, e, from),
         Ppe::Sequence(a, b) => {
-            // rückwärts: erst b^-1, dann a^-1
+            // backward: first b^-1, then a^-1
             let mid = step_backward(store, b, from);
             return step_backward(store, a, &mid);
         }
@@ -615,8 +615,8 @@ fn step_backward(store: &TripleStore, path: &Ppe, from: &FxHashSet<u32>) -> FxHa
     out
 }
 
-/// Transitive Hülle (BFS bis Fixpunkt). `reflexive` schließt die Startmenge
-/// ein (`*` vs `+`). `forward` wählt die Richtung.
+/// Transitive closure (BFS to fixpoint). `reflexive` includes the start set
+/// (`*` vs `+`). `forward` selects the direction.
 fn closure(
     store: &TripleStore,
     e: &Ppe,
@@ -657,7 +657,7 @@ fn eval_path(
     let s_end = resolve_path_end(subject, &store.dict);
     let o_end = resolve_path_end(object, &store.dict);
 
-    // Variablenname (inkl. Blank Node als __bn_) für Ergebnis-Spalten/Join.
+    // Variable name (incl. blank node as __bn_) for result columns/join.
     let var_name = |tp: &spargebra::term::TermPattern| -> Option<String> {
         match tp {
             spargebra::term::TermPattern::Variable(v) => Some(v.as_str().to_string()),
@@ -668,7 +668,7 @@ fn eval_path(
     let s_var = var_name(subject);
     let o_var = var_name(object);
 
-    // Unbekannte Konstante auf einer Seite -> leere Lösung (mit Variablenspalten).
+    // Unknown constant on one side -> empty solution (with variable columns).
     if (s_var.is_none() && s_end.is_none()) || (o_var.is_none() && o_end.is_none()) {
         let mut vo = Vec::new();
         if let Some(v) = &s_var {
@@ -684,7 +684,7 @@ fn eval_path(
 
     let cap = max_result_rows();
     match (s_end, o_end) {
-        // Subjekt gebunden, Objekt Variable: Vorwärts-Closure.
+        // Subject bound, object variable: forward closure.
         (Some(PathEnd::Bound(s)), Some(PathEnd::Var(ov))) => {
             let mut from = FxHashSet::default();
             from.insert(s);
@@ -698,7 +698,7 @@ fn eval_path(
             }
             Ok((rows, vec![ov]))
         }
-        // Objekt gebunden, Subjekt Variable: Rückwärts-Closure.
+        // Object bound, subject variable: backward closure.
         (Some(PathEnd::Var(sv)), Some(PathEnd::Bound(o))) => {
             let mut from = FxHashSet::default();
             from.insert(o);
@@ -712,7 +712,7 @@ fn eval_path(
             }
             Ok((rows, vec![sv]))
         }
-        // Beide gebunden: Existenzprüfung (0 Variablen, 1 leere Zeile bei Treffer).
+        // Both bound: existence check (0 variables, 1 empty row on a hit).
         (Some(PathEnd::Bound(s)), Some(PathEnd::Bound(o))) => {
             let mut from = FxHashSet::default();
             from.insert(s);
@@ -723,11 +723,11 @@ fn eval_path(
             }
             Ok((rows, Vec::new()))
         }
-        // Beide Variablen: über alle Startknoten aufzählen.
+        // Both variables: enumerate over all start nodes.
         (Some(PathEnd::Var(sv)), Some(PathEnd::Var(ov))) => {
             let same = sv == ov;
-            // Startkandidaten: distinkte Subjekte; für reflexive Pfade zusätzlich
-            // Objekte (Identität (x,x) gilt für jeden Knoten).
+            // Start candidates: distinct subjects; for reflexive paths also
+            // objects (identity (x,x) holds for every node).
             let needs_all_nodes = path_is_reflexive(path);
             let mut starts = store.distinct_subjects();
             if needs_all_nodes {
@@ -756,12 +756,12 @@ fn eval_path(
             }
             Ok((rows, rows_vars))
         }
-        // unreachable: None-Fälle oben behandelt
+        // unreachable: None cases handled above
         _ => Ok((RowBlock::new(0), Vec::new())),
     }
 }
 
-/// Ob ein Pfad die leere (reflexive) Sequenz enthält (`*` oder `?` an der Wurzel).
+/// Whether a path contains the empty (reflexive) sequence (`*` or `?` at the root).
 fn path_is_reflexive(path: &Ppe) -> bool {
     matches!(path, Ppe::ZeroOrMore(_) | Ppe::ZeroOrOne(_))
 }
@@ -778,16 +778,16 @@ fn eval_bgp(
             Ok((engine.execute_limited(store, &internal, limit)?, vo))
         }
         None => {
-            // Unbekannte Konstante -> leere Lösung mit den Pattern-Variablen.
+            // Unknown constant -> empty solution with the pattern variables.
             let vo = variables_in_bgp(patterns);
             Ok((RowBlock::new(vo.len()), vo))
         }
     }
 }
 
-/// Hash-Join zweier Ergebnis-Blöcke auf den gemeinsamen Variablen.
-/// `left_outer = true` behält linke Zeilen ohne Match (NULL-aufgefüllt).
-/// Fehlermeldung bei Cap-Überschreitung in einem eval_where-Operator.
+/// Hash join of two result blocks on the shared variables.
+/// `left_outer = true` keeps left rows without a match (NULL-padded).
+/// Error message when the cap is exceeded in an eval_where operator.
 fn op_too_large() -> String {
     format!(
         "result exceeds {} rows (join/union/path materialization); \
@@ -819,12 +819,12 @@ fn hash_join(
     new_var_order.extend(new_vars.iter().cloned());
     let new_arity = new_vars.len();
 
-    // Rechte Seite nach Join-Schlüssel indizieren: (Anzahl Treffer, neue Spalten
-    // flach). Die Trefferzahl wird separat geführt, weil bei `new_arity == 0`
-    // (Semi-Join: alle rechten Variablen sind Join-Keys) sonst nicht zwischen
-    // "Key fehlt" und "Key trifft, aber 0 neue Spalten" unterschieden werden
-    // kann – das verschluckte zuvor alle solchen Joins (z. B. c2rpq-Pfade mit
-    // gebundenem Objekt -> Join über den Blank-Node-Knoten).
+    // Index the right side by join key: (number of hits, new columns flat).
+    // The hit count is tracked separately because for `new_arity == 0`
+    // (semi-join: all right variables are join keys) it would otherwise be
+    // impossible to distinguish "key missing" from "key hits, but 0 new
+    // columns" – which previously swallowed all such joins (e.g. c2rpq paths
+    // with a bound object -> join over the blank-node node).
     let mut index: rustc_hash::FxHashMap<Vec<u32>, (usize, Vec<u32>)> =
         rustc_hash::FxHashMap::default();
     for rrow in right.rows() {
@@ -842,7 +842,7 @@ fn hash_join(
         match index.get(&key) {
             Some(&(count, ref flat)) => {
                 if new_arity == 0 {
-                    // Match ohne neue Spalten -> eine Zeile je rechtem Treffer.
+                    // Match with no new columns -> one row per right hit.
                     for _ in 0..count {
                         out.push_row_padded(row, NULL_ID);
                     }
@@ -865,7 +865,7 @@ fn hash_join(
     Ok((out, new_var_order))
 }
 
-/// UNION zweier Ergebnis-Blöcke: gemeinsame Variablenmenge, fehlende -> NULL.
+/// UNION of two result blocks: combined variable set, missing ones -> NULL.
 fn union_rows(
     left: RowBlock,
     lvo: &[String],
@@ -879,7 +879,7 @@ fn union_rows(
             vo.push(v.clone());
         }
     }
-    // Spaltenabbildung Quelle -> Ziel.
+    // Column mapping source -> target.
     let map_cols = |src_vo: &[String]| -> Vec<Option<usize>> {
         vo.iter()
             .map(|v| src_vo.iter().position(|x| x == v))
@@ -906,7 +906,7 @@ fn union_rows(
     Ok((out, vo))
 }
 
-/// Sortier-Schlüssel für ORDER BY (SPARQL-nahe Gesamtordnung).
+/// Sort key for ORDER BY (SPARQL-like total ordering).
 #[derive(PartialEq)]
 enum OrderKey {
     Unbound,
@@ -983,9 +983,9 @@ fn evaluate_select_with_modifiers(
     engine: &HybridEngine,
     m: &Modifiers,
 ) -> Result<SelectResult, String> {
-    // LIMIT-Pushdown nur, wenn ergebnis-erhaltend: kein ORDER BY (braucht volle
-    // Sortierung) und kein DISTINCT (braucht ggf. mehr Rohzeilen für N distinkte).
-    // Dann reichen offset+limit Zeilen; apply_offset_limit schneidet exakt zu.
+    // LIMIT pushdown only if result-preserving: no ORDER BY (needs the full
+    // sort) and no DISTINCT (may need more raw rows for N distinct ones). Then
+    // offset+limit rows suffice; apply_offset_limit trims exactly.
     let pushdown = if m.order_by.is_empty() && !m.distinct {
         m.limit.map(|l| l.saturating_add(m.offset.unwrap_or(0)))
     } else {
@@ -993,13 +993,13 @@ fn evaluate_select_with_modifiers(
     };
     let (mut rows, var_order) = eval_where(m.where_pat, store, engine, pushdown)?;
 
-    // ORDER BY (auf den vollen Bindings, vor der Projektion).
+    // ORDER BY (on the full bindings, before projection).
     if !m.order_by.is_empty() {
         sort_rows(&mut rows, &var_order, &m.order_by, store);
     }
 
-    // SELECT * : alle Variablen außer internen Blank-Node-Platzhaltern (__bn_),
-    // die nur aus expandierten Sequenz-Pfaden stammen und nicht ausgegeben werden.
+    // SELECT * : all variables except internal blank-node placeholders (__bn_),
+    // which only come from expanded sequence paths and are not output.
     let vars = m.projection.clone().unwrap_or_else(|| {
         var_order
             .iter()
@@ -1027,7 +1027,7 @@ fn evaluate_select_with_modifiers(
         if m.order_by.is_empty() {
             rows.sort_distinct();
         } else {
-            rows.dedup_preserving_order(); // Sortierung der ORDER BY beibehalten
+            rows.dedup_preserving_order(); // keep the ORDER BY ordering
         }
     }
     rows.apply_offset_limit(m.offset.unwrap_or(0), m.limit);
@@ -1076,7 +1076,7 @@ fn term_pattern_variables(tp: &spargebra::term::TermPattern) -> Vec<String> {
     }
 }
 
-/// Hängt einen JSON-String-Literal (mit Escaping) an den Puffer an.
+/// Appends a JSON string literal (with escaping) to the buffer.
 fn append_json_str(out: &mut String, s: &str) {
     out.push('"');
     for c in s.chars() {
@@ -1093,7 +1093,7 @@ fn append_json_str(out: &mut String, s: &str) {
     out.push('"');
 }
 
-/// Hängt das SPARQL-JSON-Term-Objekt für eine ID an (uri/literal+datatype/lang).
+/// Appends the SPARQL-JSON term object for an ID (uri/literal+datatype/lang).
 fn append_term(out: &mut String, id: u32, dict: &Dictionary) {
     match (dict.resolve(id), dict.resolve_type(id)) {
         (Some(v), Some(TermType::Iri)) => {
@@ -1132,8 +1132,8 @@ fn append_term(out: &mut String, id: u32, dict: &Dictionary) {
     }
 }
 
-/// Serialisiert das Ergebnis **direkt als JSON-String** – ohne pro Zeile eine
-/// `serde_json::Map`/`Value` zu allokieren (das war ~95 % der Zeit großer Queries).
+/// Serializes the result **directly as a JSON string** – without allocating a
+/// `serde_json::Map`/`Value` per row (that was ~95% of the time of large queries).
 fn write_sparql_json(result: &SelectResult, store: &TripleStore) -> String {
     let mut var_indices = Vec::with_capacity(result.vars.len());
     for var in &result.vars {
@@ -1165,7 +1165,7 @@ fn write_sparql_json(result: &SelectResult, store: &TripleStore) -> String {
         for (i, var) in result.vars.iter().enumerate() {
             let id = row[var_indices[i]];
             if id == NULL_ID {
-                continue; // ungebundene (OPTIONAL-)Variable: weglassen
+                continue; // unbound (OPTIONAL) variable: omit
             }
             if !first_cell {
                 out.push(',');
@@ -1218,8 +1218,8 @@ fn execute_update(
         .parse_update(update_str)
         .map_err(|e| e.to_string())?;
 
-    // Alle Inserts/Deletes sammeln und am Ende in einem einzigen
-    // Index-Rebuild anwenden; parallel ins WAL protokollieren.
+    // Collect all inserts/deletes and apply them at the end in a single index
+    // rebuild; log them to the WAL in parallel.
     let mut inserts: Vec<(u32, u32, u32)> = Vec::new();
     let mut deletes: Vec<(u32, u32, u32)> = Vec::new();
 
@@ -1260,8 +1260,8 @@ fn execute_update(
     Ok(())
 }
 
-/// Fügt einen Term ins Dictionary ein und protokolliert ihn im WAL, falls er
-/// neu war (damit der Replay dieselben IDs vergibt).
+/// Inserts a term into the dictionary and logs it to the WAL if it was new
+/// (so the replay assigns the same IDs).
 fn insert_term_logged(
     store: &mut TripleStore,
     t: &ParsedTermRdf,
@@ -1331,7 +1331,7 @@ fn ground_term_to_parsed(term: &GroundTerm) -> Result<ParsedTermRdf, String> {
     }
 }
 
-/// Term-Typ eines geparsten SPARQL-Literals (für Dictionary-Lookup/-Insert).
+/// Term type of a parsed SPARQL literal (for dictionary lookup/insert).
 fn literal_term_type(lit: &Literal) -> TermType {
     if let Some(lang) = lit.language() {
         TermType::literal_lang(lang)
@@ -1357,16 +1357,16 @@ fn literal_to_parsed(lit: &Literal) -> ParsedTermRdf {
 
 const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
 
-/// Laufzeit-Wert eines FILTER-Ausdrucks.
+/// Runtime value of a FILTER expression.
 #[derive(Debug, Clone)]
 enum Fv {
     Iri(String),
-    Blank(String), // Blank-Node-Label (isBlank != isIri)
-    Str(String),   // einfaches Literal / xsd:string
-    Num(f64),      // numerischer Datentyp
+    Blank(String), // blank-node label (isBlank != isIri)
+    Str(String),   // plain literal / xsd:string
+    Num(f64),      // numeric datatype
     Bool(bool),
-    Lang(String, String),  // (Lexikal, Sprach-Tag)
-    Typed(String, String), // (Lexikal, Datatype-IRI) – nicht numerisch/string
+    Lang(String, String),  // (lexical, language tag)
+    Typed(String, String), // (lexical, datatype IRI) – not numeric/string
 }
 
 fn is_numeric_dt(dt: &str) -> bool {
@@ -1424,7 +1424,7 @@ fn literal_to_fv(lit: &Literal) -> Fv {
     classify(lit.value(), Some(lit.datatype().as_str()), lit.language())
 }
 
-/// Numerischer Wert, falls der Ausdruck einen liefert.
+/// Numeric value, if the expression yields one.
 fn as_num(fv: &Fv) -> Option<f64> {
     match fv {
         Fv::Num(n) => Some(*n),
@@ -1433,7 +1433,7 @@ fn as_num(fv: &Fv) -> Option<f64> {
     }
 }
 
-/// Lexikalischer Vergleichs-String (für =/< auf Strings).
+/// Lexical comparison string (for =/< on strings).
 fn as_str(fv: &Fv) -> Option<&str> {
     match fv {
         Fv::Str(s) | Fv::Lang(s, _) | Fv::Typed(s, _) => Some(s),
@@ -1453,7 +1453,7 @@ fn fv_equal(a: &Fv, b: &Fv) -> Option<bool> {
         (Fv::Str(x), Fv::Str(y)) => Some(x == y),
         (Fv::Lang(x, lx), Fv::Lang(y, ly)) => Some(x == y && lx == ly),
         (Fv::Typed(x, dx), Fv::Typed(y, dy)) => Some(x == y && dx == dy),
-        _ => None, // unvergleichbar -> Fehler
+        _ => None, // incomparable -> error
     }
 }
 
@@ -1464,11 +1464,11 @@ fn fv_cmp(a: &Fv, b: &Fv) -> Option<std::cmp::Ordering> {
     match (a, b) {
         (Fv::Str(x), Fv::Str(y)) => Some(x.cmp(y)),
         (Fv::Lang(x, _), Fv::Lang(y, _)) => Some(x.cmp(y)),
-        // SPARQL erlaubt Ordnungsvergleiche auf IRIs und (gleich-typisierten) Literalen.
+        // SPARQL allows ordering comparisons on IRIs and (same-typed) literals.
         (Fv::Iri(x), Fv::Iri(y)) => Some(x.cmp(y)),
         (Fv::Blank(x), Fv::Blank(y)) => Some(x.cmp(y)),
         (Fv::Bool(x), Fv::Bool(y)) => Some(x.cmp(y)),
-        // Gleicher Datentyp -> lexikalischer Vergleich; verschiedene -> unvergleichbar.
+        // Same datatype -> lexical comparison; different -> incomparable.
         (Fv::Typed(x, dx), Fv::Typed(y, dy)) if dx == dy => Some(x.cmp(y)),
         _ => None,
     }
@@ -1533,7 +1533,7 @@ fn eval(expr: &Expression, row: &[u32], vars: &[String], store: &TripleStore) ->
         Expression::Divide(a, b) => {
             let x = as_num(&eval(a, row, vars, store)?).ok_or(())?;
             let y = as_num(&eval(b, row, vars, store)?).ok_or(())?;
-            // SPARQL 1.1: Division durch Null ist ein Fehler -> Zeile fällt raus.
+            // SPARQL 1.1: division by zero is an error -> the row is dropped.
             if y == 0.0 {
                 return Err(());
             }
@@ -1564,7 +1564,7 @@ fn eval(expr: &Expression, row: &[u32], vars: &[String], store: &TripleStore) ->
             }
         }
         Expression::FunctionCall(func, args) => eval_func(func, args, row, vars, store),
-        _ => Err(()), // nicht unterstützt -> Fehler (Zeile fällt raus)
+        _ => Err(()), // unsupported -> error (row is dropped)
     }
 }
 
@@ -1617,7 +1617,7 @@ fn eval_func(
             Fv::Str(_) => format!("{XSD}string"),
             Fv::Lang(..) => "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString".to_string(),
             Fv::Typed(_, dt) => dt,
-            Fv::Iri(_) | Fv::Blank(_) => return Err(()), // datatype() nur für Literale
+            Fv::Iri(_) | Fv::Blank(_) => return Err(()), // datatype() only for literals
         })),
         Function::StrLen => Ok(Fv::Num(as_str(&arg(0)?).ok_or(())?.chars().count() as f64)),
         Function::UCase => Ok(Fv::Str(as_str(&arg(0)?).ok_or(())?.to_uppercase())),
@@ -1645,7 +1645,7 @@ fn format_num(n: f64) -> String {
     }
 }
 
-/// Effective Boolean Value eines Ausdrucks.
+/// Effective boolean value of an expression.
 fn ebv(expr: &Expression, row: &[u32], vars: &[String], store: &TripleStore) -> Result<bool, ()> {
     match eval(expr, row, vars, store)? {
         Fv::Bool(b) => Ok(b),
@@ -1655,7 +1655,7 @@ fn ebv(expr: &Expression, row: &[u32], vars: &[String], store: &TripleStore) -> 
     }
 }
 
-/// Behält eine Zeile, wenn **alle** FILTER-Ausdrücke EBV true ergeben.
+/// Keeps a row if **all** FILTER expressions evaluate to EBV true.
 fn row_passes(filters: &[&Expression], row: &[u32], vars: &[String], store: &TripleStore) -> bool {
     filters.iter().all(|f| ebv(f, row, vars, store) == Ok(true))
 }
@@ -1724,17 +1724,17 @@ fn translate_term_pattern(
             PatternTerm::Variable(v.as_str().to_string()),
         )),
         spargebra::term::TermPattern::Literal(lit) => {
-            // Lexikalwert **und** Datentyp/Sprach-Tag müssen passen: "25"^^xsd:integer
-            // darf nicht "25"^^xsd:string oder den IRI 25 treffen.
+            // Lexical value **and** datatype/language tag must match:
+            // "25"^^xsd:integer must not match "25"^^xsd:string or the IRI 25.
             match dict.lookup_term(lit.value(), &literal_term_type(lit)) {
                 Some(id) => Ok(TranslationResult::Term(PatternTerm::Bound(id))),
                 None => Ok(TranslationResult::UnknownConstant),
             }
         }
-        // Blank Nodes in Query-Mustern wirken wie nicht-distinguierte Variablen
-        // (und sind genau das, was spargebra für expandierte Sequenz-Pfade
-        // `p1/p2` als Zwischenknoten einsetzt). Mit stabilem internen Namen
-        // mappen, sodass dasselbe `_:b` über mehrere Tripel hinweg joint.
+        // Blank nodes in query patterns act like non-distinguished variables
+        // (and are exactly what spargebra inserts as the intermediate node for
+        // expanded sequence paths `p1/p2`). Map with a stable internal name so
+        // the same `_:b` joins across multiple triples.
         spargebra::term::TermPattern::BlankNode(bn) => Ok(TranslationResult::Term(
             PatternTerm::Variable(format!("__bn_{}", bn.as_str())),
         )),
@@ -1809,8 +1809,8 @@ mod tests {
 
     const XSD_INT: &str = "http://www.w3.org/2001/XMLSchema#integer";
 
-    /// BGP-Lookup eines Literals muss den Datentyp respektieren: `"25"`
-    /// (= xsd:string) darf nicht das gleichnamige xsd:integer-Literal treffen.
+    /// A BGP lookup of a literal must respect the datatype: `"25"`
+    /// (= xsd:string) must not match the same-named xsd:integer literal.
     #[test]
     fn bgp_literal_lookup_respects_datatype() {
         let mut store = TripleStore::new();
@@ -1827,14 +1827,11 @@ mod tests {
             .dict
             .insert_with_type("25", TermType::literal_datatype(XSD_INT));
         let o_str = store.dict.insert_with_type("25", TermType::literal_plain());
-        assert_ne!(
-            o_int, o_str,
-            "typisierte Literale müssen verschiedene IDs haben"
-        );
+        assert_ne!(o_int, o_str, "typed literals must have different IDs");
         store.insert_triple(s_int, p, o_int);
         store.insert_triple(s_str, p, o_str);
 
-        // "25" ohne Typ -> xsd:string -> nur sStr.
+        // "25" without a type -> xsd:string -> only sStr.
         let rows = rows_of(
             &store,
             "SELECT ?s WHERE { ?s <http://example.org/p> \"25\" }",
@@ -1842,7 +1839,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["s"]["value"], "http://example.org/sStr");
 
-        // "25"^^xsd:integer -> nur sInt.
+        // "25"^^xsd:integer -> only sInt.
         let rows = rows_of(
             &store,
             "SELECT ?s WHERE { ?s <http://example.org/p> \"25\"^^<http://www.w3.org/2001/XMLSchema#integer> }",
@@ -1851,8 +1848,8 @@ mod tests {
         assert_eq!(rows[0]["s"]["value"], "http://example.org/sInt");
     }
 
-    /// SPARQL 1.1: Division durch Null ist ein Fehler -> die Zeile fällt im
-    /// FILTER raus (kein INFINITY, das `> 0` erfüllen würde).
+    /// SPARQL 1.1: division by zero is an error -> the row drops out in the
+    /// FILTER (no INFINITY that would satisfy `> 0`).
     #[test]
     fn filter_division_by_zero_drops_row() {
         let mut store = TripleStore::new();
@@ -1874,7 +1871,7 @@ mod tests {
         assert_eq!(rows.len(), 0);
     }
 
-    /// FILTER mit `<` auf IRIs muss vergleichen (vorher: immer Fehler -> leer).
+    /// FILTER with `<` on IRIs must compare (previously: always an error -> empty).
     #[test]
     fn filter_iri_less_than_compares() {
         let mut store = TripleStore::new();
@@ -1883,13 +1880,13 @@ mod tests {
             "http://example.org/p",
             "http://example.org/b",
         )]);
-        // a < b lexikalisch -> eine Zeile.
+        // a < b lexically -> one row.
         let rows = rows_of(
             &store,
             "SELECT ?x ?y WHERE { ?x <http://example.org/p> ?y FILTER(?x < ?y) }",
         );
         assert_eq!(rows.len(), 1);
-        // umgekehrt: b < a ist falsch -> leer.
+        // reversed: b < a is false -> empty.
         let rows = rows_of(
             &store,
             "SELECT ?x ?y WHERE { ?x <http://example.org/p> ?y FILTER(?y < ?x) }",
@@ -1897,8 +1894,8 @@ mod tests {
         assert_eq!(rows.len(), 0);
     }
 
-    /// isBlank unterscheidet Blank Nodes von IRIs; das IRI-Objekt darf nicht
-    /// als Blank Node durchgehen, und es wird als `bnode` ausgegeben.
+    /// isBlank distinguishes blank nodes from IRIs; the IRI object must not pass
+    /// as a blank node, and it is output as `bnode`.
     #[test]
     fn isblank_distinguishes_blank_from_iri() {
         let mut store = TripleStore::new();
@@ -1926,7 +1923,7 @@ mod tests {
         assert_eq!(rows[0]["s"]["value"], "http://example.org/sB");
         assert_eq!(rows[0]["o"]["type"], "bnode");
 
-        // isIri ist komplementär: nur das IRI-Objekt.
+        // isIri is complementary: only the IRI object.
         let rows = rows_of(
             &store,
             "SELECT ?s WHERE { ?s <http://example.org/p> ?o FILTER(isIri(?o)) }",
@@ -1962,12 +1959,12 @@ mod tests {
     fn select_with_unknown_constant_returns_empty_not_panic() {
         let store = test_store();
         let engine = HybridEngine::new();
-        // <…/zzz> kommt im Store nicht vor -> leere Lösung, kein Panic.
+        // <…/zzz> does not occur in the store -> empty solution, no panic.
         let query = "SELECT ?p ?o WHERE { <http://example.org/zzz> ?p ?o }";
         let result: Value =
             serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
         assert_eq!(result["results"]["bindings"].as_array().unwrap().len(), 0);
-        // Head-Variablen bleiben erhalten.
+        // Head variables are preserved.
         let head: Vec<&str> = result["head"]["vars"]
             .as_array()
             .unwrap()
@@ -1979,8 +1976,8 @@ mod tests {
 
     #[test]
     fn optional_multi_match_expands_rows() {
-        // bob hat zwei Alter -> die linke Zeile alice->bob muss zu ZWEI
-        // Ausgabezeilen expandieren; carol (kein Alter) bleibt eine NULL-Zeile.
+        // bob has two ages -> the left row alice->bob must expand to TWO output
+        // rows; carol (no age) stays a single NULL row.
         let mut store = TripleStore::new();
         store.ingest_str_triples(&[
             (
@@ -2001,7 +1998,7 @@ mod tests {
         let result: Value =
             serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
         let rows = result["results"]["bindings"].as_array().unwrap();
-        // bob×{25,26} = 2 Zeilen + carol×NULL = 1 Zeile.
+        // bob×{25,26} = 2 rows + carol×NULL = 1 row.
         assert_eq!(rows.len(), 3);
         let ages: Vec<Option<String>> = rows
             .iter()
@@ -2033,9 +2030,9 @@ mod tests {
 
     #[test]
     fn distinct_applies_after_projection() {
-        // Zwei Triples mit Prädikat knows + eines mit age.
-        // SELECT DISTINCT ?p muss {knows, age} = 2 Zeilen liefern,
-        // NICHT 3 (knows darf nicht doppelt erscheinen).
+        // Two triples with predicate knows + one with age.
+        // SELECT DISTINCT ?p must return {knows, age} = 2 rows,
+        // NOT 3 (knows must not appear twice).
         let store = test_store();
         let engine = HybridEngine::new();
         let query = "SELECT DISTINCT ?p WHERE { ?s ?p ?o }";
@@ -2080,7 +2077,7 @@ mod tests {
         let result: Value =
             serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
         let rows = result["results"]["bindings"].as_array().unwrap();
-        assert_eq!(rows.len(), 1, "nur 30 > 26");
+        assert_eq!(rows.len(), 1, "only 30 > 26");
         assert_eq!(rows[0]["a"]["value"], "30");
     }
 
@@ -2088,7 +2085,7 @@ mod tests {
     fn filter_str_function() {
         let store = test_store();
         let engine = HybridEngine::new();
-        // CONTAINS(STR(?b), "bob") -> nur alice->bob.
+        // CONTAINS(STR(?b), "bob") -> only alice->bob.
         let query = "SELECT ?a ?b WHERE { ?a <http://example.org/knows> ?b \
                      FILTER(CONTAINS(STR(?b), \"bob\")) }";
         let result: Value =
@@ -2107,7 +2104,7 @@ mod tests {
         let result: Value =
             serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
         let rows = result["results"]["bindings"].as_array().unwrap();
-        // bob (->charlie) fällt raus; alice->bob und charlie->alice bleiben.
+        // bob (->charlie) drops out; alice->bob and charlie->alice remain.
         assert_eq!(rows.len(), 2);
         for r in rows {
             assert_ne!(r["b"]["value"], "http://example.org/charlie");
@@ -2160,7 +2157,7 @@ mod tests {
 
     #[test]
     fn order_by_numeric_not_lexical() {
-        // 9 < 25 < 100 numerisch; lexikalisch wäre es "100" < "25" < "9".
+        // 9 < 25 < 100 numerically; lexically it would be "100" < "25" < "9".
         let mut store = TripleStore::new();
         let dt = "http://www.w3.org/2001/XMLSchema#integer";
         let s = store.dict.insert("http://example.org/x");
@@ -2183,7 +2180,7 @@ mod tests {
     fn order_by_with_distinct() {
         let store = test_store();
         let engine = HybridEngine::new();
-        // DISTINCT ?p -> {knows, age}; ORDER BY ?p sortiert die zwei Prädikate.
+        // DISTINCT ?p -> {knows, age}; ORDER BY ?p sorts the two predicates.
         let query = "SELECT DISTINCT ?p WHERE { ?s ?p ?o } ORDER BY ?p";
         let result: Value =
             serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
@@ -2198,7 +2195,7 @@ mod tests {
     fn union_combines_branches_same_var() {
         let store = test_store();
         let engine = HybridEngine::new();
-        // Branch 1: knows-Objekte (bob, charlie, alice); Branch 2: age-Objekt (25).
+        // Branch 1: knows objects (bob, charlie, alice); branch 2: age object (25).
         let query = "SELECT ?o WHERE { \
                      { ?s <http://example.org/knows> ?o } UNION \
                      { ?s <http://example.org/age> ?o } }";
@@ -2221,7 +2218,7 @@ mod tests {
     fn union_aligns_differing_vars_with_null() {
         let store = test_store();
         let engine = HybridEngine::new();
-        // Branch 1 bindet nur ?a, Branch 2 nur ?b -> Spalten müssen mit NULL ausgerichtet werden.
+        // Branch 1 binds only ?a, branch 2 only ?b -> columns must be NULL-aligned.
         let query = "SELECT ?a ?b WHERE { \
                      { ?a <http://example.org/knows> <http://example.org/bob> } UNION \
                      { ?b <http://example.org/knows> <http://example.org/alice> } }";
@@ -2229,7 +2226,7 @@ mod tests {
             serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
         let rows = result["results"]["bindings"].as_array().unwrap();
         assert_eq!(rows.len(), 2);
-        // Eine Zeile hat a=alice (b NULL), die andere b=charlie (a NULL).
+        // One row has a=alice (b NULL), the other b=charlie (a NULL).
         let a_only = rows.iter().any(|r| {
             r.get("a")
                 .and_then(|v| v.get("value"))
@@ -2244,12 +2241,12 @@ mod tests {
                 == Some("http://example.org/charlie")
                 && (r.get("a").is_none() || r["a"].is_null())
         });
-        assert!(a_only, "Zeile mit nur ?a=alice fehlt");
-        assert!(b_only, "Zeile mit nur ?b=charlie fehlt");
+        assert!(a_only, "row with only ?a=alice is missing");
+        assert!(b_only, "row with only ?b=charlie is missing");
     }
 
     fn path_store() -> TripleStore {
-        // Kette alice -> bob -> carol -> dave (knows) + alice likes eve.
+        // Chain alice -> bob -> carol -> dave (knows) + alice likes eve.
         let mut store = TripleStore::new();
         let k = "http://example.org/knows";
         let l = "http://example.org/likes";
@@ -2284,7 +2281,7 @@ mod tests {
 
     #[test]
     fn path_one_or_more() {
-        // alice knows+ ?o -> bob, carol, dave (transitive Hülle, ohne alice).
+        // alice knows+ ?o -> bob, carol, dave (transitive closure, without alice).
         assert_eq!(
             obj_values(
                 "SELECT ?o WHERE { <http://example.org/alice> <http://example.org/knows>+ ?o }"
@@ -2295,7 +2292,7 @@ mod tests {
 
     #[test]
     fn path_zero_or_more_includes_self() {
-        // alice knows* ?o -> alice (0 Schritte), bob, carol, dave.
+        // alice knows* ?o -> alice (0 steps), bob, carol, dave.
         assert_eq!(
             obj_values(
                 "SELECT ?o WHERE { <http://example.org/alice> <http://example.org/knows>* ?o }"
@@ -2317,7 +2314,7 @@ mod tests {
 
     #[test]
     fn path_sequence() {
-        // alice knows/knows ?o -> carol (2 Schritte).
+        // alice knows/knows ?o -> carol (2 steps).
         assert_eq!(
             obj_values(
                 "SELECT ?o WHERE { <http://example.org/alice> <http://example.org/knows>/<http://example.org/knows> ?o }"
@@ -2339,7 +2336,7 @@ mod tests {
 
     #[test]
     fn path_inverse() {
-        // bob ^knows ?s -> wer kennt bob = alice (über ?o-Spalte ausgewertet? nein: ?s).
+        // bob ^knows ?s -> who knows bob = alice (evaluated over the ?s column).
         let store = path_store();
         let engine = HybridEngine::new();
         let q = "SELECT ?s WHERE { <http://example.org/bob> ^<http://example.org/knows> ?s }";
@@ -2352,21 +2349,21 @@ mod tests {
 
     #[test]
     fn path_both_variables_transitive() {
-        // ?s knows+ ?o -> alle erreichbaren Paare: (alice,{bob,carol,dave}),
-        // (bob,{carol,dave}), (carol,{dave}) = 6 Paare.
+        // ?s knows+ ?o -> all reachable pairs: (alice,{bob,carol,dave}),
+        // (bob,{carol,dave}), (carol,{dave}) = 6 pairs.
         let store = path_store();
         let engine = HybridEngine::new();
         let q = "SELECT ?s ?o WHERE { ?s <http://example.org/knows>+ ?o }";
         let result: Value =
             serde_json::from_str(&execute_sparql(&store, &engine, q).unwrap()).unwrap();
         let rows = result["results"]["bindings"].as_array().unwrap();
-        assert_eq!(rows.len(), 6, "6 transitiv erreichbare (s,o)-Paare");
+        assert_eq!(rows.len(), 6, "6 transitively reachable (s,o) pairs");
     }
 
     #[test]
     fn path_in_c2rpq_join() {
-        // C2RPQ-Form: Pfad join BGP. Alle Tripel in EINEM Ingest, da
-        // ingest_str_triples die Indizes jeweils neu baut (nicht anhängt).
+        // C2RPQ form: path join BGP. All triples in ONE ingest, since
+        // ingest_str_triples rebuilds the indexes each time (does not append).
         let mut store = TripleStore::new();
         let k = "http://example.org/knows";
         let l = "http://example.org/likes";
@@ -2379,8 +2376,8 @@ mod tests {
             (&format!("{e}carol"), l, &format!("{e}zed")),
         ]);
         let engine = HybridEngine::new();
-        // ?s knows+ ?mid . ?mid likes ?z  -> ?mid muss carol sein (carol likes zed),
-        // erreichbar von alice und bob -> 2 Treffer.
+        // ?s knows+ ?mid . ?mid likes ?z  -> ?mid must be carol (carol likes zed),
+        // reachable from alice and bob -> 2 hits.
         let q = "SELECT ?s ?z WHERE { ?s <http://example.org/knows>+ ?mid . \
                  ?mid <http://example.org/likes> ?z }";
         let result: Value =
@@ -2405,13 +2402,13 @@ mod tests {
     #[test]
     fn chained_optional_referencing_prior_optional_var() {
         // Reproduces the WDBench `opts` q3 shape (a chained OPTIONAL):
-        // ein OPTIONAL, dessen Muster eine Variable nutzt, die nur in einem
-        // FRÜHEREN OPTIONAL gebunden wird ("nicht wohlgeformtes" Pattern).
+        // an OPTIONAL whose pattern uses a variable bound only in an EARLIER
+        // OPTIONAL (a "not well-designed" pattern).
         //   ?x1 P102 <O> .
         //   OPTIONAL { ?x1 P569 ?x2 }
         //   OPTIONAL { ?x1 P19  ?x3 }
         //   OPTIONAL { ?x1 P21  ?x4 }
-        //   OPTIONAL { ?x3 P625 ?x5 }   <- ?x3 stammt aus dem 2. OPTIONAL
+        //   OPTIONAL { ?x3 P625 ?x5 }   <- ?x3 comes from the 2nd OPTIONAL
         let e = "http://ex/";
         let mut store = TripleStore::new();
         store.ingest_str_triples(&[
@@ -2424,7 +2421,7 @@ mod tests {
             (&format!("{e}s1"), &format!("{e}P21"), &format!("{e}g")), // x4: s1 only
             (&format!("{e}m1"), &format!("{e}P625"), &format!("{e}c1")), // x5 via x3
             (&format!("{e}m2"), &format!("{e}P625"), &format!("{e}c2")),
-            // RAUSCHEN: P625 von einem NICHT über x3 erreichbaren Subjekt.
+            // NOISE: P625 from a subject NOT reachable via x3.
             // A cross-product would wrongly pull this in.
             (&format!("{e}noise"), &format!("{e}P625"), &format!("{e}nc")),
         ]);
@@ -2439,10 +2436,10 @@ mod tests {
         let result: Value =
             serde_json::from_str(&execute_sparql(&store, &engine, &q).unwrap()).unwrap();
         let rows = result["results"]["bindings"].as_array().unwrap();
-        // Korrekte SPARQL-Semantik (left-deep):
-        //   s1×{m1,m2} -> 2 Zeilen mit x5=c1/c2; s2 -> 1 Zeile komplett NULL = 3.
-        // KEIN Kreuzprodukt: das Rausch-Tripel (noise P625 nc) darf NICHT auftauchen.
-        assert_eq!(rows.len(), 3, "left-deep OPTIONAL-Kette, kein Kreuzprodukt");
+        // Correct SPARQL semantics (left-deep):
+        //   s1×{m1,m2} -> 2 rows with x5=c1/c2; s2 -> 1 fully NULL row = 3.
+        // NO cross product: the noise triple (noise P625 nc) must NOT appear.
+        assert_eq!(rows.len(), 3, "left-deep OPTIONAL chain, no cross product");
         let x5: Vec<Option<&str>> = rows
             .iter()
             .map(|r| {
@@ -2453,18 +2450,18 @@ mod tests {
             .collect();
         assert!(x5.contains(&Some("http://ex/c1")));
         assert!(x5.contains(&Some("http://ex/c2")));
-        assert!(x5.contains(&None)); // s2-Zeile: x3=NULL -> x5=NULL
+        assert!(x5.contains(&None)); // s2 row: x3=NULL -> x5=NULL
         assert!(
             !x5.contains(&Some("http://ex/nc")),
-            "kein Rausch-Tripel (Kreuzprodukt)"
+            "no noise triple (cross product)"
         );
     }
 
     #[test]
     fn limit_on_multi_pattern_bgp_is_pushed_down() {
-        // 2-Muster-Join `?s knows ?b . ?b knows ?x`: s->{b1..b5}, jedes bi->x.
-        // Volles Ergebnis = 5 Zeilen; LIMIT 3 muss exakt 3 gültige Zeilen liefern
-        // (pipelined DFS terminiert früh, statt alle 5 zu materialisieren).
+        // 2-pattern join `?s knows ?b . ?b knows ?x`: s->{b1..b5}, each bi->x.
+        // Full result = 5 rows; LIMIT 3 must return exactly 3 valid rows
+        // (pipelined DFS terminates early instead of materializing all 5).
         let e = "http://ex/";
         let k = format!("{e}knows");
         let mut triples: Vec<(String, String, String)> = Vec::new();
@@ -2482,7 +2479,7 @@ mod tests {
         let q = format!("SELECT ?s ?b ?x WHERE {{ ?s <{k}> ?b . ?b <{k}> ?x }} LIMIT 3");
         let r: Value = serde_json::from_str(&execute_sparql(&store, &engine, &q).unwrap()).unwrap();
         let rows = r["results"]["bindings"].as_array().unwrap();
-        assert_eq!(rows.len(), 3, "LIMIT 3 -> genau 3 Zeilen");
+        assert_eq!(rows.len(), 3, "LIMIT 3 -> exactly 3 rows");
         for row in rows {
             assert_eq!(row["x"]["value"], "http://ex/x");
             assert!(
@@ -2492,7 +2489,7 @@ mod tests {
                     .starts_with("http://ex/b")
             );
         }
-        // Ohne LIMIT: alle 5.
+        // Without LIMIT: all 5.
         let q_all = format!("SELECT ?s ?b ?x WHERE {{ ?s <{k}> ?b . ?b <{k}> ?x }}");
         let r2: Value =
             serde_json::from_str(&execute_sparql(&store, &engine, &q_all).unwrap()).unwrap();
@@ -2501,10 +2498,10 @@ mod tests {
 
     #[test]
     fn path_sequence_with_closure_rhs() {
-        // WDBench paths-Bug: `<s> (k1/(k2)*) ?x`. spargebra zerlegt das in
-        // Join(<s> k1 _:b, _:b (k2)* ?x) — der Blank-Node-Knoten muss als
-        // Variable wirken, sonst lieferte eval_path fälschlich 0.
-        // Daten: s -k1-> m ; m -k2-> n1 -k2-> n2.  Erwartet ?x = {m,n1,n2}.
+        // WDBench paths bug: `<s> (k1/(k2)*) ?x`. spargebra decomposes this into
+        // Join(<s> k1 _:b, _:b (k2)* ?x) — the blank-node node must act as a
+        // variable, otherwise eval_path would wrongly return 0.
+        // Data: s -k1-> m ; m -k2-> n1 -k2-> n2.  Expected ?x = {m,n1,n2}.
         let e = "http://ex/";
         let mut store = TripleStore::new();
         store.ingest_str_triples(&[
@@ -2525,24 +2522,24 @@ mod tests {
         assert_eq!(
             xs,
             vec![format!("{e}m"), format!("{e}n1"), format!("{e}n2")],
-            "k1/(k2)* muss m (0×k2) + n1 + n2 liefern"
+            "k1/(k2)* must return m (0×k2) + n1 + n2"
         );
-        // __bn_-Variable darf nicht ausgegeben werden.
+        // The __bn_ variable must not be output.
         let head: Vec<&str> = r["head"]["vars"]
             .as_array()
             .unwrap()
             .iter()
             .map(|v| v.as_str().unwrap())
             .collect();
-        assert_eq!(head, vec!["x"], "nur ?x, kein __bn_ in SELECT *");
+        assert_eq!(head, vec!["x"], "only ?x, no __bn_ in SELECT *");
     }
 
     #[test]
     fn semijoin_over_blank_node_path_bound_object() {
-        // c2rpq-Form: `?x (k1/(k2)*) <const>` (gebundenes Objekt). spargebra ->
-        // Join(?x k1 _:b, _:b (k2)* <const>); die rechte Seite hat NUR den
-        // Join-Key als Variable (Semi-Join, new_arity=0). Vorher verschluckte
-        // hash_join das (leerer Bucket) -> 0 Zeilen. Jetzt korrekt.
+        // c2rpq form: `?x (k1/(k2)*) <const>` (bound object). spargebra ->
+        // Join(?x k1 _:b, _:b (k2)* <const>); the right side has ONLY the
+        // join key as a variable (semi-join, new_arity=0). Previously hash_join
+        // swallowed this (empty bucket) -> 0 rows. Now correct.
         // s -k1-> m -k2-> n1 -k2-> n2.
         let e = "http://ex/";
         let mut store = TripleStore::new();
@@ -2553,24 +2550,24 @@ mod tests {
         ]);
         let engine = HybridEngine::new();
         for target in ["m", "n1", "n2"] {
-            // s erreicht jedes Ziel über k1 dann k2* -> genau {s}.
+            // s reaches every target via k1 then k2* -> exactly {s}.
             let q = format!("SELECT * WHERE {{ ?x (<{e}k1>/(<{e}k2>)*) <{e}{target}> }}");
             let r: Value =
                 serde_json::from_str(&execute_sparql(&store, &engine, &q).unwrap()).unwrap();
             let rows = r["results"]["bindings"].as_array().unwrap();
-            assert_eq!(rows.len(), 1, "Ziel {target}: genau ein ?x");
+            assert_eq!(rows.len(), 1, "target {target}: exactly one ?x");
             assert_eq!(
                 rows[0]["x"]["value"],
                 format!("{e}s"),
-                "Ziel {target}: ?x=s"
+                "target {target}: ?x=s"
             );
         }
     }
 
     #[test]
     fn semijoin_counts_multiple_right_matches() {
-        // Semi-Join muss die Trefferzahl bewahren: zwei Wege a->c über b1/b2.
-        // `?x knows/knows <c>` (gebundenes Objekt) -> a über b1 UND über b2 = 2 Zeilen.
+        // The semi-join must preserve the hit count: two ways a->c via b1/b2.
+        // `?x knows/knows <c>` (bound object) -> a via b1 AND via b2 = 2 rows.
         let e = "http://ex/";
         let k = format!("{e}knows");
         let mut store = TripleStore::new();
@@ -2584,7 +2581,7 @@ mod tests {
         let q = format!("SELECT * WHERE {{ ?x <{k}>/<{k}> <{e}c> }}");
         let r: Value = serde_json::from_str(&execute_sparql(&store, &engine, &q).unwrap()).unwrap();
         let rows = r["results"]["bindings"].as_array().unwrap();
-        assert_eq!(rows.len(), 2, "zwei Pfade a->c (über b1 und b2)");
+        assert_eq!(rows.len(), 2, "two paths a->c (via b1 and b2)");
         for row in rows {
             assert_eq!(row["x"]["value"], format!("{e}a"));
         }
@@ -2592,9 +2589,9 @@ mod tests {
 
     #[test]
     fn ingests_and_queries_blank_nodes() {
-        // Blank-Node-Tripel werden geladen (nicht übersprungen), als `bnode`
-        // ausgegeben, und dasselbe `_:b0` über mehrere Zeilen ist derselbe
-        // Knoten (dokument-scoped Identität -> Join funktioniert).
+        // Blank-node triples are loaded (not skipped), output as `bnode`, and
+        // the same `_:b0` across multiple lines is the same node (document-scoped
+        // identity -> join works).
         let path = std::env::temp_dir().join("trillian_bnode_query_test.nt");
         std::fs::write(
             &path,
@@ -2606,20 +2603,20 @@ mod tests {
         store.ingest_ntriples_file(path.to_str().unwrap()).unwrap();
         let engine = HybridEngine::new();
 
-        // (1) Objekt ist ein Blank Node -> type=bnode.
+        // (1) Object is a blank node -> type=bnode.
         let q = "SELECT ?x WHERE { <http://ex/alice> <http://ex/knows> ?x }";
         let r: Value = serde_json::from_str(&execute_sparql(&store, &engine, q).unwrap()).unwrap();
         let rows = r["results"]["bindings"].as_array().unwrap();
-        assert_eq!(rows.len(), 1, "Blank-Node-Tripel wurde geladen");
+        assert_eq!(rows.len(), 1, "blank-node triple was loaded");
         assert_eq!(rows[0]["x"]["type"], "bnode");
 
-        // (2) Join über denselben Blank Node (beide _:b0 = dieselbe ID).
+        // (2) Join over the same blank node (both _:b0 = the same ID).
         let q2 = "SELECT ?n WHERE { <http://ex/alice> <http://ex/knows> ?b . \
                   ?b <http://ex/name> ?n }";
         let r2: Value =
             serde_json::from_str(&execute_sparql(&store, &engine, q2).unwrap()).unwrap();
         let rows2 = r2["results"]["bindings"].as_array().unwrap();
-        assert_eq!(rows2.len(), 1, "Join über denselben Blank Node");
+        assert_eq!(rows2.len(), 1, "join over the same blank node");
         assert_eq!(rows2[0]["n"]["value"], "Bob");
 
         let _ = std::fs::remove_file(&path);
