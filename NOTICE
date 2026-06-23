@@ -1,0 +1,7 @@
+Trillian — a lean Rust RDF triple store and SPARQL engine
+Copyright 2026 42grad GmbH
+
+This product is developed and maintained by 42grad GmbH (https://42-grad.com)
+as a contribution to open, sovereign, and sustainable data infrastructure.
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
