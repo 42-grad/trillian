@@ -1,6 +1,6 @@
 ---
-# Tentris-freier Solo-Benchmark: nur unsere Engine, kein Tentris-Build.
-- name: Copy project to host (inkl. wdbench_*.sh / *.py)
+# Solo benchmark role: sync the project, build the server, run wdbench_solo.sh.
+- name: Copy project to host (wdbench_*.sh, *.py, src)
   synchronize:
     src: "{{ playbook_dir }}/../../../"
     dest: "{{ project_dir }}"

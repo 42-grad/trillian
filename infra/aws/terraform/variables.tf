@@ -12,28 +12,26 @@ variable "ssh_public_key_path" {
 
 variable "instance_type" {
   description = <<-EOT
-    EC2-Instanztyp. Beide Engines laufen beim Duell GLEICHZEITIG resident
-    (Rust ~130 GB logisch + Tentris ~400 GB ≈ 530 GB RAM für den vollen
-    Datensatz). Default r6i.24xlarge = 96 vCPU / 768 GB (sicher für beide).
-    Sparvarianten: r6i.16xlarge (512 GB; mit --stride fahren) oder für reine
-    Probe r6i.4xlarge (128 GB, nur Rust). x2iedn.16xlarge = 1 TB.
+    EC2 instance type. Trillian holds the full 1.26B-triple graph resident in
+    ~15-44 GB RAM, with headroom for the in-RAM build peak. r6i.16xlarge
+    (64 vCPU / 512 GB) is comfortable; r6i.4xlarge (128 GB) is fine for a
+    smaller --stride run. Overridable via the INSTANCE_TYPE env var.
   EOT
   type        = string
-  default     = "r6i.24xlarge"
+  default     = "r6i.16xlarge"
 }
 
 variable "disk_gb" {
   description = <<-EOT
-    Root-EBS in GB. Voll: dekomprimierte .nt (~100 GB) + Rust-Snapshot (~50 GB)
-    + Tentris-metall (~1,3 TB) -> 2000 GB Default. Für --stride entsprechend
-    weniger.
+    Root EBS in GB. Full run: decompressed .nt (~156 GB) + the snapshot (~49 GB)
+    -> 400 GB default. Use less for a smaller --stride run. Overridable via DISK_GB.
   EOT
   type        = number
-  default     = 2000
+  default     = 400
 }
 
 variable "ssh_ingress_cidrs" {
-  description = "Erlaubte Quell-CIDRs für SSH (zur Absicherung ggf. eigene IP/32 setzen)"
+  description = "Allowed source CIDRs for SSH (set your own IP/32 to lock it down)"
   type        = list(string)
   default     = ["0.0.0.0/0"]
 }

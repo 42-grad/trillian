@@ -40,12 +40,12 @@ data "aws_subnets" "default" {
 }
 
 resource "aws_key_pair" "duel" {
-  key_name   = "tentris-wdbench-key"
+  key_name   = "trillian-wdbench-key"
   public_key = file(var.ssh_public_key_path)
 }
 
 resource "aws_security_group" "ssh" {
-  name        = "tentris-wdbench-ssh"
+  name        = "trillian-wdbench-ssh"
   description = "SSH-only inbound for the WDBench duel host"
   vpc_id      = data.aws_vpc.default.id
 
@@ -64,7 +64,7 @@ resource "aws_security_group" "ssh" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  tags = { project = "tentris-wdbench" }
+  tags = { project = "trillian-wdbench" }
 }
 
 resource "aws_instance" "duel" {
@@ -76,7 +76,6 @@ resource "aws_instance" "duel" {
   associate_public_ip_address = true
 
   # Großes, schnelles Root-Volume: dekomprimierte .nt (~100 GB) + Rust-Snapshot
-  # (~50 GB) + Tentris-metall (~1,3 TB bei vollem Datensatz).
   root_block_device {
     volume_type = "gp3"
     volume_size = var.disk_gb
@@ -85,7 +84,7 @@ resource "aws_instance" "duel" {
     encrypted   = true
   }
 
-  tags = { project = "tentris-wdbench", Name = "tentris-wdbench-duel" }
+  tags = { project = "trillian-wdbench", Name = "trillian-wdbench" }
 }
 
 output "server_ip" {
