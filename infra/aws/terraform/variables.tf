@@ -1,11 +1,11 @@
 variable "aws_region" {
-  description = "AWS-Region"
+  description = "AWS region"
   type        = string
   default     = "us-east-1"
 }
 
 variable "ssh_public_key_path" {
-  description = "Pfad zum SSH-Public-Key, der auf dem Host hinterlegt wird"
+  description = "Path to the SSH public key installed on the host"
   type        = string
   default     = "infra/aws/terraform/duel_key.pub"
 }

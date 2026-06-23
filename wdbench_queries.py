@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-wdbench_queries.py — wandelt die WDBench-Query-Logs in ausführbare .rq-Dateien.
+wdbench_queries.py — converts the WDBench query logs into executable .rq files.
 
-WDBench liefert pro Kategorie eine Textdatei (`single_bgps.txt`,
-`multiple_bgps.txt`, `opts.txt`, `paths.txt`, `c2rpqs.txt`), eine Query pro
-Zeile im Format `<id>,<WHERE-Body>`. Der Body ist der Inhalt einer
-WHERE-Klausel (Tripel-Muster / Property-Paths / OPTIONAL). Wir wrappen ihn zu
-`SELECT * WHERE { <body> }` und schreiben je Query eine `.rq`-Datei in einen
-Kategorie-Unterordner — direkt vergleichbar gegen jeden SPARQL-Endpoint.
+WDBench provides one text file per category (`single_bgps.txt`,
+`multiple_bgps.txt`, `opts.txt`, `paths.txt`, `c2rpqs.txt`), one query per line
+in the format `<id>,<WHERE body>`. The body is the contents of a WHERE clause
+(triple patterns / property paths / OPTIONAL). We wrap it into
+`SELECT * WHERE { <body> }` and write one `.rq` file per query into a
+category subfolder — directly comparable against any SPARQL endpoint.
 
-Aufruf:  wdbench_queries.py <src_dir> <out_dir> [max_per_category]
-    src_dir  enthält die fünf *.txt aus WDBench/Queries
-    out_dir  Zielordner (ein Unterordner je Kategorie)
-    max_per_category  optional: nur die ersten N Queries je Kategorie
+Usage:  wdbench_queries.py <src_dir> <out_dir> [max_per_category]
+    src_dir  contains the five *.txt from WDBench/Queries
+    out_dir  target folder (one subfolder per category)
+    max_per_category  optional: only the first N queries per category
 """
 
 import sys
@@ -28,16 +28,16 @@ CATEGORIES = {
 
 
 def convert_line(line: str) -> str | None:
-    """`<id>,<body>` -> vollständige SELECT-*-Query (oder None bei Leerzeile)."""
+    """`<id>,<body>` -> full SELECT-* query (or None on a blank line)."""
     line = line.rstrip("\n")
     if not line.strip():
         return None
-    # nur am ERSTEN Komma trennen (der Body enthält keine führende Zahl mehr).
+    # split only at the FIRST comma (the body no longer has a leading number).
     _id, _, body = line.partition(",")
     body = body.strip()
     if not body:
         return None
-    # Body endet teils mit ". " — egal, SPARQL toleriert beides.
+    # The body sometimes ends with ". " — fine, SPARQL tolerates both.
     return f"SELECT * WHERE {{ {body} }}"
 
 
@@ -53,7 +53,7 @@ def main():
     for cat, fname in CATEGORIES.items():
         fpath = src / fname
         if not fpath.exists():
-            print(f"  ! {fname} fehlt in {src} — übersprungen")
+            print(f"  ! {fname} missing in {src} — skipped")
             continue
         cdir = out / cat
         cdir.mkdir(parents=True, exist_ok=True)
@@ -67,8 +67,8 @@ def main():
             if cap and n >= cap:
                 break
         total += n
-        print(f"  {cat:<14} {n} Queries -> {cdir}")
-    print(f"Gesamt: {total} Queries -> {out}")
+        print(f"  {cat:<14} {n} queries -> {cdir}")
+    print(f"Total: {total} queries -> {out}")
 
 
 if __name__ == "__main__":

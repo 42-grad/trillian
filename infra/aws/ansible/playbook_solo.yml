@@ -16,4 +16,4 @@
         mode: '0755'
   roles:
     - common   # apt deps + Rust toolchain
-    - bench     # lokal: Projekt syncen, server bauen, wdbench_solo.sh fahren
+    - bench     # local: sync the project, build the server, run wdbench_solo.sh

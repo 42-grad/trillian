@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-wdbench_compare.py — Korrektheits-Check: vergleicht UNSERE Ergebniszahl je Query
-gegen die publizierten WDBench-Zahlen (Results/*.xlsx).
+wdbench_compare.py — correctness check: compares OUR result count per query
+against the published WDBench numbers (Results/*.xlsx).
 
-Beide Seiten cappen bei 100.000 Zeilen. Für Queries mit <100k Ergebnis muss die
-Zahl exakt übereinstimmen, sonst rechnen wir falsch. Bei 100k auf beiden Seiten
-ist die Query nur geclamped (kein Widerspruch). Referenz = Konsens der
-publizierten Engines (wo sie sich einig sind) bzw. eine einzelne Engine.
+Both sides cap at 100,000 rows. For queries with a <100k result the count must
+match exactly, otherwise we compute the wrong answer. With 100k on both sides
+the query is merely clamped (no contradiction). Reference = consensus of the
+published engines (where they agree) or a single engine.
 
-Aufruf:  wdbench_compare.py <unsere_csv_dir> <xlsx_dir>
-    csv_dir: enthält solo_<kategorie>.csv (query,status,ms,results) — unsere Zahlen
-    xlsx_dir: enthält die WDBench Results/*.xlsx
+Usage:  wdbench_compare.py <our_csv_dir> <xlsx_dir>
+    csv_dir: contains solo_<category>.csv (query,status,ms,results) — our numbers
+    xlsx_dir: contains the WDBench Results/*.xlsx
 """
 
 import csv
@@ -43,7 +43,7 @@ def _col(ref):
 
 
 def _sheet_counts(z, ss, path):
-    """{query_number: results} für die OK-Zeilen eines Sheets."""
+    """{query_number: results} for the OK rows of a sheet."""
     out = {}
     for r in ET.fromstring(z.read(path)).iter(f"{NS}row"):
         cells = {}
@@ -51,7 +51,7 @@ def _sheet_counts(z, ss, path):
             v = c.find(f"{NS}v")
             if v is not None:
                 cells[_col(c.get("r"))] = ss[int(v.text)] if c.get("t") == "s" else v.text
-        # Spalten: 0=query_number 1=results 2=status 3=time
+        # Columns: 0=query_number 1=results 2=status 3=time
         qn, res, st = cells.get(0), cells.get(1), str(cells.get(2, "")).strip().upper()
         if qn is None or res is None or st != "OK":
             continue
@@ -63,7 +63,7 @@ def _sheet_counts(z, ss, path):
 
 
 def published_counts(xlsx_path):
-    """Liefert {engine: {qnum: results}} für ein Kategorie-xlsx."""
+    """Returns {engine: {qnum: results}} for a category xlsx."""
     z = zipfile.ZipFile(xlsx_path)
     ss = ["".join(t.text or "" for t in n.iter(f"{NS}t"))
           for n in ET.fromstring(z.read("xl/sharedStrings.xml"))]
@@ -81,7 +81,7 @@ def published_counts(xlsx_path):
 
 
 def our_counts(csv_path):
-    """{qnum: (status, results)} aus unserer solo_<cat>.csv."""
+    """{qnum: (status, results)} from our solo_<cat>.csv."""
     out = {}
     with open(csv_path) as f:
         for row in csv.DictReader(f):
@@ -94,18 +94,18 @@ def our_counts(csv_path):
 
 def main():
     if len(sys.argv) != 3:
-        print("usage: wdbench_compare.py <unsere_csv_dir> <xlsx_dir>")
+        print("usage: wdbench_compare.py <our_csv_dir> <xlsx_dir>")
         sys.exit(1)
     csv_dir, xlsx_dir = Path(sys.argv[1]), Path(sys.argv[2])
-    print("### Korrektheit: Trillian-Ergebniszahl je Query vs. publizierte WDBench-Zahl")
-    print("(beide bei 100k gecappt; Referenz = Konsens der publizierten Engines)\n")
-    print(f"{'Kategorie':<14} {'verglichen':>10} {'exakt':>7} {'beide100k':>10} {'ABWEICHUNG':>11}")
+    print("### Correctness: Trillian result count per query vs. published WDBench number")
+    print("(both capped at 100k; reference = consensus of the published engines)\n")
+    print(f"{'Category':<14} {'compared':>10} {'exact':>7} {'both100k':>10} {'DEVIATION':>11}")
     print("-" * 60)
     for cat, xlsx in CATS.items():
         ours = csv_dir / f"solo_{cat}.csv"
         pub = xlsx_dir / xlsx
         if not ours.exists() or not pub.exists():
-            print(f"{cat:<14}  (fehlt: {'unsere CSV' if not ours.exists() else xlsx})")
+            print(f"{cat:<14}  (missing: {'our CSV' if not ours.exists() else xlsx})")
             continue
         oc = our_counts(ours)
         pc = published_counts(pub)
@@ -117,8 +117,8 @@ def main():
             refs = [eng[qn] for eng in pc.values() if qn in eng]
             if not refs:
                 continue
-            # Konsens: alle einig -> eindeutige Referenz; sonst Median-nah, wir
-            # akzeptieren Treffer, wenn ocount mit IRGENDEINER Referenz übereinstimmt.
+            # Consensus: all agree -> unambiguous reference; otherwise near the
+            # median, we accept a hit if ocount matches ANY reference.
             compared += 1
             if ocount in refs:
                 if ocount >= CLAMP and all(r >= CLAMP for r in refs):
@@ -126,13 +126,13 @@ def main():
                 else:
                     exact += 1
             elif ocount >= CLAMP and max(refs) >= CLAMP:
-                clamp += 1  # beide geclamped, evtl. minimal unter 100k auf einer Seite
+                clamp += 1  # both clamped, possibly slightly under 100k on one side
             else:
                 mism.append((qn, ocount, refs))
         print(f"{cat:<14} {compared:>10} {exact:>7} {clamp:>10} {len(mism):>11}")
         for qn, oc_, refs in mism[:4]:
             print(f"    q{qn}: ours={oc_}  published={sorted(set(refs))}")
-    print("\nLesart: exakt+beide100k = Übereinstimmung. ABWEICHUNG>0 -> genauer ansehen.")
+    print("\nReading: exact+both100k = match. DEVIATION>0 -> look more closely.")
 
 
 if __name__ == "__main__":

@@ -28,12 +28,12 @@ infra/aws/terraform/duel_key.pub
 infra/aws/ansible/inventory.ini
 infra/aws/ansible/*.log
 infra/aws/wdbench_duel.log
-# .terraform.lock.hcl sollte versioniert werden, daher nicht ignorieren
+# .terraform.lock.hcl should be versioned, so do not ignore it
 watdiv_queries/
 watdiv_correctness.log
 dhat-heap.json
 
-# WDBench-Daten + generierte Queries (groß / reproduzierbar; *.nt/*.bin schon oben)
+# WDBench data + generated queries (large / reproducible; *.nt/*.bin already above)
 wdbench_data/
 wdbench_qsrc/
 wdbench_queries/

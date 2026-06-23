@@ -11,7 +11,7 @@ provider "aws" {
   region = var.aws_region
 }
 
-# Aktuelles Ubuntu-24.04-AMI (Canonical) in der gewählten Region.
+# Current Ubuntu 24.04 AMI (Canonical) in the chosen region.
 data "aws_ami" "ubuntu" {
   most_recent = true
   owners      = ["099720109477"] # Canonical
@@ -26,8 +26,8 @@ data "aws_ami" "ubuntu" {
   }
 }
 
-# Default-VPC + ein Subnetz darin (kein eigenes Netzwerk nötig für einen
-# Einzel-Host-Benchmark).
+# Default VPC + one subnet in it (no dedicated network needed for a
+# single-host benchmark).
 data "aws_vpc" "default" {
   default = true
 }
@@ -75,7 +75,7 @@ resource "aws_instance" "duel" {
   subnet_id                   = data.aws_subnets.default.ids[0]
   associate_public_ip_address = true
 
-  # Großes, schnelles Root-Volume: dekomprimierte .nt (~100 GB) + Rust-Snapshot
+  # Large, fast root volume: decompressed .nt (~100 GB) + Rust snapshot
   root_block_device {
     volume_type = "gp3"
     volume_size = var.disk_gb
