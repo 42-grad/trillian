@@ -16,9 +16,9 @@ async fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     // Modes (separate loader/server stages):
-    //   server build <file.nt> <snapshot.bin>   -> Index bauen + persistieren
-    //   server load  <snapshot.bin> [port]      -> Snapshot per mmap laden + serven
-    //   server <file.nt> [port]                 -> parsen + bauen + serven (Default)
+    //   server build <file.nt> <snapshot.bin>   -> build index + persist
+    //   server load  <snapshot.bin> [port]      -> load snapshot via mmap + serve
+    //   server <file.nt> [port]                 -> parse + build + serve (default)
     match args.get(1).map(|s| s.as_str()) {
         Some("build") => {
             let nt = args
@@ -54,7 +54,7 @@ async fn main() {
     }
 }
 
-/// Loader: N-Triples einlesen, Index bauen, als mmap-Snapshot persistieren.
+/// Loader: read N-Triples, build the index, persist it as an mmap snapshot.
 fn build_snapshot(nt: &str, snapshot: &str) {
     println!("Building index from {} ...", nt);
     let t0 = Instant::now();
@@ -65,8 +65,8 @@ fn build_snapshot(nt: &str, snapshot: &str) {
     store
         .save_snapshot(snapshot)
         .expect("Failed to write snapshot");
-    // Ein frischer Snapshot ist die neue Baseline – ein evtl. altes WAL ist
-    // obsolet und darf nicht auf den neuen Snapshot zurückgespielt werden.
+    // A fresh snapshot is the new baseline – any old WAL is obsolete and must
+    // not be replayed onto the new snapshot.
     let _ = std::fs::remove_file(format!("{}.wal", snapshot));
     println!(
         "Built + persisted {} triples ({} terms) to {} in {} ms",
@@ -77,13 +77,13 @@ fn build_snapshot(nt: &str, snapshot: &str) {
     );
 }
 
-/// Server: Snapshot per mmap laden, WAL zurückspielen, durabel serven.
+/// Server: load the snapshot via mmap, replay the WAL, serve durably.
 async fn load_and_serve(snapshot: &str, port: u16) {
     println!("Loading snapshot (mmap): {}", snapshot);
     let t0 = Instant::now();
     let mut store = TripleStore::load_snapshot(snapshot).expect("Failed to load snapshot");
 
-    // WAL nach dem Snapshot zurückspielen (durable Updates wiederherstellen).
+    // Replay the WAL after the snapshot (restore durable updates).
     let wal_path = format!("{}.wal", snapshot);
     let replayed = Wal::replay(&wal_path, &mut store).expect("Failed to replay WAL");
     let wal = Wal::open_append(&wal_path).expect("Failed to open WAL");
@@ -98,8 +98,8 @@ async fn load_and_serve(snapshot: &str, port: u16) {
     serve_durable(store, port, Some(wal)).await;
 }
 
-/// Profiling: Index in-RAM bauen (Heap, für dhat sichtbar), Memory-Report
-/// drucken und eine Query mit Phasen-Timing (Parse/Eval/Serialize) messen.
+/// Profiling: build the index in RAM (heap, visible to dhat), print a memory
+/// report, and measure a query with phase timing (parse/eval/serialize).
 fn profile(nt: &str, query_file: &str, runs: usize) {
     let mut store = TripleStore::new();
     let t0 = Instant::now();
@@ -107,7 +107,7 @@ fn profile(nt: &str, query_file: &str, runs: usize) {
         .ingest_ntriples_file(nt)
         .expect("Failed to parse .nt file");
     println!(
-        "Geladen (in-RAM): {} Triples, {} Terme in {} ms\n",
+        "Loaded (in-RAM): {} triples, {} terms in {} ms\n",
         n,
         store.dict.len(),
         t0.elapsed().as_millis()
@@ -119,7 +119,7 @@ fn profile(nt: &str, query_file: &str, runs: usize) {
     profile_query(&store, &engine, &query, runs);
 }
 
-/// Default: N-Triples parsen, Index bauen, serven (ohne Snapshot).
+/// Default: parse N-Triples, build the index, serve (without a snapshot).
 async fn parse_and_serve(nt: &str, port: u16) {
     println!("Loading N-Triples file: {}", nt);
     let mut store = TripleStore::new();

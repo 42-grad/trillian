@@ -1,8 +1,9 @@
-/// Sentinel-ID für „ungebunden“ (NULL) in Ergebniszeilen und Joins.
+/// Sentinel ID for "unbound" (NULL) in result rows and joins.
 ///
-/// Echte Dictionary-IDs sind fortlaufend ab 0 und liegen damit weit unter
-/// `u32::MAX`; der Höchstwert ist daher kollisionsfrei als NULL nutzbar. Zentral
-/// definiert, statt in mehreren Modulen als lokale `const` dupliziert.
+/// Real dictionary IDs are consecutive starting at 0 and thus far below
+/// `u32::MAX`; the maximum value is therefore usable as NULL without collision.
+/// Defined centrally instead of being duplicated as a local `const` across
+/// several modules.
 pub const NULL_ID: u32 = u32::MAX;
 
 pub mod dictionary;

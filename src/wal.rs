@@ -1,17 +1,17 @@
-//! Write-Ahead-Log für **durable** Updates.
+//! Write-ahead log for **durable** updates.
 //!
-//! Jede Änderung (neue Dictionary-Terme + Insert/Delete-Operationen) wird
-//! append-only ins Log geschrieben und per `fsync` auf Platte gezwungen. Beim
-//! Start wird das Log nach dem mmap-Snapshot zurückgespielt. Damit überleben
-//! `INSERT/DELETE DATA`-Updates einen Absturz/Neustart, ohne nach jeder
-//! Änderung den gesamten Snapshot neu zu schreiben.
+//! Every change (new dictionary terms + insert/delete operations) is written
+//! append-only to the log and forced to disk via `fsync`. On startup the log is
+//! replayed after the mmap snapshot. This lets `INSERT/DELETE DATA` updates
+//! survive a crash/restart without rewriting the entire snapshot after every
+//! change.
 //!
-//! Record-Format (append-only, little-endian):
-//! * `0x02` Term:   `[len:u32][utf8][type]`  → `dict.insert_with_type` (nächste ID)
+//! Record format (append-only, little-endian):
+//! * `0x02` Term:   `[len:u32][utf8][type]`  → `dict.insert_with_type` (next ID)
 //! * `0x00` Insert: `[s:u32][p:u32][o:u32]`
 //! * `0x01` Delete: `[s:u32][p:u32][o:u32]`
 //!
-//! `type` ist: `0`=IRI, `1`=BlankNode, `2`=Literal, `3`=Literal+lang `[len][utf8]`,
+//! `type` is: `0`=IRI, `1`=BlankNode, `2`=Literal, `3`=Literal+lang `[len][utf8]`,
 //! `4`=Literal+datatype `[len][utf8]`.
 
 use std::fs::{File, OpenOptions};
@@ -24,7 +24,7 @@ pub struct Wal {
 }
 
 impl Wal {
-    /// Öffnet das Log zum Anhängen (legt es bei Bedarf an).
+    /// Opens the log for appending (creating it if needed).
     pub fn open_append(path: &str) -> std::io::Result<Wal> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(Wal {
@@ -32,7 +32,7 @@ impl Wal {
         })
     }
 
-    /// Loggt einen neu ins Dictionary aufgenommenen Term.
+    /// Logs a term newly added to the dictionary.
     pub fn log_term(&mut self, value: &str, typ: &TermType) -> std::io::Result<()> {
         self.writer.write_all(&[0x02])?;
         self.writer.write_all(&(value.len() as u32).to_le_bytes())?;
@@ -40,7 +40,7 @@ impl Wal {
         write_type(&mut self.writer, typ)
     }
 
-    /// Loggt eine Insert- (`insert=true`) oder Delete-Operation.
+    /// Logs an insert (`insert=true`) or delete operation.
     pub fn log_op(&mut self, insert: bool, s: u32, p: u32, o: u32) -> std::io::Result<()> {
         self.writer.write_all(&[if insert { 0x00 } else { 0x01 }])?;
         self.writer.write_all(&s.to_le_bytes())?;
@@ -49,19 +49,18 @@ impl Wal {
         Ok(())
     }
 
-    /// Erzwingt das Schreiben auf Platte (Durabilität).
+    /// Forces the write to disk (durability).
     pub fn sync(&mut self) -> std::io::Result<()> {
         self.writer.flush()?;
         self.writer.get_ref().sync_data()
     }
 
-    /// Spielt das Log auf einen (frisch geladenen) Store zurück. Liefert die
-    /// Anzahl angewandter Operationen. Ein angerissener letzter Record (Crash
-    /// mitten im Schreiben) wird ignoriert.
+    /// Replays the log onto a (freshly loaded) store. Returns the number of
+    /// operations applied. A torn last record (crash mid-write) is ignored.
     pub fn replay(path: &str, store: &mut TripleStore) -> std::io::Result<usize> {
         let file = match File::open(path) {
             Ok(f) => f,
-            Err(_) => return Ok(0), // kein Log -> nichts zu tun
+            Err(_) => return Ok(0), // no log -> nothing to do
         };
         let mut buf = Vec::new();
         BufReader::new(file).read_to_end(&mut buf)?;
@@ -129,7 +128,7 @@ fn write_type<W: Write>(w: &mut W, typ: &TermType) -> std::io::Result<()> {
     }
 }
 
-/// Liest einen Term-Record ab Position `p` (nach dem Tag). `None` bei zu kurzem Puffer.
+/// Reads a term record from position `p` (after the tag). `None` if the buffer is too short.
 fn read_term(b: &[u8], mut p: usize) -> Option<(String, TermType, usize)> {
     if p + 4 > b.len() {
         return None;
@@ -174,7 +173,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    /// Eindeutiger Temp-Pfad pro Testfall (keine `Date`/`rand`-APIs nötig).
+    /// Unique temp path per test case (no `Date`/`rand` APIs needed).
     fn temp_path(tag: &str) -> String {
         static N: AtomicU32 = AtomicU32::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
@@ -184,8 +183,8 @@ mod tests {
             .into_owned()
     }
 
-    /// Schreibt drei IRI-Terme (IDs 0,1,2) + ein Insert und prüft, dass der
-    /// Replay in einen frischen Store dieselben IDs vergibt und das Triple setzt.
+    /// Writes three IRI terms (IDs 0,1,2) + one insert and checks that the
+    /// replay into a fresh store assigns the same IDs and sets the triple.
     #[test]
     fn replays_terms_and_insert() {
         let path = temp_path("insert");
@@ -208,7 +207,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Insert gefolgt von Delete desselben Triples -> Store wieder leer.
+    /// Insert followed by delete of the same triple -> store empty again.
     #[test]
     fn replays_delete_after_insert() {
         let path = temp_path("delete");
@@ -224,13 +223,13 @@ mod tests {
 
         let mut store = TripleStore::new();
         let applied = Wal::replay(&path, &mut store).unwrap();
-        assert_eq!(applied, 2); // ein Insert + ein Delete angewandt
+        assert_eq!(applied, 2); // one insert + one delete applied
         assert_eq!(store.triple_count(), 0);
 
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Der Typ (Sprach-Literal) muss den Replay verlustfrei überleben.
+    /// The type (language literal) must survive the replay losslessly.
     #[test]
     fn replays_typed_literal_term() {
         let path = temp_path("typed");
@@ -246,7 +245,7 @@ mod tests {
         let id = store
             .dict
             .lookup_term("Alice", &TermType::literal_lang("en"))
-            .expect("Sprach-Literal nach Replay vorhanden");
+            .expect("language literal present after replay");
         assert!(matches!(
             store.dict.resolve_type(id),
             Some(TermType::Literal { lang: Some(_), .. })
@@ -255,8 +254,8 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Ein angerissener letzter Record (Crash beim Schreiben) wird ignoriert,
-    /// die davor vollständig geschriebene Operation bleibt erhalten.
+    /// A torn last record (crash while writing) is ignored; the fully written
+    /// operation before it is preserved.
     #[test]
     fn ignores_truncated_tail() {
         use std::io::Write;
@@ -269,7 +268,7 @@ mod tests {
             wal.log_op(true, 0, 1, 2).unwrap();
             wal.sync().unwrap();
         }
-        // Halben Insert-Record anhängen: Tag + nur 4 statt 12 Byte.
+        // Append half an insert record: tag + only 4 instead of 12 bytes.
         {
             let mut f = OpenOptions::new().append(true).open(&path).unwrap();
             f.write_all(&[0x00]).unwrap();
@@ -279,7 +278,7 @@ mod tests {
 
         let mut store = TripleStore::new();
         let applied = Wal::replay(&path, &mut store).unwrap();
-        assert_eq!(applied, 1); // nur die vollständige Operation
+        assert_eq!(applied, 1); // only the complete operation
         assert_eq!(store.triple_count(), 1);
 
         let _ = std::fs::remove_file(&path);

@@ -1,33 +1,32 @@
-//! Synthetischer, **graph-förmiger** RDF-Datengenerator für das Benchmark-Duell.
+//! Synthetic, **graph-shaped** RDF data generator for the benchmark.
 //!
-//! Frühere Versionen nutzten getrennte Vokabulare (`subject_*` als Subjekt,
-//! `object_*` als Objekt). Dadurch konnte ein Objekt nie als Subjekt eines
-//! anderen Tripels auftreten – Chain-, Triangle- und Star-Joins matchten
-//! **strukturell nie** (0 Ergebniszeilen), und das Duell maß nur den
-//! „finde nichts"-Pfad.
+//! Earlier versions used separate vocabularies (`subject_*` as subject,
+//! `object_*` as object). That meant an object could never appear as the
+//! subject of another triple — chain, triangle, and star joins **never matched
+//! structurally** (0 result rows), and the benchmark only measured the
+//! "find nothing" path.
 //!
-//! Dieser Generator verwendet ein **gemeinsames Entitäten-Vokabular** für
-//! Subjekt und Objekt und *pflanzt* gezielt Dreiecke und Ketten ein, sodass
-//! die Join-Queries deterministisch eine bounded, nicht-leere Treffermenge
-//! liefern. Der Rest wird zufällig (seed-fix) aufgefüllt, damit die Indizes
-//! realistische Größen haben.
+//! This generator uses a **shared entity vocabulary** for subject and object
+//! and deliberately *plants* triangles and chains so the join queries
+//! deterministically return a bounded, non-empty result set. The rest is filled
+//! in randomly (fixed seed) so the indexes have realistic sizes.
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 #[derive(Debug, Clone)]
 pub struct SyntheticParams {
-    /// Anzahl Entitäten im gemeinsamen S/O-Vokabular.
+    /// Number of entities in the shared S/O vocabulary.
     pub n_entities: usize,
-    /// Anzahl Prädikate.
+    /// Number of predicates.
     pub n_predicates: usize,
-    /// Ziel-Anzahl Tripel insgesamt.
+    /// Target total number of triples.
     pub n_triples: usize,
-    /// Anzahl eingepflanzter Dreiecke auf `predicate_0` (a→b→c→a).
+    /// Number of planted triangles on `predicate_0` (a→b→c→a).
     pub n_triangles: usize,
-    /// Anzahl eingepflanzter Ketten w-p0→x-p1→y-p2→z.
+    /// Number of planted chains w-p0→x-p1→y-p2→z.
     pub n_chains: usize,
-    /// RNG-Seed für Reproduzierbarkeit.
+    /// RNG seed for reproducibility.
     pub seed: u64,
 }
 
@@ -52,10 +51,10 @@ fn predicate(i: usize) -> String {
     format!("predicate_{}", i)
 }
 
-/// Erzeugt die Tripel als nackte Term-Namen (ohne IRI-Präfix).
+/// Generates the triples as bare term names (without an IRI prefix).
 ///
-/// Die ersten `3*n_triangles + 3*n_chains` Tripel sind die gepflanzten
-/// Strukturen, danach folgt zufälliger Fülltext.
+/// The first `3*n_triangles + 3*n_chains` triples are the planted structures,
+/// followed by random filler.
 pub fn generate(params: &SyntheticParams) -> Vec<(String, String, String)> {
     let mut rng = StdRng::seed_from_u64(params.seed);
     let mut triples: Vec<(String, String, String)> = Vec::with_capacity(params.n_triples);
@@ -64,7 +63,7 @@ pub fn generate(params: &SyntheticParams) -> Vec<(String, String, String)> {
     let p1 = predicate(1 % params.n_predicates);
     let p2 = predicate(2 % params.n_predicates);
 
-    // Dreiecke auf predicate_0: a→b, b→c, c→a.
+    // Triangles on predicate_0: a→b, b→c, c→a.
     for t in 0..params.n_triangles {
         let a = entity((3 * t) % params.n_entities);
         let b = entity((3 * t + 1) % params.n_entities);
@@ -74,7 +73,7 @@ pub fn generate(params: &SyntheticParams) -> Vec<(String, String, String)> {
         triples.push((c, p0.clone(), a));
     }
 
-    // Ketten w-p0→x-p1→y-p2→z, Entitätenblock hinter den Dreiecken.
+    // Chains w-p0→x-p1→y-p2→z, entity block after the triangles.
     let base = 3 * params.n_triangles;
     for c in 0..params.n_chains {
         let w = entity((base + 4 * c) % params.n_entities);
@@ -86,7 +85,7 @@ pub fn generate(params: &SyntheticParams) -> Vec<(String, String, String)> {
         triples.push((y, p2.clone(), z));
     }
 
-    // Zufälliger Fülltext über das gemeinsame Vokabular.
+    // Random filler over the shared vocabulary.
     while triples.len() < params.n_triples {
         let s = entity(rng.gen_range(0..params.n_entities));
         let p = predicate(rng.gen_range(0..params.n_predicates));

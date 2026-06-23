@@ -4,14 +4,14 @@ use super::executor::{RowBlock, execute_plan_limited, execute_wcoj_limited};
 use super::planner::GraphPattern;
 use super::query::TripleStore;
 
-/// Hybride Abfrage-Engine.
+/// Hybrid query engine.
 ///
-/// Analysiert das `GraphPattern` auf Zyklen im Variablen-Abhängigkeitsgraphen
-/// und wählt dann automatisch den besten Ausführungspfad:
+/// Analyzes the `GraphPattern` for cycles in the variable dependency graph and
+/// then automatically picks the best execution path:
 ///
-/// * **Zyklus vorhanden** → `execute_wcoj` (Worst-Case-Optimal Join).
-/// * **Azyklisch** (Stern, Pfad, Baum) → kostenbasierter Binär-Planner
-///   (`execute_plan` mit `GraphPattern::optimize`).
+/// * **Cycle present** → `execute_wcoj` (worst-case-optimal join).
+/// * **Acyclic** (star, path, tree) → cost-based binary planner
+///   (`execute_plan` with `GraphPattern::optimize`).
 ///
 /// This mirrors common practice for worst-case-optimal join engines: linear joins
 /// via the cost-based planner, cyclic patterns via WCOJ (leapfrog triejoin).
@@ -23,16 +23,16 @@ impl HybridEngine {
         Self
     }
 
-    /// Führt ein Graph-Pattern aus und wählt automatisch den optimalen Pfad.
-    /// Gibt `Err` zurück, wenn die Ergebnismenge den Row-Cap übersteigt
-    /// (Schutz vor OOM bei entarteten Queries), siehe `executor::max_result_rows`.
+    /// Executes a graph pattern, automatically picking the optimal path.
+    /// Returns `Err` if the result set exceeds the row cap (guards against OOM
+    /// on degenerate queries), see `executor::max_result_rows`.
     pub fn execute(&self, store: &TripleStore, pattern: &GraphPattern) -> Result<RowBlock, String> {
         self.execute_limited(store, pattern, None)
     }
 
-    /// Wie [`execute`](Self::execute), terminiert aber früh, sobald `limit`
-    /// Endzeilen produziert sind (LIMIT-Pushdown — beschränkt Speicher + Zeit;
-    /// nur gültig, wenn kein ORDER BY/DISTINCT darüber liegt).
+    /// Like [`execute`](Self::execute), but terminates early once `limit` final
+    /// rows have been produced (LIMIT pushdown — bounds memory + time; only valid
+    /// when there is no ORDER BY/DISTINCT on top).
     pub fn execute_limited(
         &self,
         store: &TripleStore,
@@ -48,11 +48,10 @@ impl HybridEngine {
     }
 }
 
-/// Baut den Variablen-Abhängigkeitsgraphen auf und prüft auf Zyklen.
+/// Builds the variable dependency graph and checks for cycles.
 ///
-/// Jede Kante verbindet zwei Variablen, die im selben Triple-Muster
-/// vorkommen. Ein Zyklus in diesem Graphen bedeutet, dass das Pattern
-/// zyklisch ist (z. B. Dreieck).
+/// Each edge connects two variables that occur in the same triple pattern.
+/// A cycle in this graph means the pattern is cyclic (e.g. a triangle).
 fn has_cycle(pattern: &GraphPattern) -> bool {
     if pattern.patterns.len() < 2 {
         return false;
@@ -62,7 +61,7 @@ fn has_cycle(pattern: &GraphPattern) -> bool {
 
     for pat in &pattern.patterns {
         let vars = pat.variables();
-        // Clique zwischen allen Variablen im Muster
+        // Clique between all variables in the pattern
         for (i, v1) in vars.iter().enumerate() {
             for v2 in vars.iter().skip(i + 1) {
                 adj.entry((*v1).clone()).or_default().push((*v2).clone());

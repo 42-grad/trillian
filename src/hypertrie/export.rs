@@ -3,13 +3,13 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 
 use super::dictionary::TermType;
 
-/// Exportiert String-Tripels im N-Triples-Format (.nt).
+/// Exports string triples in N-Triples format (.nt).
 ///
-/// Jede Zeile hat die Form:
+/// Each line has the form:
 /// `<http://example.org/subject> <http://example.org/predicate> <http://example.org/object> .`
 ///
-/// Alle Terme werden als URIs behandelt; Literale werden nicht separat
-/// quoted (sufficient for the benchmark suite).
+/// All terms are treated as URIs; literals are not quoted separately
+/// (sufficient for the benchmark suite).
 pub fn export_ntriples(path: &str, triples: &[(&str, &str, &str)]) -> std::io::Result<()> {
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
@@ -36,16 +36,16 @@ pub struct ParsedTriple {
     pub object: ParsedTerm,
 }
 
-/// Parst eine N-Triples-Datei (.nt) und liefert (subject, predicate, object)
-/// als vollständige Term-Strings inklusive Term-Typ.
+/// Parses an N-Triples file (.nt) and returns (subject, predicate, object) as
+/// full term strings including the term type.
 ///
-/// Unterstützt:
+/// Supports:
 ///   - IRIs: `<http://example.org/s>`
-///   - Literale: `"hello"`, `"hello"@en`, `"30"^^<http://www.w3.org/2001/XMLSchema#integer>`
-///   - Escape-Sequenzen in Strings: `\"`, `\\`, `\n`, `\r`, `\t`, `\uXXXX`, `\UXXXXXXXX`
+///   - Literals: `"hello"`, `"hello"@en`, `"30"^^<http://www.w3.org/2001/XMLSchema#integer>`
+///   - escape sequences in strings: `\"`, `\\`, `\n`, `\r`, `\t`, `\uXXXX`, `\UXXXXXXXX`
 ///
-/// Blank Nodes (`_:b0`) werden als [`TermType::BlankNode`] geparst (dokument-
-/// scoped). Syntaktisch ungültige Zeilen werden übersprungen.
+/// Blank nodes (`_:b0`) are parsed as [`TermType::BlankNode`] (document-scoped).
+/// Syntactically invalid lines are skipped.
 pub fn parse_ntriples(path: &str) -> std::io::Result<Vec<ParsedTriple>> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
@@ -103,13 +103,13 @@ fn parse_term(s: &str) -> Option<(ParsedTerm, &str)> {
     }
 }
 
-/// Parst einen Blank-Node-Knoten `_:label`. Das Label ist dokument-scoped; bei
-/// einem Single-File-Ingest dient es direkt als Dictionary-Schlüssel (Typ
-/// [`TermType::BlankNode`]), sodass dasselbe `_:label` über alle Zeilen hinweg
-/// auf dieselbe ID abbildet. Wert ohne `_:`-Präfix (die Serialisierung in
-/// [`serialize_term`] setzt es wieder davor).
+/// Parses a blank node `_:label`. The label is document-scoped; for a
+/// single-file ingest it serves directly as the dictionary key (type
+/// [`TermType::BlankNode`]), so the same `_:label` maps to the same ID across
+/// all lines. Value without the `_:` prefix (serialization in
+/// [`serialize_term`] puts it back).
 fn parse_blank_node(s: &str) -> Option<(ParsedTerm, &str)> {
-    let after = &s[2..]; // hinter "_:"
+    let after = &s[2..]; // after "_:"
     let end = after
         .find(|c: char| c.is_whitespace())
         .unwrap_or(after.len());
@@ -163,10 +163,10 @@ fn parse_literal(s: &str) -> Option<(ParsedTerm, &str)> {
 }
 
 fn parse_quoted_string(s: &str) -> Option<(String, &str)> {
-    // s beginnt mit "
+    // s starts with "
     let mut result = String::new();
     let bytes = s.as_bytes();
-    let mut i = 1; // nach dem öffnenden "
+    let mut i = 1; // after the opening "
 
     while i < bytes.len() {
         let c = bytes[i] as char;
@@ -212,17 +212,17 @@ fn parse_quoted_string(s: &str) -> Option<(String, &str)> {
         i += 1;
     }
 
-    None // nicht terminiert
+    None // not terminated
 }
 
-/// Serialisiert einen Term (Wert + Typ) als gültige N-Triples-Syntax.
+/// Serializes a term (value + type) as valid N-Triples syntax.
 ///
 /// * IRI        → `<value>`
-/// * Blank Node → `_:value`
-/// * Literal    → `"escaped"`, `"escaped"@lang` oder `"escaped"^^<datatype>`
+/// * Blank node → `_:value`
+/// * Literal    → `"escaped"`, `"escaped"@lang` or `"escaped"^^<datatype>`
 ///
-/// Gegenstück zu [`parse_term`]: `parse_term(serialize_term(v, t))` ist
-/// (bis auf Whitespace) die Identität.
+/// Counterpart to [`parse_term`]: `parse_term(serialize_term(v, t))` is the
+/// identity (up to whitespace).
 pub fn serialize_term(value: &str, typ: &TermType) -> String {
     match typ {
         TermType::Iri => format!("<{}>", value),
@@ -240,7 +240,7 @@ pub fn serialize_term(value: &str, typ: &TermType) -> String {
     }
 }
 
-/// Escaped die Sonderzeichen eines Literal-Lexikals für N-Triples.
+/// Escapes the special characters of a literal lexical form for N-Triples.
 fn escape_literal(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -321,15 +321,15 @@ mod tests {
 
     #[test]
     fn parses_blank_nodes() {
-        // Objekt-Blank-Node.
+        // Object blank node.
         let t = parse_triple_line("<http://example.org/s> <http://example.org/p> _:b0 .")
-            .expect("Tripel mit Blank-Node-Objekt muss geparst werden");
+            .expect("triple with blank-node object must parse");
         assert_eq!(t.object.typ, TermType::BlankNode);
-        assert_eq!(t.object.value, "b0"); // ohne _: Präfix
+        assert_eq!(t.object.value, "b0"); // without _: prefix
 
-        // Subjekt-Blank-Node + Round-trip über die Serialisierung.
+        // Subject blank node + round-trip through serialization.
         let t2 = parse_triple_line("_:n1 <http://example.org/p> <http://example.org/o> .")
-            .expect("Tripel mit Blank-Node-Subjekt muss geparst werden");
+            .expect("triple with blank-node subject must parse");
         assert_eq!(t2.subject.typ, TermType::BlankNode);
         assert_eq!(serialize_term(&t2.subject.value, &t2.subject.typ), "_:n1");
     }

@@ -2,27 +2,27 @@ use rustc_hash::FxHashMap;
 
 use super::planner::PatternTerm;
 
-/// Kardinalitäts-Primitive für den Planner. Wird sowohl von [`Stats`] (Tests,
-/// vorberechnete Maps) als auch vom `TripleStore` (on-demand aus dem Index,
-/// ohne Speicher-fressende Pair-Count-Maps) implementiert.
+/// Cardinality primitives for the planner. Implemented both by [`Stats`] (tests,
+/// precomputed maps) and by `TripleStore` (on demand from the index, without
+/// memory-hungry pair-count maps).
 pub trait CardEstimator {
     fn total(&self) -> usize;
-    /// #O für (s, p)
+    /// #objects for (s, p)
     fn sp(&self, s: u32, p: u32) -> usize;
-    /// #S für (p, o)
+    /// #subjects for (p, o)
     fn po(&self, p: u32, o: u32) -> usize;
-    /// #P für (o, s)
+    /// #predicates for (o, s)
     fn os(&self, o: u32, s: u32) -> usize;
-    /// #Triple mit Subjekt s
+    /// #triples with subject s
     fn sdeg(&self, s: u32) -> usize;
-    /// #Triple mit Prädikat p
+    /// #triples with predicate p
     fn pdeg(&self, p: u32) -> usize;
-    /// #Triple mit Objekt o
+    /// #triples with object o
     fn odeg(&self, o: u32) -> usize;
 }
 
-/// Schätzt die Kardinalität (Anzahl Ergebnisreihen) eines Tripel-Musters über
-/// einen beliebigen [`CardEstimator`].
+/// Estimates the cardinality (number of result rows) of a triple pattern via
+/// any [`CardEstimator`].
 pub fn estimate_cardinality<E: CardEstimator + ?Sized>(
     est: &E,
     s: &PatternTerm,
@@ -66,11 +66,10 @@ impl CardEstimator for Stats {
     }
 }
 
-/// Statistische Metadaten über den gesamten Triple-Store.
+/// Precomputed statistics over the whole triple store.
 ///
-/// Alle Kardinalitäten sind exakt (keine Stichproben) und in O(1)
-/// abrufbar. Die Paar-Counts erlauben eine präzise Schätzung selbst
-/// für Muster mit zwei gebundenen Termen.
+/// All cardinalities are exact (no sampling) and O(1) to look up. The pair
+/// counts allow a precise estimate even for patterns with two bound terms.
 #[derive(Debug, Clone, Default)]
 pub struct Stats {
     pub total_triples: usize,
@@ -104,7 +103,7 @@ impl Stats {
         stats
     }
 
-    /// Inkrementelles Update: erfasst ein neu hinzugefügtes (distinktes) Triple.
+    /// Incremental update: records a newly added (distinct) triple.
     pub fn add_triple(&mut self, s: u32, p: u32, o: u32) {
         self.total_triples += 1;
         *self.subject_degree.entry(s).or_insert(0) += 1;
@@ -115,8 +114,8 @@ impl Stats {
         *self.osp_pair_count.entry((o, s)).or_insert(0) += 1;
     }
 
-    /// Inkrementelles Update: erfasst ein entferntes Triple. Zähler, die auf
-    /// 0 fallen, werden aus den Maps entfernt.
+    /// Incremental update: records a removed triple. Counters that drop to 0
+    /// are removed from the maps.
     pub fn remove_triple(&mut self, s: u32, p: u32, o: u32) {
         self.total_triples = self.total_triples.saturating_sub(1);
         dec(&mut self.subject_degree, s);
@@ -127,7 +126,7 @@ impl Stats {
         dec(&mut self.osp_pair_count, (o, s));
     }
 
-    /// Anzahl Einträge über alle Maps (für den Memory-Report).
+    /// Number of entries across all maps (for the memory report).
     pub fn entry_count(&self) -> usize {
         self.subject_degree.len()
             + self.predicate_degree.len()
@@ -137,29 +136,29 @@ impl Stats {
             + self.osp_pair_count.len()
     }
 
-    /// Grobe Byte-Schätzung der Statistik-Maps.
+    /// Rough byte estimate of the statistics maps.
     pub fn approx_bytes(&self) -> usize {
-        // Degree-Maps: u32->usize (~14 B/Eintrag mit hashbrown-Overhead).
+        // Degree maps: u32->usize (~14 B/entry incl. hashbrown overhead).
         let deg =
             (self.subject_degree.len() + self.predicate_degree.len() + self.object_degree.len())
                 * 14;
-        // Pair-Maps: (u32,u32)->usize (~20 B/Eintrag).
+        // Pair maps: (u32,u32)->usize (~20 B/entry).
         let pair =
             (self.spo_pair_count.len() + self.pos_pair_count.len() + self.osp_pair_count.len())
                 * 20;
         deg + pair
     }
 
-    /// Schätzt die Kardinalität (Anzahl Ergebnisreihen) eines Musters.
-    /// Läuft in O(1) dank vorberechneter Hash-Maps.
+    /// Estimates the cardinality (number of result rows) of a pattern.
+    /// Runs in O(1) thanks to the precomputed hash maps.
     pub fn estimate_cardinality(&self, s: &PatternTerm, p: &PatternTerm, o: &PatternTerm) -> usize {
         use PatternTerm::{Bound, Variable};
 
         match (s, p, o) {
-            // Exaktes Triple
+            // Exact triple
             (Bound(_), Bound(_), Bound(_)) => 1,
 
-            // Ein Wildcard
+            // One wildcard
             (Bound(sv), Bound(pv), Variable(_)) => {
                 self.spo_pair_count.get(&(*sv, *pv)).copied().unwrap_or(0)
             }
@@ -170,7 +169,7 @@ impl Stats {
                 self.osp_pair_count.get(&(*ov, *sv)).copied().unwrap_or(0)
             }
 
-            // Zwei Wildcards
+            // Two wildcards
             (Bound(sv), Variable(_), Variable(_)) => {
                 self.subject_degree.get(sv).copied().unwrap_or(0)
             }
@@ -181,13 +180,13 @@ impl Stats {
                 self.object_degree.get(ov).copied().unwrap_or(0)
             }
 
-            // Drei Wildcards
+            // Three wildcards
             (Variable(_), Variable(_), Variable(_)) => self.total_triples,
         }
     }
 }
 
-/// Dekrementiert einen Zähler in der Map und entfernt den Eintrag bei 0.
+/// Decrements a counter in the map, removing the entry at 0.
 fn dec<K: std::hash::Hash + Eq>(map: &mut FxHashMap<K, usize>, key: K) {
     if let Some(v) = map.get_mut(&key) {
         if *v <= 1 {

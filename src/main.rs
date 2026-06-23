@@ -7,18 +7,18 @@ use trillian::hypertrie::{
 fn main() {
     const NT_FILE: &str = "synthetic_1m.nt";
 
-    // Falls die Datei noch nicht existiert, zuerst synthetische Daten
-    // generieren und exportieren (einmaliger Bootstrap).
+    // If the file does not exist yet, first generate and export synthetic
+    // data (one-time bootstrap).
     if !std::path::Path::new(NT_FILE).exists() {
-        log("synthetic_1m.nt nicht gefunden – generiere Datei...");
+        log("synthetic_1m.nt not found – generating file...");
         generate_synthetic_nt(NT_FILE);
     }
 
     // ------------------------------------------------------------------
-    // Streamendes Laden + Ingest (Dictionary + CSR-Indizes), ohne den
-    // gesamten Parse-Puffer im Speicher zu halten.
+    // Streaming load + ingest (dictionary + CSR indexes), without keeping
+    // the entire parse buffer in memory.
     // ------------------------------------------------------------------
-    log("Lade N-Triples-Datei (streaming)...");
+    log("Loading N-Triples file (streaming)...");
     let t0 = Instant::now();
     let mut store = TripleStore::new();
     let n_triples = store
@@ -39,7 +39,7 @@ fn main() {
     // ------------------------------------------------------------------
     // 3. Chain-Join Benchmark (azyklisch)
     // ------------------------------------------------------------------
-    // Muster: (?w, predicate_0, ?x) (?x, predicate_1, ?y) (?y, predicate_2, ?z)
+    // Pattern: (?w, predicate_0, ?x) (?x, predicate_1, ?y) (?y, predicate_2, ?z)
     // A linear chain join over three patterns.
     // ------------------------------------------------------------------
     let pid0 = store
@@ -77,11 +77,11 @@ fn main() {
 
     let engine = HybridEngine::new();
 
-    // Einmal ausführen, um Ergebniszahl zu ermitteln
+    // Run once to determine the result count
     let chain_results = engine.execute(&store, &chain_pattern).expect("chain query");
     let chain_count = chain_results.n_rows();
 
-    // Benchmark: 1.000 Durchläufe
+    // Benchmark: 1,000 runs
     const N_CHAIN_RUNS: usize = 1_000;
     let t0 = Instant::now();
     for _ in 0..N_CHAIN_RUNS {
@@ -103,7 +103,7 @@ fn main() {
     // ------------------------------------------------------------------
     // 4. Triangle-Join Benchmark (zyklisch)
     // ------------------------------------------------------------------
-    // Muster: (?a, predicate_0, ?b) (?b, predicate_0, ?c) (?c, predicate_0, ?a)
+    // Pattern: (?a, predicate_0, ?b) (?b, predicate_0, ?c) (?c, predicate_0, ?a)
     // A cyclic triangle join (handled by the WCOJ path).
     // ------------------------------------------------------------------
     let triangle_pattern = GraphPattern {
@@ -126,13 +126,13 @@ fn main() {
         ],
     };
 
-    // Einmal ausführen, um Ergebniszahl zu ermitteln
+    // Run once to determine the result count
     let triangle_results = engine
         .execute(&store, &triangle_pattern)
         .expect("triangle query");
     let triangle_count = triangle_results.n_rows();
 
-    // Benchmark: 20 Durchläufe
+    // Benchmark: 20 runs
     const N_TRIANGLE_RUNS: usize = 20;
     let t0 = Instant::now();
     for _ in 0..N_TRIANGLE_RUNS {
@@ -159,9 +159,9 @@ fn log(msg: &str) {
 fn generate_synthetic_nt(path: &str) {
     use trillian::synthetic::{SyntheticParams, generate};
 
-    // Graph-förmige Daten mit gemeinsamem S/O-Vokabular und eingepflanzten
-    // Dreiecken/Ketten, damit Chain-/Triangle-/Star-Joins echte Treffer
-    // liefern (siehe src/synthetic.rs).
+    // Graph-shaped data with a shared S/O vocabulary and planted
+    // triangles/chains, so chain/triangle/star joins return real matches
+    // (see src/synthetic.rs).
     let params = SyntheticParams::default();
     let owned = generate(&params);
     let str_triples: Vec<(&str, &str, &str)> = owned
@@ -171,7 +171,7 @@ fn generate_synthetic_nt(path: &str) {
 
     export_ntriples(path, &str_triples).expect("bootstrap export failed");
     log(&format!(
-        "{} mit {} Triples erzeugt (graph-förmig, {} Dreiecke, {} Ketten).",
+        "generated {} with {} triples (graph-shaped, {} triangles, {} chains).",
         path, params.n_triples, params.n_triangles, params.n_chains
     ));
 }

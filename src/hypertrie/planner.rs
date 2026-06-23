@@ -31,9 +31,9 @@ pub struct GraphPattern {
 }
 
 impl GraphPattern {
-    /// Liefert alle Variablen in ihrer ersten Erscheinungsreihenfolge.
-    /// Das ist dieselbe Reihenfolge, in der `execute_plan` und `execute_wcoj`
-    /// die Ergebniszeilen materialisieren.
+    /// Returns all variables in order of first appearance.
+    /// This is the same order in which `execute_plan` and `execute_wcoj`
+    /// materialize the result rows.
     pub fn variable_order(&self) -> Vec<&String> {
         let mut seen = rustc_hash::FxHashSet::default();
         let mut order = Vec::new();
@@ -59,7 +59,7 @@ pub struct ExecutionPlan {
 }
 
 impl ExecutionPlan {
-    /// Naive Plan: führt die Muster in der Reihenfolge der Eingabe aus.
+    /// Naive plan: executes the patterns in input order.
     pub fn naive(n: usize) -> Self {
         Self {
             steps: (0..n).map(|i| PlanStep { pattern_index: i }).collect(),
@@ -68,14 +68,14 @@ impl ExecutionPlan {
 }
 
 impl GraphPattern {
-    /// Kostenbasierter, gieriger Optimierer.
+    /// Cost-based greedy optimizer.
     ///
-    /// 1. Starte mit dem selektivsten Muster (niedrigste Kardinalität).
-    /// 2. Füge immer das noch nicht geplante Muster hinzu, das
-    ///    a) mindestens eine Variable mit dem bereits geplanten Teil teilt und
-    ///    b) unter diesen die niedrigste Kardinalität hat.
-    /// 3. Falls keine Verbindung besteht (z. B. Kreuzprodukt), nimm das
-    ///    selektivste verbleibende Muster.
+    /// 1. Start with the most selective pattern (lowest cardinality).
+    /// 2. Always add the not-yet-planned pattern that
+    ///    a) shares at least one variable with the already-planned part and
+    ///    b) has the lowest cardinality among those.
+    /// 3. If there is no connection (e.g. a cross product), take the most
+    ///    selective remaining pattern.
     pub fn optimize<E: CardEstimator + ?Sized>(&self, est: &E) -> ExecutionPlan {
         let n = self.patterns.len();
         if n == 0 {
@@ -85,7 +85,7 @@ impl GraphPattern {
         let mut planned = vec![false; n];
         let mut steps = Vec::with_capacity(n);
 
-        // Schritt 1: selektivstes Muster als Startpunkt
+        // Step 1: most selective pattern as the starting point
         let mut best_idx = 0;
         let mut best_cost = usize::MAX;
         for (i, pat) in self.patterns.iter().enumerate() {
@@ -100,7 +100,7 @@ impl GraphPattern {
             pattern_index: best_idx,
         });
 
-        // Schritt 2+ : gierig verbundene Muster hinzufügen
+        // Step 2+: greedily add connected patterns
         while steps.len() < n {
             let mut pick = None;
             let mut pick_cost = usize::MAX;
@@ -126,7 +126,7 @@ impl GraphPattern {
                 }
             }
 
-            // Fallback: keine Verbindung -> selektivstes verbleibendes Muster
+            // Fallback: no connection -> most selective remaining pattern
             let idx = pick.unwrap_or_else(|| {
                 let mut best = 0;
                 let mut best_cost = usize::MAX;
@@ -220,9 +220,9 @@ mod tests {
         let pattern = make_pattern();
         let plan = pattern.optimize(&stats);
 
-        // Nach Pattern 1 (y) muss Pattern 0 folgen, weil es y teilt.
+        // After pattern 1 (y), pattern 0 must follow because it shares y.
         assert_eq!(plan.steps[1].pattern_index, 0);
-        // Pattern 2 teilt x mit Pattern 0.
+        // Pattern 2 shares x with pattern 0.
         assert_eq!(plan.steps[2].pattern_index, 2);
     }
 }
