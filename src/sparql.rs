@@ -1098,17 +1098,17 @@ fn append_term(out: &mut String, id: u32, dict: &Dictionary) {
     match (dict.resolve(id), dict.resolve_type(id)) {
         (Some(v), Some(TermType::Iri)) => {
             out.push_str("{\"type\":\"uri\",\"value\":");
-            append_json_str(out, v);
+            append_json_str(out, &v);
             out.push('}');
         }
         (Some(v), Some(TermType::BlankNode)) => {
             out.push_str("{\"type\":\"bnode\",\"value\":");
-            append_json_str(out, v);
+            append_json_str(out, &v);
             out.push('}');
         }
         (Some(v), Some(TermType::Literal { datatype, lang })) => {
             out.push_str("{\"type\":\"literal\",\"value\":");
-            append_json_str(out, v);
+            append_json_str(out, &v);
             if let Some(dt) = &datatype {
                 out.push_str(",\"datatype\":");
                 append_json_str(out, dt);
@@ -1121,7 +1121,7 @@ fn append_term(out: &mut String, id: u32, dict: &Dictionary) {
         }
         (Some(v), _) => {
             out.push_str("{\"type\":\"literal\",\"value\":");
-            append_json_str(out, v);
+            append_json_str(out, &v);
             out.push('}');
         }
         (None, _) => {
@@ -1415,7 +1415,7 @@ fn term_to_fv(id: u32, store: &TripleStore) -> Option<Fv> {
         TermType::Iri => Some(Fv::Iri(v.to_string())),
         TermType::BlankNode => Some(Fv::Blank(v.to_string())),
         TermType::Literal { datatype, lang } => {
-            Some(classify(v, datatype.as_deref(), lang.as_deref()))
+            Some(classify(&v, datatype.as_deref(), lang.as_deref()))
         }
     }
 }

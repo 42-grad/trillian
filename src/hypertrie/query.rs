@@ -12,7 +12,7 @@ use super::stats::CardEstimator;
 /// werden beide geprüft, damit ein altes/fremdes Format einen Fehler liefert,
 /// statt still falsche Daten zu mappen.
 const SNAP_MAGIC: &[u8; 8] = b"TTRSNAP1";
-const SNAP_VERSION: u32 = 2; // v2: Dictionary serialisiert rohe Schlüssel (Typ im Präfix)
+const SNAP_VERSION: u32 = 3; // v3: namespace-gefaltete Dictionary-Schlüssel
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Var {
@@ -312,12 +312,15 @@ impl TripleStore {
     }
 
     fn serialize_id(&self, id: u32) -> String {
-        let value = self.dict.resolve(id).unwrap_or("");
+        let value = self
+            .dict
+            .resolve(id)
+            .unwrap_or(std::borrow::Cow::Borrowed(""));
         let typ = self
             .dict
             .resolve_type(id)
             .unwrap_or(super::dictionary::TermType::Iri);
-        super::export::serialize_term(value, &typ)
+        super::export::serialize_term(&value, &typ)
     }
 
     /// Baut alle Indizes aus einer Triple-Liste neu auf (Bulk-Load).
@@ -360,7 +363,11 @@ impl TripleStore {
         let mb = |b: usize| b as f64 / 1024.0 / 1024.0;
         let perm = self.spo.heap_bytes() + self.pos.heap_bytes() + self.osp.heap_bytes();
         let dict = self.dict.approx_bytes();
-        let pred: usize = self.pred_subjects.values().map(|v| v.len() * 4).sum::<usize>();
+        let pred: usize = self
+            .pred_subjects
+            .values()
+            .map(|v| v.len() * 4)
+            .sum::<usize>();
         let total = perm + dict + pred;
         println!(
             "=== Memory-Report (logisch, {} Triples) ===",

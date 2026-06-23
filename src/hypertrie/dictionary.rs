@@ -1,6 +1,62 @@
+use std::borrow::Cow;
+
 use string_interner::backend::StringBackend;
 use string_interner::symbol::SymbolU32;
 use string_interner::{StringInterner, Symbol};
+
+/// Escape-Byte für ein gefaltetes Namespace-Präfix. `0x02` kommt in IRIs,
+/// Literalen und Sprach-/Datentyp-Strings nicht vor (wie `SEP` = `0x01`).
+const NS_ESC: char = '\u{2}';
+
+/// Bekannte lange IRI-Präfixe. Bei echten Wikidata-Daten machen `entity/Q*` und
+/// `prop/direct/P*` den Großteil aller IRIs aus; ihr Präfix (29–37 Zeichen)
+/// wiederholt sich millionenfach. Folding ersetzt ihn durch 2 Bytes
+/// (`NS_ESC` + Code). **Längste zuerst** (greedy). Index = Code-Offset ab 'A'.
+const NS_PREFIXES: &[&str] = &[
+    "http://www.wikidata.org/entity/statement/",
+    "http://www.wikidata.org/prop/direct-normalized/",
+    "http://www.wikidata.org/prop/direct/",
+    "http://www.wikidata.org/prop/statement/",
+    "http://www.wikidata.org/prop/qualifier/",
+    "http://www.wikidata.org/prop/reference/",
+    "http://www.wikidata.org/entity/",
+    "http://www.wikidata.org/prop/",
+    "http://www.w3.org/2001/XMLSchema#",
+    "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+    "http://www.w3.org/2000/01/rdf-schema#",
+    "http://www.w3.org/2004/02/skos/core#",
+    "http://schema.org/",
+];
+
+/// Faltet ein bekanntes Präfix eines IRI in `NS_ESC` + 1-Byte-Code. Kein Treffer
+/// -> unverändert geliehen (z. B. Literale, fremde IRIs).
+fn fold_iri(iri: &str) -> Cow<'_, str> {
+    for (i, pre) in NS_PREFIXES.iter().enumerate() {
+        if let Some(rest) = iri.strip_prefix(pre) {
+            let mut s = String::with_capacity(2 + rest.len());
+            s.push(NS_ESC);
+            s.push((b'A' + i as u8) as char);
+            s.push_str(rest);
+            return Cow::Owned(s);
+        }
+    }
+    Cow::Borrowed(iri)
+}
+
+/// Kehrt [`fold_iri`] um.
+fn unfold_iri(folded: &str) -> Cow<'_, str> {
+    let b = folded.as_bytes();
+    if b.first() == Some(&0x02) && b.len() >= 2 {
+        let idx = (b[1].wrapping_sub(b'A')) as usize;
+        if let Some(pre) = NS_PREFIXES.get(idx) {
+            let mut s = String::with_capacity(pre.len() + folded.len());
+            s.push_str(pre);
+            s.push_str(&folded[2..]);
+            return Cow::Owned(s);
+        }
+    }
+    Cow::Borrowed(folded)
+}
 
 /// String-Interner: alle Term-Strings liegen in **einer** Arena (statt je einem
 /// eigenen `String`), Symbole sind fortlaufende 0-basierte u32-IDs.
@@ -64,14 +120,16 @@ const SEP: char = '\u{1}';
 /// bleibt zusammenhängendes Suffix, sodass [`decode_value`] zero-copy slicen kann.
 fn encode_key(value: &str, typ: &TermType) -> String {
     match typ {
-        TermType::Iri => format!("I{SEP}{value}"),
+        // IRI-Wert + Datentyp-IRI werden namespace-gefaltet (lange Wikidata/XSD-
+        // Präfixe -> 2 Bytes). Lexikalwerte von Literalen bleiben unverändert.
+        TermType::Iri => format!("I{SEP}{}", fold_iri(value)),
         TermType::BlankNode => format!("B{SEP}{value}"),
         TermType::Literal { lang: Some(l), .. } => format!("G{l}{SEP}{value}"),
         TermType::Literal {
             datatype: Some(d),
             lang: None,
         } if d != XSD_STRING => {
-            format!("D{d}{SEP}{value}")
+            format!("D{}{SEP}{value}", fold_iri(d))
         }
         // einfaches Literal oder explizit xsd:string -> derselbe Schlüssel
         TermType::Literal { .. } => format!("L{SEP}{value}"),
@@ -102,9 +160,9 @@ fn decode_type(key: &str) -> TermType {
             TermType::literal_lang(&key[1..sep])
         }
         Some(b'D') => {
-            // D<datatype>\x01<value>  -> typisiertes Literal
+            // D<datatype>\x01<value>  -> typisiertes Literal (Datentyp entfalten)
             let sep = key.find(SEP).unwrap_or(key.len());
-            TermType::literal_datatype(&key[1..sep])
+            TermType::literal_datatype(unfold_iri(&key[1..sep]).into_owned())
         }
         _ => TermType::Iri, // defensiv
     }
@@ -158,9 +216,17 @@ impl Dictionary {
     }
 
     /// Löst eine ID in den ursprünglichen Lexikalwert auf (ohne Typ-Präfix).
+    /// IRIs werden namespace-entfaltet (dann `Cow::Owned`); Literale/Blank Nodes
+    /// bleiben zero-copy geliehen (der häufigste Fall bei echten Daten).
     #[inline]
-    pub fn resolve(&self, id: u32) -> Option<&str> {
-        self.raw_key(id).map(decode_value)
+    pub fn resolve(&self, id: u32) -> Option<Cow<'_, str>> {
+        let key = self.raw_key(id)?;
+        let val = decode_value(key);
+        if key.as_bytes().first() == Some(&b'I') {
+            Some(unfold_iri(val))
+        } else {
+            Some(Cow::Borrowed(val))
+        }
     }
 
     /// Liefert den Typ eines Terms (aus dem Schlüssel-Präfix rekonstruiert).
@@ -255,7 +321,7 @@ mod tests {
         let id = d.insert_with_type("25", TermType::literal_datatype(dt));
         d.insert_with_type("25", TermType::Iri);
 
-        assert_eq!(d.resolve(id), Some("25"));
+        assert_eq!(d.resolve(id).as_deref(), Some("25"));
         assert_eq!(
             d.lookup_term("25", &TermType::literal_datatype(dt)),
             Some(id)
@@ -276,7 +342,41 @@ mod tests {
         let mut d = Dictionary::new();
         let weird = "a\u{1}b";
         let id = d.insert_with_type(weird, TermType::literal_plain());
-        assert_eq!(d.resolve(id), Some(weird));
+        assert_eq!(d.resolve(id).as_deref(), Some(weird));
         assert_eq!(d.lookup_term(weird, &TermType::literal_plain()), Some(id));
+    }
+}
+
+#[cfg(test)]
+mod nsfold {
+    use super::*;
+    #[test]
+    fn namespace_folding_roundtrip() {
+        let mut d = Dictionary::new();
+        let q = "http://www.wikidata.org/entity/Q42";
+        let p = "http://www.wikidata.org/prop/direct/P31";
+        let other = "http://example.org/x";
+        let iq = d.insert(q);
+        let ip = d.insert(p);
+        let io = d.insert(other);
+        // Volle IRIs kommen unverändert zurück (entfaltet).
+        assert_eq!(d.resolve(iq).as_deref(), Some(q));
+        assert_eq!(d.resolve(ip).as_deref(), Some(p));
+        assert_eq!(d.resolve(io).as_deref(), Some(other));
+        // Lookup über die volle IRI findet den gefalteten Schlüssel.
+        assert_eq!(d.lookup_iri(q), Some(iq));
+        assert_eq!(d.lookup_iri(p), Some(ip));
+        // Gefalteter Schlüssel ist tatsächlich kürzer als die volle IRI.
+        assert!(d.raw_key(iq).unwrap().len() < q.len());
+        // Typisiertes Literal mit XSD-Datentyp: Datentyp wird gefaltet + entfaltet.
+        let dt = "http://www.w3.org/2001/XMLSchema#integer";
+        let il = d.insert_with_type("25", TermType::literal_datatype(dt));
+        assert_eq!(d.resolve(il).as_deref(), Some("25"));
+        match d.resolve_type(il) {
+            Some(TermType::Literal {
+                datatype: Some(g), ..
+            }) => assert_eq!(g, dt),
+            other => panic!("erwartete typisiertes Literal, {other:?}"),
+        }
     }
 }
