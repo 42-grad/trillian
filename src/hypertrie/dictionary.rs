@@ -6,14 +6,14 @@ use string_interner::backend::StringBackend;
 use string_interner::symbol::SymbolU32;
 use string_interner::{StringInterner, Symbol};
 
-/// Escape-Byte für ein gefaltetes Namespace-Präfix. `0x02` kommt in IRIs,
-/// Literalen und Sprach-/Datentyp-Strings nicht vor (wie `SEP` = `0x01`).
+/// Escape byte for a folded namespace prefix. `0x02` does not occur in IRIs,
+/// literals, or language/datatype strings (like `SEP` = `0x01`).
 const NS_ESC: char = '\u{2}';
 
-/// Bekannte lange IRI-Präfixe. Bei echten Wikidata-Daten machen `entity/Q*` und
-/// `prop/direct/P*` den Großteil aller IRIs aus; ihr Präfix (29–37 Zeichen)
-/// wiederholt sich millionenfach. Folding ersetzt ihn durch 2 Bytes
-/// (`NS_ESC` + Code). **Längste zuerst** (greedy). Index = Code-Offset ab 'A'.
+/// Known long IRI prefixes. On real Wikidata data `entity/Q*` and
+/// `prop/direct/P*` make up the bulk of all IRIs; their prefix (29–37 chars)
+/// repeats millions of times. Folding replaces it with 2 bytes (`NS_ESC` +
+/// code). **Longest first** (greedy). Index = code offset from 'A'.
 const NS_PREFIXES: &[&str] = &[
     "http://www.wikidata.org/entity/statement/",
     "http://www.wikidata.org/prop/direct-normalized/",
@@ -30,8 +30,8 @@ const NS_PREFIXES: &[&str] = &[
     "http://schema.org/",
 ];
 
-/// Faltet ein bekanntes Präfix eines IRI in `NS_ESC` + 1-Byte-Code. Kein Treffer
-/// -> unverändert geliehen (z. B. Literale, fremde IRIs).
+/// Folds a known prefix of an IRI into `NS_ESC` + a 1-byte code. No match
+/// -> borrowed unchanged (e.g. literals, foreign IRIs).
 fn fold_iri(iri: &str) -> Cow<'_, str> {
     for (i, pre) in NS_PREFIXES.iter().enumerate() {
         if let Some(rest) = iri.strip_prefix(pre) {
@@ -45,7 +45,7 @@ fn fold_iri(iri: &str) -> Cow<'_, str> {
     Cow::Borrowed(iri)
 }
 
-/// Kehrt [`fold_iri`] um.
+/// Inverse of [`fold_iri`].
 fn unfold_iri(folded: &str) -> Cow<'_, str> {
     let b = folded.as_bytes();
     if b.first() == Some(&0x02) && b.len() >= 2 {
@@ -60,13 +60,13 @@ fn unfold_iri(folded: &str) -> Cow<'_, str> {
     Cow::Borrowed(folded)
 }
 
-/// String-Interner: alle Term-Strings liegen in **einer** Arena (statt je einem
-/// eigenen `String`), Symbole sind fortlaufende 0-basierte u32-IDs.
+/// String interner: all term strings live in **one** arena (instead of one
+/// `String` each), symbols are consecutive 0-based u32 IDs.
 type Interner = StringInterner<StringBackend<SymbolU32>>;
 
-/// Typ eines RDF-Terms. Wird pro Dictionary-ID gespeichert, damit die
-/// SPARQL-Ausgabe (term_to_json) zwischen IRI, Literal mit Datentyp und
-/// Literal mit Sprach-Tag unterscheiden kann.
+/// Type of an RDF term. Stored per dictionary ID so the SPARQL output
+/// (term_to_json) can distinguish between IRI, literal with datatype, and
+/// literal with language tag.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TermType {
     Iri,
@@ -104,26 +104,26 @@ impl TermType {
     }
 }
 
-/// `xsd:string` – ein einfaches Literal (`datatype: None`) ist nach RDF 1.1
-/// **identisch** zu einem explizit mit `xsd:string` typisierten Literal. Beide
-/// müssen daher denselben Dictionary-Schlüssel erhalten.
+/// `xsd:string` – a plain literal (`datatype: None`) is, per RDF 1.1,
+/// **identical** to a literal explicitly typed with `xsd:string`. Both must
+/// therefore get the same dictionary key.
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 
-/// Trenner zwischen Typ-Präfix und Lexikalwert im internierten Schlüssel.
-/// `0x01` kommt in normalen IRIs, Datentyp-IRIs und Sprach-Tags nicht vor; der
-/// (beliebige) Lexikalwert steht als Suffix nach dem **ersten** Vorkommen.
+/// Separator between the type prefix and the lexical value in the interned key.
+/// `0x01` does not occur in normal IRIs, datatype IRIs, or language tags; the
+/// (arbitrary) lexical value follows as a suffix after the **first** occurrence.
 const SEP: char = '\u{1}';
 
-/// Baut den eindeutigen Interner-Schlüssel aus Lexikalwert **und** Typ.
+/// Builds the unique interner key from the lexical value **and** type.
 ///
-/// Ohne Typ im Schlüssel kollabieren z. B. `"25"^^xsd:integer`,
-/// `"25"^^xsd:string` und der IRI `25` zu einer einzigen ID – ein
-/// Korrektheitsfehler bei typisierten Literal-Constraints. Der Lexikalwert
-/// bleibt zusammenhängendes Suffix, sodass [`decode_value`] zero-copy slicen kann.
+/// Without the type in the key, `"25"^^xsd:integer`, `"25"^^xsd:string`, and the
+/// IRI `25` would collapse to a single ID – a correctness bug for typed-literal
+/// constraints. The lexical value stays a contiguous suffix, so [`decode_value`]
+/// can slice it zero-copy.
 fn encode_key(value: &str, typ: &TermType) -> String {
     match typ {
-        // IRI-Wert + Datentyp-IRI werden namespace-gefaltet (lange Wikidata/XSD-
-        // Präfixe -> 2 Bytes). Lexikalwerte von Literalen bleiben unverändert.
+        // IRI value + datatype IRI are namespace-folded (long Wikidata/XSD
+        // prefixes -> 2 bytes). Lexical values of literals stay unchanged.
         TermType::Iri => format!("I{SEP}{}", fold_iri(value)),
         TermType::BlankNode => format!("B{SEP}{value}"),
         TermType::Literal { lang: Some(l), .. } => format!("G{l}{SEP}{value}"),
@@ -133,23 +133,23 @@ fn encode_key(value: &str, typ: &TermType) -> String {
         } if d != XSD_STRING => {
             format!("D{}{SEP}{value}", fold_iri(d))
         }
-        // einfaches Literal oder explizit xsd:string -> derselbe Schlüssel
+        // plain literal or explicit xsd:string -> same key
         TermType::Literal { .. } => format!("L{SEP}{value}"),
     }
 }
 
-/// Holt den Lexikalwert aus einem internierten Schlüssel zurück (zero-copy).
+/// Recovers the lexical value from an interned key (zero-copy).
 #[inline]
 fn decode_value(key: &str) -> &str {
     match key.find(SEP) {
         Some(i) => &key[i + SEP.len_utf8()..],
-        None => key, // sollte nicht vorkommen; defensiv
+        None => key, // should not happen; defensive
     }
 }
 
-/// Rekonstruiert den Term-Typ aus dem Präfix eines internierten Schlüssels.
-/// Der Typ ist vollständig im Schlüssel kodiert (siehe [`encode_key`]) – eine
-/// separate `Vec<TermType>` (48 B/Term + eigene Strings) ist damit überflüssig.
+/// Reconstructs the term type from the prefix of an interned key.
+/// The type is fully encoded in the key (see [`encode_key`]) – a separate
+/// `Vec<TermType>` (48 B/term + its own strings) is thus unnecessary.
 fn decode_type(key: &str) -> TermType {
     let bytes = key.as_bytes();
     match bytes.first() {
@@ -157,38 +157,38 @@ fn decode_type(key: &str) -> TermType {
         Some(b'B') => TermType::BlankNode,
         Some(b'L') => TermType::literal_plain(),
         Some(b'G') => {
-            // G<lang>\x01<value>  -> Sprach-Literal
+            // G<lang>\x01<value>  -> language literal
             let sep = key.find(SEP).unwrap_or(key.len());
             TermType::literal_lang(&key[1..sep])
         }
         Some(b'D') => {
-            // D<datatype>\x01<value>  -> typisiertes Literal (Datentyp entfalten)
+            // D<datatype>\x01<value>  -> typed literal (unfold the datatype)
             let sep = key.find(SEP).unwrap_or(key.len());
             TermType::literal_datatype(unfold_iri(&key[1..sep]).into_owned())
         }
-        _ => TermType::Iri, // defensiv
+        _ => TermType::Iri, // defensive
     }
 }
 
-/// Read-only Dictionary-Basis, **zero-copy aus dem mmap-Snapshot**. Hält keine
-/// Strings im RAM – Schlüssel, Offsets und der sortierte Lookup-Index liegen in
-/// der gemappten Datei (über `Arc<Mmap>` am Leben gehalten). Spiegelt das
-/// base+delta-Pattern des Index: `MappedDict` = Basis, `Interner` = Overlay.
+/// Read-only dictionary base, **zero-copy from the mmap snapshot**. Holds no
+/// strings in RAM – keys, offsets, and the sorted lookup index live in the
+/// mapped file (kept alive via `Arc<Mmap>`). Mirrors the index's base+delta
+/// pattern: `MappedDict` = base, `Interner` = overlay.
 #[derive(Debug)]
 struct MappedDict {
     map: Arc<Mmap>,
     n: usize,
-    keys_off: usize,   // Byte-Offset des Schlüssel-Blobs
-    keys_len: usize,   // Länge des Blobs in Bytes
-    offs_off: usize,   // Byte-Offset des u32-Offset-Arrays (n+1 Einträge)
-    sorted_off: usize, // Byte-Offset des u32-Arrays sortierter IDs (n Einträge, Lookup)
+    keys_off: usize,   // byte offset of the key blob
+    keys_len: usize,   // length of the blob in bytes
+    offs_off: usize,   // byte offset of the u32 offset array (n+1 entries)
+    sorted_off: usize, // byte offset of the u32 array of sorted IDs (n entries, lookup)
 }
 
 impl MappedDict {
     #[inline]
     fn key_offsets(&self) -> &[u64] {
-        // u64: der Blob übersteigt bei Vollskala 4 GB -> u32-Offsets würden
-        // überlaufen (365M Terme × ~20 B ≈ 7 GB).
+        // u64: at full scale the blob exceeds 4 GB -> u32 offsets would
+        // overflow (365M terms × ~20 B ≈ 7 GB).
         bytemuck::cast_slice(&self.map[self.offs_off..self.offs_off + (self.n + 1) * 8])
     }
     #[inline]
@@ -199,10 +199,10 @@ impl MappedDict {
     fn key(&self, id: usize) -> &str {
         let o = self.key_offsets();
         let blob = &self.map[self.keys_off..self.keys_off + self.keys_len];
-        // SAFETY: serialize schreibt ausschließlich gültige UTF-8-Schlüssel.
+        // SAFETY: serialize writes only valid UTF-8 keys.
         unsafe { std::str::from_utf8_unchecked(&blob[o[id] as usize..o[id + 1] as usize]) }
     }
-    /// Binärsuche über die nach Schlüssel sortierten IDs. O(log n).
+    /// Binary search over the key-sorted IDs. O(log n).
     fn lookup(&self, key: &str) -> Option<u32> {
         let ids = self.sorted_ids();
         let (mut lo, mut hi) = (0usize, ids.len());
@@ -218,17 +218,17 @@ impl MappedDict {
     }
 }
 
-/// Bidirektionales String ↔ u32 Dictionary mit Term-Typ-Information.
+/// Bidirectional String ↔ u32 dictionary with term-type information.
 ///
-/// Strings werden **interniert** (eine Arena, jeder Schlüssel einmal). Der
-/// Term-Typ ist im Schlüssel-Präfix kodiert ([`encode_key`]) und wird bei Bedarf
-/// per [`decode_type`] rekonstruiert – keine parallele `Vec<TermType>`.
+/// Strings are **interned** (one arena, each key once). The term type is encoded
+/// in the key prefix ([`encode_key`]) and reconstructed on demand via
+/// [`decode_type`] – no parallel `Vec<TermType>`.
 ///
-/// Zweimodig: beim Bau/Update liegen alle Terme im `interner` (owned). Aus einem
-/// Snapshot geladen, bildet `mapped` die **zero-copy** Basis (IDs `0..base_n`)
-/// und der `interner` nimmt nur **nach** dem Laden hinzugefügte Terme auf
-/// (IDs ab `base_n`). Das hält den residenten RAM niedrig: die Term-Strings
-/// liegen pageable im mmap statt owned im Heap.
+/// Two-mode: during build/update all terms live in the `interner` (owned).
+/// Loaded from a snapshot, `mapped` forms the **zero-copy** base (IDs
+/// `0..base_n`) and the `interner` only takes terms added **after** loading
+/// (IDs from `base_n`). This keeps resident RAM low: the term strings live
+/// pageable in the mmap instead of owned on the heap.
 #[derive(Debug, Default)]
 pub struct Dictionary {
     mapped: Option<MappedDict>,
@@ -237,8 +237,7 @@ pub struct Dictionary {
 
 impl Clone for Dictionary {
     fn clone(&self) -> Self {
-        // Geklonte Dictionaries teilen sich die mmap-Basis (Arc), der Overlay
-        // wird kopiert.
+        // Cloned dictionaries share the mmap base (Arc); the overlay is copied.
         Self {
             mapped: self.mapped.as_ref().map(|m| MappedDict {
                 map: m.map.clone(),
@@ -263,8 +262,8 @@ impl Dictionary {
         self.mapped.as_ref().map_or(0, |m| m.n)
     }
 
-    /// Liefert den rohen Schlüssel (inkl. Typ-Präfix) zu einer ID – aus der
-    /// mmap-Basis (id < base_n) oder dem Overlay-Interner.
+    /// Returns the raw key (incl. type prefix) for an ID – from the mmap base
+    /// (id < base_n) or the overlay interner.
     #[inline]
     fn raw_key(&self, id: u32) -> Option<&str> {
         let base = self.base_n();
@@ -275,8 +274,8 @@ impl Dictionary {
         }
     }
 
-    /// Fügt einen Term mit Typ hinzu oder liefert die existierende ID. Bereits in
-    /// der mmap-Basis vorhandene Terme werden **nicht** dupliziert.
+    /// Adds a term with type or returns the existing ID. Terms already present
+    /// in the mmap base are **not** duplicated.
     pub fn insert_with_type(&mut self, term: &str, typ: TermType) -> u32 {
         let key = encode_key(term, &typ);
         if let Some(m) = &self.mapped
@@ -287,12 +286,12 @@ impl Dictionary {
         self.base_n() as u32 + self.interner.get_or_intern(&key).to_usize() as u32
     }
 
-    /// Fügt einen IRI-Term hinzu (Rückwärtskompatibilität).
+    /// Adds an IRI term (backward compatibility).
     pub fn insert(&mut self, term: &str) -> u32 {
         self.insert_with_type(term, TermType::Iri)
     }
 
-    /// Liefert die ID eines Terms anhand von Lexikalwert **und** Typ.
+    /// Returns the ID of a term by lexical value **and** type.
     #[inline]
     pub fn lookup_term(&self, value: &str, typ: &TermType) -> Option<u32> {
         let key = encode_key(value, typ);
@@ -306,15 +305,15 @@ impl Dictionary {
             .map(|s| self.base_n() as u32 + s.to_usize() as u32)
     }
 
-    /// Bequemlichkeit: ID eines IRI-Terms.
+    /// Convenience: ID of an IRI term.
     #[inline]
     pub fn lookup_iri(&self, iri: &str) -> Option<u32> {
         self.lookup_term(iri, &TermType::Iri)
     }
 
-    /// Löst eine ID in den ursprünglichen Lexikalwert auf (ohne Typ-Präfix).
-    /// IRIs werden namespace-entfaltet (dann `Cow::Owned`); Literale/Blank Nodes
-    /// bleiben zero-copy geliehen (der häufigste Fall bei echten Daten).
+    /// Resolves an ID to its original lexical value (without the type prefix).
+    /// IRIs are namespace-unfolded (then `Cow::Owned`); literals/blank nodes stay
+    /// borrowed zero-copy (the most common case on real data).
     #[inline]
     pub fn resolve(&self, id: u32) -> Option<Cow<'_, str>> {
         let key = self.raw_key(id)?;
@@ -326,14 +325,14 @@ impl Dictionary {
         }
     }
 
-    /// Liefert den Typ eines Terms (aus dem Schlüssel-Präfix rekonstruiert).
+    /// Returns the type of a term (reconstructed from the key prefix).
     #[inline]
     pub fn resolve_type(&self, id: u32) -> Option<TermType> {
         self.raw_key(id).map(decode_type)
     }
 
-    /// Grobe Byte-Schätzung des **owned** RAM (für den Memory-Report). Die
-    /// mmap-Basis zählt nicht (pageable, zero-copy); nur der Overlay-Interner.
+    /// Rough byte estimate of the **owned** RAM (for the memory report). The
+    /// mmap base does not count (pageable, zero-copy); only the overlay interner.
     pub fn approx_bytes(&self) -> usize {
         let base = self.base_n() as u32;
         let n_overlay = self.interner.len();
@@ -354,18 +353,18 @@ impl Dictionary {
         self.len() == 0
     }
 
-    /// Serialisiert das Dictionary mmap-freundlich. Der Aufrufer stellt sicher,
-    /// dass die aktuelle `buf`-Länge **4-Byte-aligned** ist. Layout:
-    /// `[n:u32][key_offsets:(n+1)×u32][keys_blob:bytes][pad4][sorted_ids:n×u32]`.
-    /// `key_offsets` sind kumulative Byte-Offsets in den Blob (ID-Reihenfolge);
-    /// `sorted_ids` sind die nach Schlüssel sortierten IDs (Lookup per Binärsuche).
+    /// Serializes the dictionary mmap-friendly. The caller ensures the current
+    /// `buf` length is **4-byte aligned**. Layout:
+    /// `[n:u32][key_offsets:(n+1)×u64][keys_blob:bytes][pad4][sorted_ids:n×u32]`.
+    /// `key_offsets` are cumulative byte offsets into the blob (ID order);
+    /// `sorted_ids` are the key-sorted IDs (lookup via binary search).
     pub fn serialize_into(&self, buf: &mut Vec<u8>) {
         let n = self.len();
         buf.extend_from_slice(&(n as u32).to_le_bytes());
         while !buf.len().is_multiple_of(8) {
-            buf.push(0); // u64-Offset-Array 8-Byte-aligned beginnen
+            buf.push(0); // start the u64 offset array 8-byte aligned
         }
-        // key_offsets (kumulativ, n+1 Einträge, u64 wegen >4 GB Blob bei Vollskala)
+        // key_offsets (cumulative, n+1 entries, u64 because of >4 GB blob at full scale)
         let mut offsets: Vec<u64> = Vec::with_capacity(n + 1);
         let mut acc = 0u64;
         offsets.push(0);
@@ -374,14 +373,14 @@ impl Dictionary {
             offsets.push(acc);
         }
         buf.extend_from_slice(bytemuck::cast_slice(&offsets));
-        // keys_blob (in ID-Reihenfolge, direkt geschrieben – kein Zwischenpuffer)
+        // keys_blob (in ID order, written directly – no intermediate buffer)
         for id in 0..n as u32 {
             buf.extend_from_slice(self.raw_key(id).unwrap_or("").as_bytes());
         }
         while !buf.len().is_multiple_of(4) {
             buf.push(0);
         }
-        // sorted_ids: IDs nach Schlüssel sortiert
+        // sorted_ids: IDs sorted by key
         let mut ids: Vec<u32> = (0..n as u32).collect();
         ids.sort_by(|&a, &b| {
             self.raw_key(a)
@@ -391,12 +390,12 @@ impl Dictionary {
         buf.extend_from_slice(bytemuck::cast_slice(&ids));
     }
 
-    /// Baut ein **mmap-backed** Dictionary aus dem Snapshot (zero-copy, kein
-    /// owned RAM für die Term-Strings). `dict_off` muss 8-Byte-aligned sein.
+    /// Builds an **mmap-backed** dictionary from the snapshot (zero-copy, no
+    /// owned RAM for the term strings). `dict_off` must be 8-byte aligned.
     pub fn from_mapped(map: Arc<Mmap>, dict_off: usize) -> Self {
         let b: &[u8] = &map;
         let n = u32::from_le_bytes(b[dict_off..dict_off + 4].try_into().unwrap()) as usize;
-        // n:u32 + Padding -> u64-Offset-Array beginnt 8-aligned bei dict_off+8.
+        // n:u32 + padding -> u64 offset array starts 8-aligned at dict_off+8.
         let offs_off = dict_off + 8;
         let keys_off = offs_off + (n + 1) * 8;
         let keys_len = u64::from_le_bytes(
@@ -426,7 +425,7 @@ impl Dictionary {
 mod tests {
     use super::*;
 
-    /// Gleicher Lexikalwert, aber verschiedene Typen -> verschiedene IDs.
+    /// Same lexical value but different types -> different IDs.
     #[test]
     fn distinct_terms_for_same_lexical_value() {
         let mut d = Dictionary::new();
@@ -441,12 +440,12 @@ mod tests {
         assert_ne!(i_int, i_str, "integer != string");
         assert_ne!(i_int, i_iri, "integer != IRI");
         assert_ne!(i_str, i_iri, "string != IRI");
-        // einfaches Literal und explizites xsd:string sind nach RDF 1.1 identisch
+        // plain literal and explicit xsd:string are identical per RDF 1.1
         assert_eq!(i_str, i_plain, "plain literal == xsd:string");
     }
 
-    /// `resolve` liefert den reinen Lexikalwert zurück (ohne Typ-Präfix), und
-    /// `lookup_term` findet exakt den passend typisierten Eintrag.
+    /// `resolve` returns the bare lexical value (without the type prefix), and
+    /// `lookup_term` finds exactly the matching typed entry.
     #[test]
     fn resolve_strips_prefix_and_lookup_is_typed() {
         let mut d = Dictionary::new();
@@ -469,7 +468,7 @@ mod tests {
         );
     }
 
-    /// Lexikalwert mit eingebettetem Trenner-Byte bleibt unversehrt.
+    /// A lexical value with an embedded separator byte stays intact.
     #[test]
     fn value_containing_separator_byte_roundtrips() {
         let mut d = Dictionary::new();
@@ -492,16 +491,16 @@ mod nsfold {
         let iq = d.insert(q);
         let ip = d.insert(p);
         let io = d.insert(other);
-        // Volle IRIs kommen unverändert zurück (entfaltet).
+        // Full IRIs come back unchanged (unfolded).
         assert_eq!(d.resolve(iq).as_deref(), Some(q));
         assert_eq!(d.resolve(ip).as_deref(), Some(p));
         assert_eq!(d.resolve(io).as_deref(), Some(other));
-        // Lookup über die volle IRI findet den gefalteten Schlüssel.
+        // Lookup via the full IRI finds the folded key.
         assert_eq!(d.lookup_iri(q), Some(iq));
         assert_eq!(d.lookup_iri(p), Some(ip));
-        // Gefalteter Schlüssel ist tatsächlich kürzer als die volle IRI.
+        // The folded key is indeed shorter than the full IRI.
         assert!(d.raw_key(iq).unwrap().len() < q.len());
-        // Typisiertes Literal mit XSD-Datentyp: Datentyp wird gefaltet + entfaltet.
+        // Typed literal with an XSD datatype: the datatype is folded + unfolded.
         let dt = "http://www.w3.org/2001/XMLSchema#integer";
         let il = d.insert_with_type("25", TermType::literal_datatype(dt));
         assert_eq!(d.resolve(il).as_deref(), Some("25"));
@@ -509,7 +508,7 @@ mod nsfold {
             Some(TermType::Literal {
                 datatype: Some(g), ..
             }) => assert_eq!(g, dt),
-            other => panic!("erwartete typisiertes Literal, {other:?}"),
+            other => panic!("expected typed literal, {other:?}"),
         }
     }
 }
