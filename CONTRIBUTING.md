@@ -4,6 +4,32 @@ Thanks for your interest in improving Trillian! Contributions of all kinds are
 welcome — bug reports, fixes, performance work, documentation, and new SPARQL
 features.
 
+## How contributions are accepted (governance)
+
+Trillian is maintained by **42grad GmbH**. Anyone may open a pull request; the
+maintainers review every change and **decide what gets merged**. We may decline
+or request changes to a contribution — for example if it doesn't fit the
+project's scope or direction, isn't sufficiently tested, or would compromise
+correctness, performance, or maintainability. A rejection is never personal; it
+keeps the project coherent.
+
+To avoid wasted effort on larger work, **open an issue first** and agree on the
+approach before writing a big PR. Small, focused PRs are easiest to review and
+merge.
+
+## Reporting bugs and requesting features
+
+- **Bugs** and **feature requests** go through GitHub Issues — please use the
+  templates. A good bug report includes a minimal SPARQL query and dataset that
+  reproduces the problem.
+- Feature requests are welcome as proposals; the maintainers prioritize them
+  against the project's roadmap and may keep, defer, or decline them.
+
+## Security
+
+**Do not report security issues in public issues or PRs.** See
+[SECURITY.md](SECURITY.md) for the private disclosure process.
+
 ## Developer Certificate of Origin (DCO)
 
 Trillian uses the [Developer Certificate of Origin](https://developercertificate.org/)

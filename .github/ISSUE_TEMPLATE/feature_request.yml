@@ -1,0 +1,31 @@
+name: Feature request
+description: Propose a new capability or improvement
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Feature requests are welcome as proposals. The maintainers (42grad GmbH)
+        prioritize them against the roadmap and may keep, defer, or decline them.
+        For larger changes, please agree on the approach here before opening a PR.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / use case
+      description: What are you trying to do that Trillian can't do well today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What should it do? SPARQL feature, API, behaviour, performance…
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you tried or other approaches you weighed.
+    validations:
+      required: false
