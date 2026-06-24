@@ -1,0 +1,14 @@
+target
+.git
+.github
+benchmarks
+examples
+infra
+*.nt
+*.bin
+*.log
+wdbench_data
+wdbench_qsrc
+wdbench_queries
+dhat-heap.json
+.DS_Store

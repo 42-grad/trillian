@@ -87,9 +87,9 @@ pub fn generate(params: &SyntheticParams) -> Vec<(String, String, String)> {
 
     // Random filler over the shared vocabulary.
     while triples.len() < params.n_triples {
-        let s = entity(rng.gen_range(0..params.n_entities));
-        let p = predicate(rng.gen_range(0..params.n_predicates));
-        let o = entity(rng.gen_range(0..params.n_entities));
+        let s = entity(rng.random_range(0..params.n_entities));
+        let p = predicate(rng.random_range(0..params.n_predicates));
+        let o = entity(rng.random_range(0..params.n_entities));
         triples.push((s, p, o));
     }
 

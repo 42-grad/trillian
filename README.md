@@ -4,6 +4,12 @@
 
 # Trillian
 
+<p align="center">
+  <a href="https://github.com/cpthappy/trillian/actions/workflows/rust.yml"><img src="https://github.com/cpthappy/trillian/actions/workflows/rust.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License: Apache-2.0"></a>
+  <img src="https://img.shields.io/badge/rust-1.87%2B-orange.svg" alt="Rust 1.87+">
+</p>
+
 A lean, fast RDF triple store and SPARQL engine written in Rust. Trillian keeps
 the whole graph in memory with flat, cache-friendly indexes and `u32` term IDs,
 serves SPARQL over HTTP, and persists to a zero-copy memory-mapped snapshot. The

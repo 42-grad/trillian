@@ -392,22 +392,47 @@ impl Dictionary {
 
     /// Builds an **mmap-backed** dictionary from the snapshot (zero-copy, no
     /// owned RAM for the term strings). `dict_off` must be 8-byte aligned.
-    pub fn from_mapped(map: Arc<Mmap>, dict_off: usize) -> Self {
+    ///
+    /// Returns `Err` (instead of panicking) if the dictionary section is
+    /// truncated or its offsets fall outside the mapped file.
+    pub fn from_mapped(map: Arc<Mmap>, dict_off: usize) -> Result<Self, String> {
         let b: &[u8] = &map;
-        let n = u32::from_le_bytes(b[dict_off..dict_off + 4].try_into().unwrap()) as usize;
+        let rd_u32 = |p: usize| -> Result<u32, String> {
+            b.get(p..p + 4)
+                .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
+                .ok_or_else(|| format!("dictionary truncated at offset {p}"))
+        };
+        let rd_u64 = |p: usize| -> Result<u64, String> {
+            b.get(p..p + 8)
+                .map(|s| u64::from_le_bytes(s.try_into().unwrap()))
+                .ok_or_else(|| format!("dictionary truncated at offset {p}"))
+        };
+
+        let n = rd_u32(dict_off)? as usize;
         // n:u32 + padding -> u64 offset array starts 8-aligned at dict_off+8.
         let offs_off = dict_off + 8;
-        let keys_off = offs_off + (n + 1) * 8;
-        let keys_len = u64::from_le_bytes(
-            b[offs_off + n * 8..offs_off + n * 8 + 8]
-                .try_into()
-                .unwrap(),
-        ) as usize;
-        let mut sorted_off = keys_off + keys_len;
+        // The offset array has n+1 u64 entries; the last one is the blob length.
+        let last_off = offs_off
+            .checked_add(n.checked_mul(8).ok_or("dictionary offset overflow")?)
+            .ok_or("dictionary offset overflow")?;
+        let keys_off = offs_off
+            .checked_add((n + 1).checked_mul(8).ok_or("dictionary offset overflow")?)
+            .ok_or("dictionary offset overflow")?;
+        let keys_len = rd_u64(last_off)? as usize;
+        let mut sorted_off = keys_off
+            .checked_add(keys_len)
+            .ok_or("dictionary offset overflow")?;
         while !sorted_off.is_multiple_of(4) {
             sorted_off += 1;
         }
-        Dictionary {
+        // The sorted-id array has n u32 entries; the whole section must fit.
+        let end = sorted_off
+            .checked_add(n.checked_mul(4).ok_or("dictionary offset overflow")?)
+            .ok_or("dictionary offset overflow")?;
+        if keys_off + keys_len > b.len() || end > b.len() {
+            return Err("dictionary section out of bounds".to_string());
+        }
+        Ok(Dictionary {
             mapped: Some(MappedDict {
                 map: map.clone(),
                 n,
@@ -417,7 +442,7 @@ impl Dictionary {
                 sorted_off,
             }),
             interner: Interner::new(),
-        }
+        })
     }
 }
 

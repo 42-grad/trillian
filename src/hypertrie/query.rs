@@ -444,12 +444,24 @@ impl TripleStore {
         let map = std::sync::Arc::new(unsafe { memmap2::Mmap::map(&file)? });
         let b: &[u8] = &map;
 
-        let rd_u32 = |b: &[u8], p: usize| u32::from_le_bytes(b[p..p + 4].try_into().unwrap());
-        let rd_u64 = |b: &[u8], p: usize| u64::from_le_bytes(b[p..p + 8].try_into().unwrap());
-
         let bad = |msg: String| std::io::Error::new(std::io::ErrorKind::InvalidData, msg);
-        // Header (magic + version + length table) must be fully present.
-        if b.len() < 32 {
+        // Bounds-checked little-endian readers: a truncated/corrupt file yields a
+        // clean error instead of panicking on an out-of-range slice.
+        let rd_u32 = |b: &[u8], p: usize| -> std::io::Result<u32> {
+            b.get(p..p + 4)
+                .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
+                .ok_or_else(|| bad(format!("snapshot truncated at offset {p}")))
+        };
+        let rd_u64 = |b: &[u8], p: usize| -> std::io::Result<u64> {
+            b.get(p..p + 8)
+                .map(|s| u64::from_le_bytes(s.try_into().unwrap()))
+                .ok_or_else(|| bad(format!("snapshot truncated at offset {p}")))
+        };
+
+        // Header: magic(8) + version(4) + term_count(4) + arrays_off(8) +
+        // dict_off(8) + 15 array lengths(u32) = 92 bytes, all required.
+        const HEADER_LEN: usize = 32 + 15 * 4;
+        if b.len() < HEADER_LEN {
             return Err(bad("snapshot too short (header incomplete)".into()));
         }
         if &b[0..8] != SNAP_MAGIC {
@@ -458,30 +470,39 @@ impl TripleStore {
                 std::str::from_utf8(SNAP_MAGIC).unwrap_or("?")
             )));
         }
-        let version = rd_u32(b, 8);
+        let version = rd_u32(b, 8)?;
         if version != SNAP_VERSION {
             return Err(bad(format!(
                 "incompatible snapshot version {version} (supported: {SNAP_VERSION})"
             )));
         }
-        let arrays_off = rd_u64(b, 16) as usize;
-        let dict_off = rd_u64(b, 24) as usize;
+        let arrays_off = rd_u64(b, 16)? as usize;
+        let dict_off = rd_u64(b, 24)? as usize;
         let mut p = 32;
         let mut lens = [0usize; 15];
         for l in &mut lens {
-            *l = rd_u32(b, p) as usize;
+            *l = rd_u32(b, p)? as usize;
             p += 4;
         }
 
+        // Map each index array, verifying its byte range lies within the file
+        // (so a corrupt length/offset errors here, not later at query time).
         let mut byte_off = arrays_off;
         let mut arenas: Vec<U32Arena> = Vec::with_capacity(15);
         for &len in &lens {
+            let end = len
+                .checked_mul(4)
+                .and_then(|bytes| byte_off.checked_add(bytes))
+                .ok_or_else(|| bad("snapshot index array length overflow".into()))?;
+            if end > b.len() {
+                return Err(bad("snapshot truncated (index array out of bounds)".into()));
+            }
             arenas.push(U32Arena::Mapped {
                 map: map.clone(),
                 byte_offset: byte_off,
                 len,
             });
-            byte_off += len * 4;
+            byte_off = end;
         }
 
         let mut it = arenas.into_iter();
@@ -498,7 +519,7 @@ impl TripleStore {
         let pos = LayeredIndex::from_base(take5(&mut it));
         let osp = LayeredIndex::from_base(take5(&mut it));
 
-        let dict = Dictionary::from_mapped(map.clone(), dict_off);
+        let dict = Dictionary::from_mapped(map.clone(), dict_off).map_err(bad)?;
 
         let mut store = TripleStore::new();
         store.dict = dict;
@@ -945,6 +966,44 @@ mod tests {
         bytes[8] = 0xFF; // break the version byte
         std::fs::write(ps, &bytes).unwrap();
         assert!(TripleStore::load_snapshot(ps).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_snapshot_rejects_truncated_file() {
+        // A valid snapshot cut short mid-section must error, not panic, at every
+        // truncation length (exercises the bounds-checked header/array/dict reads).
+        let mut store = TripleStore::new();
+        store.ingest_str_triples(&[
+            (
+                "http://example.org/a",
+                "http://example.org/p",
+                "http://example.org/b",
+            ),
+            (
+                "http://example.org/b",
+                "http://example.org/p",
+                "http://example.org/c",
+            ),
+        ]);
+        let path = std::env::temp_dir().join("trillian_truncated_snapshot.bin");
+        let ps = path.to_str().unwrap();
+        store.save_snapshot(ps).unwrap();
+        let full = std::fs::read(ps).unwrap();
+
+        for cut in [
+            40usize,
+            80,
+            100,
+            full.len() / 2,
+            full.len().saturating_sub(1),
+        ] {
+            std::fs::write(ps, &full[..cut]).unwrap();
+            assert!(
+                TripleStore::load_snapshot(ps).is_err(),
+                "truncation to {cut} bytes must be rejected cleanly"
+            );
+        }
         let _ = std::fs::remove_file(&path);
     }
 

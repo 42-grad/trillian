@@ -2,6 +2,9 @@
 name = "trillian"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.87"
+# Not published to crates.io yet; flip to allow `cargo publish` when ready.
+publish = false
 license = "Apache-2.0"
 description = "A lean Rust RDF triple store and SPARQL engine (flat-CSR permutation indexes, WCOJ, property paths)."
 repository = "https://github.com/cpthappy/trillian"
@@ -12,7 +15,7 @@ categories = ["database-implementations"]
 
 [dependencies]
 rustc-hash = "2"
-rand = "0.8"
+rand = "0.9"
 rayon = "1.10"
 roaring = "0.10"
 axum = "0.8"

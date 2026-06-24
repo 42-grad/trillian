@@ -12,12 +12,20 @@ __pycache__/
 .DS_Store
 *.swp
 *.swo
+*~
+.idea/
+.vscode/
 .claude/
 
 # Local scratch & profiling output
 *.sparql
 *.log
 dhat-heap.json
+
+# Local secrets (keep .env.example tracked)
+.env
+.env.*
+!.env.example
 
 # Generated WDBench working data (downloaded / built locally)
 wdbench_data/
