@@ -22,7 +22,7 @@ jobs:
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
@@ -39,7 +39,7 @@ jobs:
           cp README.md LICENSE NOTICE CHANGELOG.md "$dist/"
           tar -czf "$dist.tar.gz" "$dist"
           shasum -a 256 "$dist.tar.gz" > "$dist.tar.gz.sha256"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
           path: |
@@ -53,7 +53,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v4
         with:
           path: dist

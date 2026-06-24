@@ -6,6 +6,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-06-24
+
+### Fixed
+- `sameTerm` now does exact RDF-term equality (kind + lexical + datatype + lang)
+  instead of value equality, so `"1"^^xsd:integer` and `"1"^^xsd:double` are no
+  longer treated as the same term.
+- `/stream` no longer falls back to column 0 when a SELECT variable is absent;
+  the column is omitted instead of emitting a wrong value.
+
+### Security
+- `MappedDict::key` uses checked UTF-8 conversion (no more `from_utf8_unchecked`),
+  and snapshot loading validates the key blob is UTF-8 and uses checked
+  arithmetic for the dictionary bounds check — a corrupt/hostile snapshot can no
+  longer trigger undefined behaviour or bypass the bounds check.
+- HTTP request bodies are capped (`TRILLIAN_MAX_BODY_BYTES`, default 64 MiB) to
+  prevent OOM from oversized POSTs.
+
+### Changed
+- `FILTER` `||`/`&&` now short-circuit (3-valued semantics unchanged).
+
+### Removed
+- Dead `intersect_bitmap`, dropping the `roaring` dependency.
+
 ## [0.1.1] - 2026-06-24
 
 ### Changed
@@ -47,6 +70,7 @@ Initial open-source release.
 ### Removed
 - The test-only `Stats` cardinality helper is gated out of release builds.
 
-[Unreleased]: https://github.com/cpthappy/trillian/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/cpthappy/trillian/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/cpthappy/trillian/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/cpthappy/trillian/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/cpthappy/trillian/releases/tag/v0.1.0

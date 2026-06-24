@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use axum::Router;
 use axum::body::{Body, Bytes};
-use axum::extract::{Query, State};
+use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -62,6 +62,19 @@ pub async fn serve(store: TripleStore, port: u16) {
     serve_durable(store, port, None).await
 }
 
+/// Maximum accepted request-body size in bytes (guards against OOM from huge
+/// POST bodies). Overridable via `TRILLIAN_MAX_BODY_BYTES`; default 64 MiB.
+fn max_body_bytes() -> usize {
+    use std::sync::OnceLock;
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("TRILLIAN_MAX_BODY_BYTES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(64 * 1024 * 1024)
+    })
+}
+
 /// Like [`serve`], but with an optional write-ahead log for durable updates.
 pub async fn serve_durable(store: TripleStore, port: u16, wal: Option<crate::wal::Wal>) {
     let state = Arc::new(AppState::with_wal(store, wal));
@@ -71,6 +84,8 @@ pub async fn serve_durable(store: TripleStore, port: u16, wal: Option<crate::wal
         .route("/stream", get(stream_handler).post(stream_handler))
         .route("/count", get(count_handler).post(count_handler))
         .route("/update", post(update_handler))
+        // Cap request bodies so a giant POST can't exhaust memory.
+        .layer(DefaultBodyLimit::max(max_body_bytes()))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", port);
@@ -155,11 +170,12 @@ pub async fn stream_handler(
             Ok(select) => {
                 let var_order = select.var_order;
                 let vars = select.vars;
-                let mut var_indices = Vec::with_capacity(vars.len());
-                for var in &vars {
-                    let pos = var_order.iter().position(|v| v == var).unwrap_or(0);
-                    var_indices.push(pos);
-                }
+                // Column index per SELECT variable; `None` if it is not in the
+                // result (omit it rather than silently reading column 0).
+                let var_indices: Vec<Option<usize>> = vars
+                    .iter()
+                    .map(|var| var_order.iter().position(|v| v == var))
+                    .collect();
 
                 // Header line with the variable names as an NDJSON object.
                 let header = json!({ "head": { "vars": vars } }).to_string();
@@ -169,10 +185,9 @@ pub async fn stream_handler(
                     let obj: Map<String, Value> = vars
                         .iter()
                         .enumerate()
-                        .map(|(i, var)| {
-                            let id = row[var_indices[i]];
-                            let term = term_to_json(id, &store.dict);
-                            (var.clone(), term)
+                        .filter_map(|(i, var)| {
+                            let id = row[var_indices[i]?];
+                            Some((var.clone(), term_to_json(id, &store.dict)))
                         })
                         .collect();
                     let line = serde_json::to_string(&obj).unwrap_or_default() + "\n";
@@ -1494,6 +1509,59 @@ fn fv_cmp(a: &Fv, b: &Fv) -> Option<std::cmp::Ordering> {
     }
 }
 
+/// Exact RDF term identity (for `sameTerm`): kind + lexical form + datatype +
+/// language, with **no** value promotion. Unlike `=`/`fv_equal`, this treats
+/// `"1"^^xsd:integer` and `"1"^^xsd:double` as different terms.
+#[derive(PartialEq)]
+enum TermKey {
+    Iri(String),
+    Blank(String),
+    Lit(String, Option<String>, Option<String>), // lexical, datatype, language
+}
+
+/// Normalizes a literal to a `TermKey`. Per RDF 1.1 a plain literal and an
+/// explicit `xsd:string` literal are the same term, so `xsd:string` collapses
+/// to "no datatype".
+fn lit_key(lexical: &str, datatype: Option<&str>, lang: Option<&str>) -> TermKey {
+    let xsd_string = format!("{XSD}string");
+    let dt = datatype.filter(|d| *d != xsd_string).map(str::to_string);
+    TermKey::Lit(lexical.to_string(), dt, lang.map(str::to_string))
+}
+
+/// Resolves an expression to its RDF term identity, or `None` if it is unbound
+/// or a computed (non-term) expression — in which case `sameTerm` errors.
+fn term_key(
+    expr: &Expression,
+    row: &[u32],
+    vars: &[String],
+    store: &TripleStore,
+) -> Option<TermKey> {
+    match expr {
+        Expression::NamedNode(nn) => Some(TermKey::Iri(nn.as_str().to_string())),
+        Expression::Literal(lit) => Some(lit_key(
+            lit.value(),
+            Some(lit.datatype().as_str()),
+            lit.language(),
+        )),
+        Expression::Variable(v) => {
+            let col = vars.iter().position(|x| x == v.as_str())?;
+            let id = row[col];
+            if id == NULL_ID {
+                return None;
+            }
+            let value = store.dict.resolve(id)?;
+            match store.dict.resolve_type(id)? {
+                TermType::Iri => Some(TermKey::Iri(value.into_owned())),
+                TermType::BlankNode => Some(TermKey::Blank(value.into_owned())),
+                TermType::Literal { datatype, lang } => {
+                    Some(lit_key(&value, datatype.as_deref(), lang.as_deref()))
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
 fn eval(expr: &Expression, row: &[u32], vars: &[String], store: &TripleStore) -> Result<Fv, ()> {
     match expr {
         Expression::NamedNode(nn) => Ok(Fv::Iri(nn.as_str().to_string())),
@@ -1507,23 +1575,35 @@ fn eval(expr: &Expression, row: &[u32], vars: &[String], store: &TripleStore) ->
             term_to_fv(id, store).ok_or(())
         }
         Expression::Or(a, b) => {
+            // SPARQL 3-valued OR: true if either operand is true (even if the
+            // other errors). Short-circuits once a `true` is found.
             let ea = ebv(a, row, vars, store);
+            if ea == Ok(true) {
+                return Ok(Fv::Bool(true));
+            }
             let eb = ebv(b, row, vars, store);
-            if ea == Ok(true) || eb == Ok(true) {
-                Ok(Fv::Bool(true))
-            } else if ea.is_err() || eb.is_err() {
-                Err(())
+            if eb == Ok(true) {
+                return Ok(Fv::Bool(true));
+            }
+            if ea.is_err() || eb.is_err() {
+                Err(()) // false-or-error / error-or-error -> error
             } else {
                 Ok(Fv::Bool(false))
             }
         }
         Expression::And(a, b) => {
+            // SPARQL 3-valued AND: false if either operand is false (even if the
+            // other errors). Short-circuits once a `false` is found.
             let ea = ebv(a, row, vars, store);
+            if ea == Ok(false) {
+                return Ok(Fv::Bool(false));
+            }
             let eb = ebv(b, row, vars, store);
-            if ea == Ok(false) || eb == Ok(false) {
-                Ok(Fv::Bool(false))
-            } else if ea.is_err() || eb.is_err() {
-                Err(())
+            if eb == Ok(false) {
+                return Ok(Fv::Bool(false));
+            }
+            if ea.is_err() || eb.is_err() {
+                Err(()) // true-and-error / error-and-error -> error
             } else {
                 Ok(Fv::Bool(true))
             }
@@ -1534,8 +1614,11 @@ fn eval(expr: &Expression, row: &[u32], vars: &[String], store: &TripleStore) ->
             fv_equal(&x, &y).map(Fv::Bool).ok_or(())
         }
         Expression::SameTerm(a, b) => {
-            let (x, y) = (eval(a, row, vars, store)?, eval(b, row, vars, store)?);
-            Ok(Fv::Bool(fv_equal(&x, &y).unwrap_or(false)))
+            // Exact term identity — NOT value equality (no numeric promotion).
+            match (term_key(a, row, vars, store), term_key(b, row, vars, store)) {
+                (Some(x), Some(y)) => Ok(Fv::Bool(x == y)),
+                _ => Err(()), // unbound or non-term operand
+            }
         }
         Expression::Greater(a, b) => {
             cmp_op(a, b, row, vars, store, |o| o == std::cmp::Ordering::Greater)
@@ -2640,5 +2723,112 @@ mod tests {
         assert_eq!(rows2[0]["n"]["value"], "Bob");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// sameTerm is exact RDF-term equality: `"1"^^xsd:integer` and
+    /// `"1"^^xsd:double` are different terms, even though `=` promotes them.
+    #[test]
+    fn sameterm_distinguishes_datatypes() {
+        let xsd_double = "http://www.w3.org/2001/XMLSchema#double";
+        let mut store = TripleStore::new();
+        let s1 = store.dict.insert_with_type("http://ex/s1", TermType::Iri);
+        let s2 = store.dict.insert_with_type("http://ex/s2", TermType::Iri);
+        let p = store.dict.insert_with_type("http://ex/p", TermType::Iri);
+        let v_int = store
+            .dict
+            .insert_with_type("1", TermType::literal_datatype(XSD_INT));
+        let v_dbl = store
+            .dict
+            .insert_with_type("1", TermType::literal_datatype(xsd_double));
+        store.insert_triple(s1, p, v_int);
+        store.insert_triple(s2, p, v_dbl);
+
+        let rows = rows_of(
+            &store,
+            "SELECT ?s WHERE { ?s <http://ex/p> ?v \
+             FILTER(sameTerm(?v, \"1\"^^<http://www.w3.org/2001/XMLSchema#integer>)) }",
+        );
+        assert_eq!(rows.len(), 1, "sameTerm must match only the integer term");
+        assert_eq!(rows[0]["s"]["value"], "http://ex/s1");
+
+        // value-equality promotes numerically -> matches both.
+        let rows = rows_of(
+            &store,
+            "SELECT ?s WHERE { ?s <http://ex/p> ?v \
+             FILTER(?v = \"1\"^^<http://www.w3.org/2001/XMLSchema#integer>) }",
+        );
+        assert_eq!(rows.len(), 2, "= promotes numerics across datatypes");
+    }
+
+    /// SPARQL three-valued OR/AND: a `true`/`false` wins even when the other
+    /// operand errors (and that operand is short-circuited).
+    #[test]
+    fn logical_or_and_three_valued_with_error() {
+        let mut store = TripleStore::new();
+        let s = store.dict.insert_with_type("http://ex/s", TermType::Iri);
+        let p = store.dict.insert_with_type("http://ex/v", TermType::Iri);
+        let o = store
+            .dict
+            .insert_with_type("5", TermType::literal_datatype(XSD_INT));
+        store.insert_triple(s, p, o);
+        let q = |f: &str| {
+            rows_of(
+                &store,
+                &format!("SELECT ?s WHERE {{ ?s <http://ex/v> ?v FILTER({f}) }}"),
+            )
+            .len()
+        };
+        assert_eq!(q("?v = 5 || (?v / 0) > 0"), 1, "true || error -> true");
+        assert_eq!(q("(?v / 0) > 0 || ?v = 5"), 1, "error || true -> true");
+        assert_eq!(q("?v = 99 || (?v / 0) > 0"), 0, "false || error -> error");
+        assert_eq!(q("?v = 99 && (?v / 0) > 0"), 0, "false && error -> false");
+    }
+
+    #[test]
+    fn insert_and_delete_data() {
+        let mut store = TripleStore::new();
+        execute_update(
+            &mut store,
+            "INSERT DATA { <http://ex/a> <http://ex/knows> <http://ex/b> }",
+            None,
+        )
+        .unwrap();
+        assert_eq!(store.triple_count(), 1);
+        let rows = rows_of(
+            &store,
+            "SELECT ?o WHERE { <http://ex/a> <http://ex/knows> ?o }",
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["o"]["value"], "http://ex/b");
+
+        execute_update(
+            &mut store,
+            "DELETE DATA { <http://ex/a> <http://ex/knows> <http://ex/b> }",
+            None,
+        )
+        .unwrap();
+        assert_eq!(store.triple_count(), 0);
+    }
+
+    #[test]
+    fn filter_in_strlen_bound() {
+        let store = test_store(); // 3 knows edges
+        let only_bob = rows_of(
+            &store,
+            "SELECT ?a ?b WHERE { ?a <http://example.org/knows> ?b \
+             FILTER(?b IN (<http://example.org/bob>)) }",
+        );
+        assert_eq!(only_bob.len(), 1);
+        let long = rows_of(
+            &store,
+            "SELECT ?b WHERE { ?a <http://example.org/knows> ?b \
+             FILTER(STRLEN(STR(?b)) > 10) }",
+        );
+        assert_eq!(long.len(), 3);
+        let bound = rows_of(
+            &store,
+            "SELECT ?b WHERE { ?a <http://example.org/knows> ?b FILTER(BOUND(?b)) }",
+        );
+        assert_eq!(bound.len(), 3);
     }
 }
