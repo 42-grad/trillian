@@ -20,6 +20,44 @@ To avoid wasted effort on larger work, **open an issue first** and agree on the
 approach before writing a big PR. Small, focused PRs are easiest to review and
 merge.
 
+## Branching model and releases
+
+Two long-lived branches, both protected — no direct pushes; changes land only
+through reviewed pull requests, and only maintainers can merge:
+
+- **`master`** — always releasable. Every release is a tagged commit here.
+- **`develop`** — integration branch where reviewed work accumulates between
+  releases.
+
+The flow:
+
+1. Anyone may fork or branch and open PRs. Create a `feature/<short-name>`
+   branch off `develop`.
+2. Open a PR **into `develop`**. CI (fmt + clippy + tests) must pass and a
+   maintainer must approve and merge it.
+3. To cut a release, a maintainer opens a PR **from `develop` into `master`**
+   that bumps the version (see below).
+4. After it merges, a maintainer tags the release on `master`:
+   ```bash
+   git checkout master && git pull
+   git tag v1.2.3 && git push origin v1.2.3
+   ```
+   The tag triggers the Release workflow, which builds the binaries and
+   publishes a GitHub Release with downloadable archives (Linux + macOS).
+
+Direct pushes to `master` and `develop` are disabled — everything goes through
+PRs reviewed and merged by a maintainer.
+
+### Versioning
+
+Trillian follows [Semantic Versioning](https://semver.org/). The `version` in
+`Cargo.toml` is the source of truth. In the `develop` → `master` release PR:
+
+1. Bump `version` in `Cargo.toml`.
+2. Move the `## [Unreleased]` entries in [CHANGELOG.md](CHANGELOG.md) under a new
+   `## [x.y.z] - YYYY-MM-DD` heading.
+3. Tag the merged commit `vx.y.z` (matching the `Cargo.toml` version).
+
 ## Reporting bugs and requesting features
 
 - **Bugs** and **feature requests** go through GitHub Issues — please use the

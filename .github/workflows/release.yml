@@ -1,0 +1,68 @@
+name: Release
+
+# Triggered by pushing a version tag on master (the release gate):
+#   git tag v0.1.0 && git push origin v0.1.0
+# Builds the server binary for each platform and publishes a GitHub Release
+# with the archives attached as downloads.
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
+      - name: Build release
+        run: cargo build --release --locked --bin server --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          dist="trillian-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "$dist"
+          cp "target/${{ matrix.target }}/release/server" "$dist/trillian-server"
+          cp README.md LICENSE NOTICE CHANGELOG.md "$dist/"
+          tar -czf "$dist.tar.gz" "$dist"
+          shasum -a 256 "$dist.tar.gz" > "$dist.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            *.tar.gz
+            *.tar.gz.sha256
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create GitHub release with binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes
