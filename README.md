@@ -80,8 +80,9 @@ retrieval step runs with just the Python standard library (no API key).
 Trillian is measured against the published [WDBench](https://github.com/MillenniumDB/WDBench)
 result numbers for Blazegraph, Jena, Virtuoso, and Neo4j on the full
 1.26-billion-triple Wikidata graph. The reproducible harness lives in
-[`infra/aws/`](infra/aws/) and `wdbench_*.{sh,py}`; methodology and the reference
-numbers are in [`wdbench_reference.md`](wdbench_reference.md) and
+[`infra/aws/`](infra/aws/) and [`benchmarks/`](benchmarks/); methodology and the
+reference numbers are in
+[`benchmarks/wdbench_reference.md`](benchmarks/wdbench_reference.md) and
 [`BENCHMARKS.md`](BENCHMARKS.md).
 
 > Caveat: different hardware and setup than the published runs, so absolute

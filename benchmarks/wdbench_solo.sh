@@ -12,7 +12,8 @@
 #   timeout_s default 60 (like the reference).
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # benchmarks/
+ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"                       # project root
 # Canonical, COMPLETE WDBench dump (9.15 GB .nt.bz2 -> ~1.257 billion triples).
 # NOT the truncated latest_truthy_data_filtered.tar.bz2 (yields only ~495M).
 DATA_URL="https://ndownloader.figshare.com/files/34816081"
@@ -62,7 +63,7 @@ log "Dataset: ${TRIPLES} triples (stride=${STRIDE})"
 for f in single_bgps multiple_bgps opts paths c2rpqs; do
     [ -f "${QSRC}/${f}.txt" ] || curl -sL -o "${QSRC}/${f}.txt" "${REPO_RAW}/${f}.txt"
 done
-python3 "${ROOT}/wdbench_queries.py" "${QSRC}" "${QDIR}"
+python3 "${SCRIPT_DIR}/wdbench_queries.py" "${QSRC}" "${QDIR}"
 
 # --- 3. Our engine: build + mmap load (measured) ----------------------------
 log "Building snapshot + loading server..."
@@ -84,7 +85,7 @@ echo "Ingest+Load: ${INGEST_MS} ms | Snapshot disk: $(du -m "${SNAP}" 2>/dev/nul
 echo "Label          Category       Aggregate (ms)"
 echo "-------------------------------------------------------------------------------"
 for cat in single_bgps multiple_bgps opts paths c2rpqs; do
-    python3 "${ROOT}/wdbench_bench.py" "http://localhost:${PORT}/sparql" "${QDIR}/${cat}" \
+    python3 "${SCRIPT_DIR}/wdbench_bench.py" "http://localhost:${PORT}/sparql" "${QDIR}/${cat}" \
         --timeout "${TIMEOUT}" --label trillian --csv "${DATADIR}/solo_${cat}.csv" || true
 done
 log "Done. Per-query CSVs in ${DATADIR}/solo_*.csv"

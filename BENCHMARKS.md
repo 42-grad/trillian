@@ -19,9 +19,11 @@ benchmark's published numbers for Blazegraph, Jena (TDB), Virtuoso, and Neo4j.
   engines were given 64 GB). **Absolute milliseconds are therefore indicative,
   not a controlled head-to-head; on-disk store sizes are directly comparable.**
 
-The harness is reproducible: `infra/aws/run_aws_bench.sh` (or `wdbench_solo.sh`
-locally) runs all five classes and writes per-query CSVs; `wdbench_compare.py`
-diffs result counts against the published numbers.
+The harness is reproducible: `infra/aws/run_aws_bench.sh` (or
+`benchmarks/wdbench_solo.sh` locally) runs all five classes and writes per-query
+CSVs; `benchmarks/wdbench_compare.py` diffs result counts against the published
+numbers. The published reference figures live in
+`benchmarks/wdbench_reference.md`.
 
 ## Latency — median over completed queries (ms, lower is better)
 

@@ -26,8 +26,9 @@ INSTANCE_TYPE=r6i.4xlarge DISK_GB=300 ./infra/aws/run_aws_bench.sh 10 60
 ```
 
 The script provisions the instance, builds the Rust engine, downloads the
-WDBench dump, builds a snapshot, runs the five query classes (`wdbench_solo.sh`),
-and fetches `wdbench_solo.log` plus per-query CSVs back. It creates a dedicated
+WDBench dump, builds a snapshot, runs the five query classes
+(`benchmarks/wdbench_solo.sh`), and fetches `wdbench_solo.log` plus per-query
+CSVs back. It creates a dedicated
 SSH keypair under `terraform/duel_key` (never committed).
 
 ## Tear down (important — the instance bills until destroyed)
@@ -40,5 +41,5 @@ SSH keypair under `terraform/duel_key` (never committed).
 
 - `INSTANCE_TYPE` / `DISK_GB` — env overrides per run.
 - `aws_region`, `ssh_ingress_cidrs` (set your own IP/32 to lock down SSH).
-- Results are compared against the published numbers in `wdbench_reference.md`
-  via `wdbench_compare.py`.
+- Results are compared against the published numbers in
+  `benchmarks/wdbench_reference.md` via `benchmarks/wdbench_compare.py`.

@@ -1,45 +1,37 @@
+# Rust build output
 /target
+
+# Datasets & snapshots (large / reproducible) — but keep the example graph
 *.nt
 *.bin
+!examples/graphrag/knowledge.nt
+
+# Python / editor / OS junk
 __pycache__/
 *.pyc
-.claude/
-# Editor / OS junk
 .DS_Store
 *.swp
 *.swo
-chain_query.sparql
-triangle_query.sparql
-duel_output.log
-infra/terraform/.terraform
-infra/terraform/*.tfstate
-infra/terraform/*.tfstate.*
-infra/terraform/terraform.tfvars
-infra/ansible/inventory.ini
-infra/ansible/*.log
-# Ephemeres SSH-Keypair (wird von run_remote_duel.sh generiert) - NIE committen
-infra/terraform/duel_key
-infra/terraform/duel_key.pub
-# AWS-Konstrukt: State, Provider-Cache, Inventory, SSH-Keypair - NIE committen
-infra/aws/terraform/.terraform
-infra/aws/terraform/.terraform.lock.hcl
-infra/aws/terraform/*.tfstate
-infra/aws/terraform/*.tfstate.*
-infra/aws/terraform/terraform.tfvars
-infra/aws/terraform/duel_key
-infra/aws/terraform/duel_key.pub
-infra/aws/ansible/inventory.ini
-infra/aws/ansible/*.log
-infra/aws/wdbench_duel.log
-# .terraform.lock.hcl should be versioned, so do not ignore it
-watdiv_queries/
-watdiv_correctness.log
+.claude/
+
+# Local scratch & profiling output
+*.sparql
+*.log
 dhat-heap.json
 
-# WDBench data + generated queries (large / reproducible; *.nt/*.bin already above)
+# Generated WDBench working data (downloaded / built locally)
 wdbench_data/
 wdbench_qsrc/
 wdbench_queries/
+wdbench_queries_solo/
 wdbench_queries_full/
+
+# Secrets & local state — NEVER commit (Terraform state, SSH keypairs, inventory)
+infra/**/.terraform/
+infra/**/*.tfstate
+infra/**/*.tfstate.*
+infra/**/terraform.tfvars
+infra/**/duel_key
+infra/**/duel_key.pub
+infra/**/inventory.ini
 infra/aws/solo_csv/
-infra/aws/wdbench_solo.log

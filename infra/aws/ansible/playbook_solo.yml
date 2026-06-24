@@ -1,5 +1,5 @@
 ---
-# Solo benchmark: provision a host, build the engine, run wdbench_solo.sh
+# Solo benchmark: provision a host, build the engine, run benchmarks/wdbench_solo.sh
 # and compare against the published WDBench numbers.
 - name: Provision AWS host, build the Rust engine, run the solo WDBench benchmark
   hosts: wdbench
@@ -16,4 +16,4 @@
         mode: '0755'
   roles:
     - common   # apt deps + Rust toolchain
-    - bench     # local: sync the project, build the server, run wdbench_solo.sh
+    - bench     # local: sync the project, build the server, run benchmarks/wdbench_solo.sh

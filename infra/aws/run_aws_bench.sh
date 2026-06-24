@@ -2,7 +2,7 @@
 # run_aws_bench.sh
 #
 # Provisions an EC2 instance, deploys our engine, and runs the solo WDBench
-# benchmark (wdbench_solo.sh) for the absolute comparison with the published
+# benchmark (benchmarks/wdbench_solo.sh) for the absolute comparison with the published
 # Blazegraph/Jena/Virtuoso/Neo4j numbers.
 #
 # Local prerequisites: terraform, ansible, AWS credentials.
@@ -81,7 +81,7 @@ echo "[run_aws_bench] Fetching result..."
 scp -i "$SSH_PRIVATE_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     "ubuntu@$SERVER_IP:/opt/trillian/wdbench_solo.log" \
     "${SCRIPT_DIR}/wdbench_solo.log" 2>/dev/null || echo "  (no log found)"
-# Per-query CSVs for the correctness comparison (wdbench_compare.py).
+# Per-query CSVs for the correctness comparison (benchmarks/wdbench_compare.py).
 mkdir -p "${SCRIPT_DIR}/solo_csv"
 scp -i "$SSH_PRIVATE_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     "ubuntu@$SERVER_IP:/opt/trillian/wdbench_data/solo_*.csv" \

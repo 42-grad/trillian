@@ -11,7 +11,8 @@
 # Usage:  ./wdbench_probe.sh ["N1 N2 N3"]   # slice sizes (lines), default below
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # benchmarks/
+ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"                       # project root
 DATA_URL="https://ndownloader.figshare.com/files/34816081"   # truthy_direct_properties.nt.bz2 (9.15 GB, complete)
 REPO_RAW="https://raw.githubusercontent.com/MillenniumDB/WDBench/master/Queries"
 TOTAL_TRIPLES=1257169959
@@ -40,7 +41,7 @@ log "Downloading the WDBench query logs..."
 for f in single_bgps multiple_bgps opts paths c2rpqs; do
     [ -f "${QSRC}/${f}.txt" ] || curl -sL -o "${QSRC}/${f}.txt" "${REPO_RAW}/${f}.txt"
 done
-python3 "${ROOT}/wdbench_queries.py" "${QSRC}" "${QDIR}" 25   # sample: 25/category
+python3 "${SCRIPT_DIR}/wdbench_queries.py" "${QSRC}" "${QDIR}" 25   # sample: 25/category
 
 # --- 2. Stream the largest slice ONCE (bzip2 stops early via SIGPIPE) --------
 BIG="${DATADIR}/wdbench_${MAXN}.nt"

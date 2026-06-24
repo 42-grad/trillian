@@ -25,7 +25,7 @@
 - name: Run solo WDBench benchmark (download + decompress + build + measure)
   shell: |
     . $HOME/.cargo/env
-    ./wdbench_solo.sh {{ wdbench_stride }} {{ wdbench_timeout }}
+    ./benchmarks/wdbench_solo.sh {{ wdbench_stride }} {{ wdbench_timeout }}
   args:
     chdir: "{{ project_dir }}"
     executable: /bin/bash
