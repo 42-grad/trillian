@@ -6,25 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Added
-- `rust-toolchain.toml` pinning the toolchain for reproducible builds.
-- `Dockerfile` for a containerized server image.
-- `CODE_OF_CONDUCT.md` (Contributor Covenant 2.1) and this changelog.
-- Dependabot config and a cached, lint-all-targets CI pipeline.
-- Pre-commit hook (`.githooks/pre-commit`) running fmt + clippy + tests.
-- End-to-end integration tests under `tests/` (SPARQL over the public API,
-  snapshot round-trip).
-- Public `sparql::execute_sparql` so embedders can run queries without the HTTP
-  server.
+## [0.1.1] - 2026-06-24
 
 ### Changed
-- Snapshot loading now returns errors on truncated/corrupt files instead of
-  panicking.
-- Bumped `rand` to 0.9.
-- Refactored `eval_path` into focused helpers.
-
-### Removed
-- The test-only `Stats` cardinality helper is now gated out of release builds.
+- Reworked the GraphRAG example into a real ingestion pipeline:
+  `ingest_wikipedia.py` builds a knowledge graph from a Wikipedia article via LLM
+  triple extraction, with a bundled "Hitchhiker's Guide to the Galaxy" graph so
+  the demo runs offline. Fixed literal-object handling in the retrieval step.
 
 ## [0.1.0] - 2026-06-24
 
@@ -40,6 +28,25 @@ Initial open-source release.
   ORDER BY, property paths, `INSERT DATA`/`DELETE DATA` with a write-ahead log.
 - Zero-copy mmap snapshots and a streaming N-Triples loader.
 - WDBench benchmark harness and a GraphRAG example.
+- Public `sparql::execute_sparql` so embedders can run queries without the HTTP
+  server.
+- End-to-end integration tests under `tests/` (SPARQL over the public API,
+  snapshot round-trip).
+- Project hygiene for open source: `rust-toolchain.toml`, `Dockerfile`,
+  `CODE_OF_CONDUCT.md`, this changelog, Dependabot, a cached CI pipeline
+  (fmt + clippy `--all-targets` + tests), and a `.githooks/pre-commit` hook.
+- Tag-triggered release workflow publishing downloadable binaries (Linux +
+  macOS), plus a protected `master`/`develop` branching model.
 
-[Unreleased]: https://github.com/cpthappy/trillian/compare/v0.1.0...HEAD
+### Changed
+- Snapshot loading returns errors on truncated/corrupt files instead of
+  panicking (bounds-checked readers).
+- Bumped `rand` to 0.9.
+- Refactored `eval_path` into focused helpers.
+
+### Removed
+- The test-only `Stats` cardinality helper is gated out of release builds.
+
+[Unreleased]: https://github.com/cpthappy/trillian/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/cpthappy/trillian/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/cpthappy/trillian/releases/tag/v0.1.0
