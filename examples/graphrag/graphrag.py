@@ -15,16 +15,19 @@ Pipeline:
   3. Render those triples as readable sentences using rdfs:label.
   4. Ask Mistral to answer using ONLY those facts.
 
+The graph itself is built from a Wikipedia article by `ingest_wikipedia.py`; a
+pre-generated `hitchhikers.nt` (The Hitchhiker's Guide to the Galaxy) ships with
+the example so this runs out of the box.
+
 Run without an API key to see just the retrieved subgraph (retrieval-only mode).
 
 Usage:
-  # 1. build + serve the sample graph with Trillian (see README)
-  ./target/release/server build examples/graphrag/knowledge.nt /tmp/kg.bin
-  ./target/release/server load /tmp/kg.bin 9090 &
-  # 2. (optional) export your Mistral key
+  # 1. serve the knowledge graph with Trillian (see README)
+  ./target/release/server examples/graphrag/hitchhikers.nt 9090 &
+  # 2. (optional) export your Mistral key for a generated answer
   export MISTRAL_API_KEY=...
   # 3. ask
-  python3 examples/graphrag/graphrag.py "What can I build with Trillian and Mistral AI?"
+  python3 examples/graphrag/graphrag.py "Who wrote the Hitchhiker's Guide and what is the answer to the Ultimate Question?"
 """
 
 import os
@@ -77,23 +80,37 @@ def match_entities(question: str) -> list[str]:
     return list(found)
 
 
-def neighbourhood(entity: str) -> list[tuple[str, str, str]]:
+def _uri(iri: str) -> dict:
+    """A binding cell for a known IRI (mirrors SPARQL-results JSON shape)."""
+    return {"type": "uri", "value": iri}
+
+
+def neighbourhood(entity: str) -> list[tuple[dict, dict, dict]]:
     """Direct facts of `entity` (outgoing + incoming) plus one extra hop via a
-    property path, as (subject, predicate, object) IRI/literal triples."""
-    triples: list[tuple[str, str, str]] = []
+    two-pattern join. Each term is a binding cell `{type, value}` so we can tell
+    IRIs (resolve to labels) from literals (used verbatim)."""
+    e = _uri(entity)
+    triples: list[tuple[dict, dict, dict]] = []
     # outgoing: <e> ?p ?o
     for r in sparql(f"SELECT ?p ?o WHERE {{ <{entity}> ?p ?o }}"):
-        triples.append((entity, r["p"]["value"], r["o"]["value"]))
+        triples.append((e, r["p"], r["o"]))
     # incoming: ?s ?p <e>
     for r in sparql(f"SELECT ?s ?p WHERE {{ ?s ?p <{entity}> }}"):
-        triples.append((r["s"]["value"], r["p"]["value"], entity))
+        triples.append((r["s"], r["p"], e))
     # one extra hop via a two-pattern BGP join: <e> ?p1 ?mid . ?mid ?p2 ?o2
     #   (this is what makes it "graph" RAG — structured multi-hop context).
     for r in sparql(
         f"SELECT ?mid ?p2 ?o2 WHERE {{ <{entity}> ?p1 ?mid . ?mid ?p2 ?o2 }} LIMIT 25"
     ):
-        triples.append((r["mid"]["value"], r["p2"]["value"], r["o2"]["value"]))
+        triples.append((r["mid"], r["p2"], r["o2"]))
     return triples
+
+
+def term_str(cell: dict) -> str:
+    """Render a term: IRIs become their label, literals are used as-is."""
+    if cell["type"] == "uri":
+        return label(cell["value"])
+    return cell["value"]
 
 
 def pred_label(p: str) -> str:
@@ -111,11 +128,13 @@ def retrieve(question: str):
     facts = []
     for e in entities:
         for s, p, o in neighbourhood(e):
-            key = (s, p, o)
-            if key in seen or p == RDFS_LABEL:
+            if p["value"] == RDFS_LABEL:
+                continue
+            key = (s["value"], p["value"], o["value"])
+            if key in seen:
                 continue
             seen.add(key)
-            facts.append(f"{label(s)} {pred_label(p)} {label(o)}.")
+            facts.append(f"{term_str(s)} {pred_label(p['value'])} {term_str(o)}.")
     return facts, [label(e) for e in entities]
 
 

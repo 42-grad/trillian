@@ -1,0 +1,75 @@
+<http://example.org/hhg/entity/Hitchhikers_Guide_Book> <http://example.org/hhg/prop/writtenBy> <http://example.org/hhg/entity/Douglas_Adams> .
+<http://example.org/hhg/entity/Hitchhikers_Guide_Book> <http://example.org/hhg/prop/firstPublished> "1979"^^<http://www.w3.org/2001/XMLSchema#integer> .
+<http://example.org/hhg/entity/Hitchhikers_Guide_Book> <http://example.org/hhg/prop/genre> "science fiction comedy" .
+<http://example.org/hhg/entity/Douglas_Adams> <http://example.org/hhg/prop/occupation> "author" .
+<http://example.org/hhg/entity/Douglas_Adams> <http://example.org/hhg/prop/nationality> "English" .
+<http://example.org/hhg/entity/Douglas_Adams> <http://example.org/hhg/prop/born> "1952"^^<http://www.w3.org/2001/XMLSchema#integer> .
+<http://example.org/hhg/entity/Douglas_Adams> <http://example.org/hhg/prop/died> "2001"^^<http://www.w3.org/2001/XMLSchema#integer> .
+<http://example.org/hhg/entity/Douglas_Adams> <http://example.org/hhg/prop/homeCountry> <http://example.org/hhg/entity/England> .
+<http://example.org/hhg/entity/Arthur_Dent> <http://example.org/hhg/prop/species> "human" .
+<http://example.org/hhg/entity/Arthur_Dent> <http://example.org/hhg/prop/homePlanet> <http://example.org/hhg/entity/Earth> .
+<http://example.org/hhg/entity/Arthur_Dent> <http://example.org/hhg/prop/role> "protagonist" .
+<http://example.org/hhg/entity/Arthur_Dent> <http://example.org/hhg/prop/knows> <http://example.org/hhg/entity/Ford_Prefect> .
+<http://example.org/hhg/entity/Ford_Prefect> <http://example.org/hhg/prop/species> "Betelgeusian" .
+<http://example.org/hhg/entity/Ford_Prefect> <http://example.org/hhg/prop/homePlanet> <http://example.org/hhg/entity/Betelgeuse> .
+<http://example.org/hhg/entity/Ford_Prefect> <http://example.org/hhg/prop/occupation> "field researcher" .
+<http://example.org/hhg/entity/Ford_Prefect> <http://example.org/hhg/prop/researcherFor> <http://example.org/hhg/entity/The_Guide> .
+<http://example.org/hhg/entity/Ford_Prefect> <http://example.org/hhg/prop/rescued> <http://example.org/hhg/entity/Arthur_Dent> .
+<http://example.org/hhg/entity/Zaphod_Beeblebrox> <http://example.org/hhg/prop/role> "Galactic President" .
+<http://example.org/hhg/entity/Zaphod_Beeblebrox> <http://example.org/hhg/prop/numberOfHeads> "2"^^<http://www.w3.org/2001/XMLSchema#integer> .
+<http://example.org/hhg/entity/Zaphod_Beeblebrox> <http://example.org/hhg/prop/stole> <http://example.org/hhg/entity/Heart_of_Gold> .
+<http://example.org/hhg/entity/Zaphod_Beeblebrox> <http://example.org/hhg/prop/relativeOf> <http://example.org/hhg/entity/Ford_Prefect> .
+<http://example.org/hhg/entity/Trillian> <http://example.org/hhg/prop/species> "human" .
+<http://example.org/hhg/entity/Trillian> <http://example.org/hhg/prop/homePlanet> <http://example.org/hhg/entity/Earth> .
+<http://example.org/hhg/entity/Trillian> <http://example.org/hhg/prop/occupation> "astrophysicist" .
+<http://example.org/hhg/entity/Trillian> <http://example.org/hhg/prop/realName> "Tricia McMillan" .
+<http://example.org/hhg/entity/Trillian> <http://example.org/hhg/prop/crewOf> <http://example.org/hhg/entity/Heart_of_Gold> .
+<http://example.org/hhg/entity/Marvin> <http://example.org/hhg/prop/type> "android" .
+<http://example.org/hhg/entity/Marvin> <http://example.org/hhg/prop/trait> "chronically depressed" .
+<http://example.org/hhg/entity/Marvin> <http://example.org/hhg/prop/nickname> "the Paranoid Android" .
+<http://example.org/hhg/entity/Marvin> <http://example.org/hhg/prop/crewOf> <http://example.org/hhg/entity/Heart_of_Gold> .
+<http://example.org/hhg/entity/Slartibartfast> <http://example.org/hhg/prop/homePlanet> <http://example.org/hhg/entity/Magrathea> .
+<http://example.org/hhg/entity/Slartibartfast> <http://example.org/hhg/prop/occupation> "planetary coastline designer" .
+<http://example.org/hhg/entity/Slartibartfast> <http://example.org/hhg/prop/designed> "the fjords of Norway" .
+<http://example.org/hhg/entity/Deep_Thought> <http://example.org/hhg/prop/type> "supercomputer" .
+<http://example.org/hhg/entity/Deep_Thought> <http://example.org/hhg/prop/computed> <http://example.org/hhg/entity/Ultimate_Question> .
+<http://example.org/hhg/entity/Deep_Thought> <http://example.org/hhg/prop/answer> "42"^^<http://www.w3.org/2001/XMLSchema#integer> .
+<http://example.org/hhg/entity/Deep_Thought> <http://example.org/hhg/prop/computationYears> "7500000"^^<http://www.w3.org/2001/XMLSchema#integer> .
+<http://example.org/hhg/entity/Ultimate_Question> <http://example.org/hhg/prop/answer> "42"^^<http://www.w3.org/2001/XMLSchema#integer> .
+<http://example.org/hhg/entity/Earth> <http://example.org/hhg/prop/type> "planet-sized supercomputer" .
+<http://example.org/hhg/entity/Earth> <http://example.org/hhg/prop/designedBy> <http://example.org/hhg/entity/Deep_Thought> .
+<http://example.org/hhg/entity/Earth> <http://example.org/hhg/prop/builtBy> <http://example.org/hhg/entity/Magrathea> .
+<http://example.org/hhg/entity/Earth> <http://example.org/hhg/prop/destroyedBy> <http://example.org/hhg/entity/Vogons> .
+<http://example.org/hhg/entity/Earth> <http://example.org/hhg/prop/purpose> "compute the Ultimate Question" .
+<http://example.org/hhg/entity/The_Guide> <http://example.org/hhg/prop/publishedBy> <http://example.org/hhg/entity/Megadodo_Publications> .
+<http://example.org/hhg/entity/The_Guide> <http://example.org/hhg/prop/coverText> "Don't Panic" .
+<http://example.org/hhg/entity/The_Guide> <http://example.org/hhg/prop/type> "electronic guidebook" .
+<http://example.org/hhg/entity/Vogons> <http://example.org/hhg/prop/type> "alien species" .
+<http://example.org/hhg/entity/Vogons> <http://example.org/hhg/prop/knownFor> "atrocious poetry" .
+<http://example.org/hhg/entity/Vogons> <http://example.org/hhg/prop/destroyed> <http://example.org/hhg/entity/Earth> .
+<http://example.org/hhg/entity/Heart_of_Gold> <http://example.org/hhg/prop/type> "spaceship" .
+<http://example.org/hhg/entity/Heart_of_Gold> <http://example.org/hhg/prop/poweredBy> <http://example.org/hhg/entity/Infinite_Improbability_Drive> .
+<http://example.org/hhg/entity/Babel_fish> <http://example.org/hhg/prop/type> "creature" .
+<http://example.org/hhg/entity/Babel_fish> <http://example.org/hhg/prop/function> "universal translator" .
+<http://example.org/hhg/entity/Magrathea> <http://example.org/hhg/prop/type> "planet" .
+<http://example.org/hhg/entity/Magrathea> <http://example.org/hhg/prop/knownFor> "building luxury planets" .
+<http://example.org/hhg/entity/Hitchhikers_Guide_Book> <http://www.w3.org/2000/01/rdf-schema#label> "The Hitchhiker's Guide to the Galaxy" .
+<http://example.org/hhg/entity/Douglas_Adams> <http://www.w3.org/2000/01/rdf-schema#label> "Douglas Adams" .
+<http://example.org/hhg/entity/Arthur_Dent> <http://www.w3.org/2000/01/rdf-schema#label> "Arthur Dent" .
+<http://example.org/hhg/entity/Ford_Prefect> <http://www.w3.org/2000/01/rdf-schema#label> "Ford Prefect" .
+<http://example.org/hhg/entity/Zaphod_Beeblebrox> <http://www.w3.org/2000/01/rdf-schema#label> "Zaphod Beeblebrox" .
+<http://example.org/hhg/entity/Trillian> <http://www.w3.org/2000/01/rdf-schema#label> "Trillian" .
+<http://example.org/hhg/entity/Marvin> <http://www.w3.org/2000/01/rdf-schema#label> "Marvin" .
+<http://example.org/hhg/entity/Slartibartfast> <http://www.w3.org/2000/01/rdf-schema#label> "Slartibartfast" .
+<http://example.org/hhg/entity/Deep_Thought> <http://www.w3.org/2000/01/rdf-schema#label> "Deep Thought" .
+<http://example.org/hhg/entity/The_Guide> <http://www.w3.org/2000/01/rdf-schema#label> "The Guide" .
+<http://example.org/hhg/entity/Megadodo_Publications> <http://www.w3.org/2000/01/rdf-schema#label> "Megadodo Publications" .
+<http://example.org/hhg/entity/Earth> <http://www.w3.org/2000/01/rdf-schema#label> "Earth" .
+<http://example.org/hhg/entity/Magrathea> <http://www.w3.org/2000/01/rdf-schema#label> "Magrathea" .
+<http://example.org/hhg/entity/Betelgeuse> <http://www.w3.org/2000/01/rdf-schema#label> "Betelgeuse" .
+<http://example.org/hhg/entity/Vogons> <http://www.w3.org/2000/01/rdf-schema#label> "Vogons" .
+<http://example.org/hhg/entity/Heart_of_Gold> <http://www.w3.org/2000/01/rdf-schema#label> "Heart of Gold" .
+<http://example.org/hhg/entity/Babel_fish> <http://www.w3.org/2000/01/rdf-schema#label> "Babel fish" .
+<http://example.org/hhg/entity/Ultimate_Question> <http://www.w3.org/2000/01/rdf-schema#label> "Ultimate Question of Life, the Universe, and Everything" .
+<http://example.org/hhg/entity/England> <http://www.w3.org/2000/01/rdf-schema#label> "England" .
+<http://example.org/hhg/entity/Infinite_Improbability_Drive> <http://www.w3.org/2000/01/rdf-schema#label> "Infinite Improbability Drive" .

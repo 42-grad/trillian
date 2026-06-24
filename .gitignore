@@ -4,7 +4,7 @@
 # Datasets & snapshots (large / reproducible) — but keep the example graph
 *.nt
 *.bin
-!examples/graphrag/knowledge.nt
+!examples/graphrag/*.nt
 
 # Python / editor / OS junk
 __pycache__/
