@@ -12,7 +12,7 @@
 //! in randomly (fixed seed) so the indexes have realistic sizes.
 
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 #[derive(Debug, Clone)]
 pub struct SyntheticParams {

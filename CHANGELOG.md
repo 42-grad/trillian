@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-06-24
+
+### Changed
+- Repository moved to the **42-grad** organization; references updated.
+- Dependency updates: `rand` 0.9 → 0.10 (`random_range` moved to the `RngExt`
+  trait), `lru` 0.13 → 0.18, `string-interner` 0.17 → 0.20, `memmap2` 0.9.11;
+  CI action `download-artifact` v4 → v8.
+
 ## [0.1.2] - 2026-06-24
 
 ### Fixed
@@ -70,7 +78,8 @@ Initial open-source release.
 ### Removed
 - The test-only `Stats` cardinality helper is gated out of release builds.
 
-[Unreleased]: https://github.com/cpthappy/trillian/compare/v0.1.2...HEAD
-[0.1.2]: https://github.com/cpthappy/trillian/compare/v0.1.1...v0.1.2
-[0.1.1]: https://github.com/cpthappy/trillian/compare/v0.1.0...v0.1.1
-[0.1.0]: https://github.com/cpthappy/trillian/releases/tag/v0.1.0
+[Unreleased]: https://github.com/42-grad/trillian/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/42-grad/trillian/compare/v0.1.2...v0.1.3
+[0.1.2]: https://github.com/42-grad/trillian/compare/v0.1.1...v0.1.2
+[0.1.1]: https://github.com/42-grad/trillian/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/42-grad/trillian/releases/tag/v0.1.0
