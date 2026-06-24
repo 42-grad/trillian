@@ -4,6 +4,9 @@ Thanks for your interest in improving Trillian! Contributions of all kinds are
 welcome — bug reports, fixes, performance work, documentation, and new SPARQL
 features.
 
+By participating, you agree to abide by our
+[Code of Conduct](CODE_OF_CONDUCT.md).
+
 ## How contributions are accepted (governance)
 
 Trillian is maintained by **42grad GmbH**. Anyone may open a pull request; the
@@ -72,6 +75,20 @@ requests whose commits are not signed off cannot be merged.
 cargo build --release        # builds the `trillian` and `server` binaries
 cargo test                   # runs the unit/integration suite
 ```
+
+The toolchain is pinned in `rust-toolchain.toml`, so rustup uses the right
+version automatically.
+
+### Pre-commit hook (recommended)
+
+Enable the bundled hook once to run the full pipeline (fmt + clippy + tests)
+before every commit — the same checks CI runs:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+Bypass it in an emergency with `git commit --no-verify`.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for an overview of the storage layout,
 the query engine, and the on-disk snapshot format.

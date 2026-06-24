@@ -349,7 +349,10 @@ fn evaluate_select(
     evaluate_select_with_modifiers(store, engine, &m)
 }
 
-fn execute_sparql(
+/// Executes a SPARQL `SELECT`/`ASK` query against the store and returns the
+/// SPARQL-results JSON body (the same payload the HTTP `/sparql` endpoint
+/// serves). Lets embedders and tests run queries without standing up the server.
+pub fn execute_sparql(
     store: &TripleStore,
     engine: &HybridEngine,
     query_str: &str,
@@ -682,83 +685,100 @@ fn eval_path(
         return Ok((RowBlock::new(vo.len()), vo));
     }
 
-    let cap = max_result_rows();
     match (s_end, o_end) {
         // Subject bound, object variable: forward closure.
         (Some(PathEnd::Bound(s)), Some(PathEnd::Var(ov))) => {
-            let mut from = FxHashSet::default();
-            from.insert(s);
-            let ends = step_forward(store, path, &from);
-            if ends.len() > cap {
-                return Err(op_too_large());
-            }
-            let mut rows = RowBlock::new(1);
-            for o in ends {
-                rows.push_row(&[o]);
-            }
-            Ok((rows, vec![ov]))
+            path_from_bound(store, path, s, ov, true)
         }
         // Object bound, subject variable: backward closure.
         (Some(PathEnd::Var(sv)), Some(PathEnd::Bound(o))) => {
-            let mut from = FxHashSet::default();
-            from.insert(o);
-            let starts = step_backward(store, path, &from);
-            if starts.len() > cap {
-                return Err(op_too_large());
-            }
-            let mut rows = RowBlock::new(1);
-            for s in starts {
-                rows.push_row(&[s]);
-            }
-            Ok((rows, vec![sv]))
+            path_from_bound(store, path, o, sv, false)
         }
         // Both bound: existence check (0 variables, 1 empty row on a hit).
-        (Some(PathEnd::Bound(s)), Some(PathEnd::Bound(o))) => {
-            let mut from = FxHashSet::default();
-            from.insert(s);
-            let ends = step_forward(store, path, &from);
-            let mut rows = RowBlock::new(0);
-            if ends.contains(&o) {
-                rows.push_row(&[]);
-            }
-            Ok((rows, Vec::new()))
-        }
+        (Some(PathEnd::Bound(s)), Some(PathEnd::Bound(o))) => Ok(path_existence(store, path, s, o)),
         // Both variables: enumerate over all start nodes.
-        (Some(PathEnd::Var(sv)), Some(PathEnd::Var(ov))) => {
-            let same = sv == ov;
-            // Start candidates: distinct subjects; for reflexive paths also
-            // objects (identity (x,x) holds for every node).
-            let needs_all_nodes = path_is_reflexive(path);
-            let mut starts = store.distinct_subjects();
-            if needs_all_nodes {
-                starts.extend(store.distinct_objects());
-                starts.sort_unstable();
-                starts.dedup();
-            }
-            let rows_vars = if same { vec![sv] } else { vec![sv, ov] };
-            let mut rows = RowBlock::new(rows_vars.len());
-            for s in starts {
-                let mut from = FxHashSet::default();
-                from.insert(s);
-                let ends = step_forward(store, path, &from);
-                for o in ends {
-                    if same {
-                        if o == s {
-                            rows.push_row(&[s]);
-                        }
-                    } else {
-                        rows.push_row(&[s, o]);
-                    }
-                }
-                if rows.n_rows() > cap {
-                    return Err(op_too_large());
-                }
-            }
-            Ok((rows, rows_vars))
-        }
+        (Some(PathEnd::Var(sv)), Some(PathEnd::Var(ov))) => path_both_vars(store, path, sv, ov),
         // unreachable: None cases handled above
         _ => Ok((RowBlock::new(0), Vec::new())),
     }
+}
+
+/// One bound endpoint, one variable endpoint: the reachable set as a single
+/// column. `forward` selects the direction (bound subject → object, or bound
+/// object → subject).
+fn path_from_bound(
+    store: &TripleStore,
+    path: &Ppe,
+    bound: u32,
+    var: String,
+    forward: bool,
+) -> Result<(RowBlock, Vec<String>), String> {
+    let mut from = FxHashSet::default();
+    from.insert(bound);
+    let reached = if forward {
+        step_forward(store, path, &from)
+    } else {
+        step_backward(store, path, &from)
+    };
+    if reached.len() > max_result_rows() {
+        return Err(op_too_large());
+    }
+    let mut rows = RowBlock::new(1);
+    for n in reached {
+        rows.push_row(&[n]);
+    }
+    Ok((rows, vec![var]))
+}
+
+/// Both endpoints bound: a membership test yielding zero variables and at most
+/// one (empty) row.
+fn path_existence(store: &TripleStore, path: &Ppe, s: u32, o: u32) -> (RowBlock, Vec<String>) {
+    let mut from = FxHashSet::default();
+    from.insert(s);
+    let mut rows = RowBlock::new(0);
+    if step_forward(store, path, &from).contains(&o) {
+        rows.push_row(&[]);
+    }
+    (rows, Vec::new())
+}
+
+/// Both endpoints variable: enumerate reachable `(s, o)` pairs over all start
+/// nodes. When the two variables are the same, only fixed points `(x, x)` match.
+fn path_both_vars(
+    store: &TripleStore,
+    path: &Ppe,
+    sv: String,
+    ov: String,
+) -> Result<(RowBlock, Vec<String>), String> {
+    let cap = max_result_rows();
+    let same = sv == ov;
+    // Start candidates: distinct subjects; for reflexive paths also objects
+    // (the identity (x, x) holds for every node).
+    let mut starts = store.distinct_subjects();
+    if path_is_reflexive(path) {
+        starts.extend(store.distinct_objects());
+        starts.sort_unstable();
+        starts.dedup();
+    }
+    let rows_vars = if same { vec![sv] } else { vec![sv, ov] };
+    let mut rows = RowBlock::new(rows_vars.len());
+    for s in starts {
+        let mut from = FxHashSet::default();
+        from.insert(s);
+        for o in step_forward(store, path, &from) {
+            if same {
+                if o == s {
+                    rows.push_row(&[s]);
+                }
+            } else {
+                rows.push_row(&[s, o]);
+            }
+        }
+        if rows.n_rows() > cap {
+            return Err(op_too_large());
+        }
+    }
+    Ok((rows, rows_vars))
 }
 
 /// Whether a path contains the empty (reflexive) sequence (`*` or `?` at the root).

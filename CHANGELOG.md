@@ -11,11 +11,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `Dockerfile` for a containerized server image.
 - `CODE_OF_CONDUCT.md` (Contributor Covenant 2.1) and this changelog.
 - Dependabot config and a cached, lint-all-targets CI pipeline.
+- Pre-commit hook (`.githooks/pre-commit`) running fmt + clippy + tests.
+- End-to-end integration tests under `tests/` (SPARQL over the public API,
+  snapshot round-trip).
+- Public `sparql::execute_sparql` so embedders can run queries without the HTTP
+  server.
 
 ### Changed
 - Snapshot loading now returns errors on truncated/corrupt files instead of
   panicking.
 - Bumped `rand` to 0.9.
+- Refactored `eval_path` into focused helpers.
+
+### Removed
+- The test-only `Stats` cardinality helper is now gated out of release builds.
 
 ## [0.1.0] - 2026-06-24
 
