@@ -199,8 +199,14 @@ impl MappedDict {
     fn key(&self, id: usize) -> &str {
         let o = self.key_offsets();
         let blob = &self.map[self.keys_off..self.keys_off + self.keys_len];
-        // SAFETY: serialize writes only valid UTF-8 keys.
-        unsafe { std::str::from_utf8_unchecked(&blob[o[id] as usize..o[id + 1] as usize]) }
+        // Checked: the snapshot is attacker-controllable, so a corrupt offset or
+        // non-UTF-8/boundary-splitting slice must NOT cause UB. Fall back to ""
+        // (a corrupt snapshot already failed validation in `from_mapped`; this is
+        // defence in depth on the hot path).
+        let (lo, hi) = (o[id] as usize, o[id + 1] as usize);
+        blob.get(lo..hi)
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .unwrap_or("")
     }
     /// Binary search over the key-sorted IDs. O(log n).
     fn lookup(&self, key: &str) -> Option<u32> {
@@ -419,9 +425,12 @@ impl Dictionary {
             .checked_add((n + 1).checked_mul(8).ok_or("dictionary offset overflow")?)
             .ok_or("dictionary offset overflow")?;
         let keys_len = rd_u64(last_off)? as usize;
-        let mut sorted_off = keys_off
+        // `keys_end` via checked add — a corrupt `keys_len` must not wrap past
+        // `b.len()` and bypass the bounds check.
+        let keys_end = keys_off
             .checked_add(keys_len)
             .ok_or("dictionary offset overflow")?;
+        let mut sorted_off = keys_end;
         while !sorted_off.is_multiple_of(4) {
             sorted_off += 1;
         }
@@ -429,8 +438,13 @@ impl Dictionary {
         let end = sorted_off
             .checked_add(n.checked_mul(4).ok_or("dictionary offset overflow")?)
             .ok_or("dictionary offset overflow")?;
-        if keys_off + keys_len > b.len() || end > b.len() {
+        if keys_end > b.len() || end > b.len() {
             return Err("dictionary section out of bounds".to_string());
+        }
+        // Validate the keys blob is UTF-8 up front, so a corrupt snapshot is
+        // rejected at load rather than yielding garbage at query time.
+        if std::str::from_utf8(&b[keys_off..keys_end]).is_err() {
+            return Err("dictionary keys blob is not valid UTF-8".to_string());
         }
         Ok(Dictionary {
             mapped: Some(MappedDict {
