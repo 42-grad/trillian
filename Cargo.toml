@@ -15,18 +15,18 @@ categories = ["database-implementations"]
 
 [dependencies]
 rustc-hash = "2"
-rand = "0.9"
+rand = "0.10"
 rayon = "1.10"
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 spargebra = "0.4"
-lru = "0.13"
+lru = "0.18"
 tokio-stream = "0.1"
 memmap2 = "0.9"
 bytemuck = "1"
-string-interner = "0.17"
+string-interner = "0.20"
 dhat = { version = "0.3", optional = true }
 
 [dev-dependencies]
