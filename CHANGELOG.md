@@ -70,7 +70,7 @@ Initial open-source release.
 ### Removed
 - The test-only `Stats` cardinality helper is gated out of release builds.
 
-[Unreleased]: https://github.com/cpthappy/trillian/compare/v0.1.2...HEAD
-[0.1.2]: https://github.com/cpthappy/trillian/compare/v0.1.1...v0.1.2
-[0.1.1]: https://github.com/cpthappy/trillian/compare/v0.1.0...v0.1.1
-[0.1.0]: https://github.com/cpthappy/trillian/releases/tag/v0.1.0
+[Unreleased]: https://github.com/42-grad/trillian/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/42-grad/trillian/compare/v0.1.1...v0.1.2
+[0.1.1]: https://github.com/42-grad/trillian/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/42-grad/trillian/releases/tag/v0.1.0
