@@ -601,15 +601,6 @@ pub fn intersect_sorted(a: &[u32], b: &[u32]) -> Vec<u32> {
     result
 }
 
-/// Intersection of two sorted u32 slices via a roaring bitmap.
-pub fn intersect_bitmap(a: &[u32], b: &[u32]) -> Vec<u32> {
-    use roaring::RoaringBitmap;
-
-    let bitmap_a: RoaringBitmap = a.iter().copied().collect();
-    let bitmap_b: RoaringBitmap = b.iter().copied().collect();
-    (&bitmap_a & &bitmap_b).iter().collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
