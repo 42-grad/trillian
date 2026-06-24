@@ -6,6 +6,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- Repository moved to the **42-grad** organization; references updated.
+- Dependency updates: `rand` 0.9 → 0.10 (`random_range` moved to the `RngExt`
+  trait), `lru` 0.13 → 0.18, `string-interner` 0.17 → 0.20, `memmap2` 0.9.11;
+  CI action `download-artifact` v4 → v8.
+
 ## [0.1.2] - 2026-06-24
 
 ### Fixed
