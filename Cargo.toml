@@ -15,7 +15,7 @@ categories = ["database-implementations"]
 
 [dependencies]
 rustc-hash = "2"
-rand = "0.9"
+rand = "0.10"
 rayon = "1.10"
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
