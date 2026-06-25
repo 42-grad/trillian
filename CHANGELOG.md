@@ -6,6 +6,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-06-25
+
+### Added
+- Project website at [trilliandb.org](https://trilliandb.org) built with Astro,
+  deployed via GitHub Pages — quickstart, feature overview, GraphRAG tutorial,
+  and imprint.
+- Custom domain `trilliandb.org` for the project site.
+- `cargo deny check` as a CI supply-chain gate (`deny.toml` policy).
+- `AGENTS.md` with branching, release, and CI conventions for AI (and human)
+  contributors.
+- GraphRAG demo now prints latency (per-phase and total), timestamp, and
+  process RSS on every run.
+
+### Fixed
+- GraphRAG demo: `from mistralai import Mistral` → `from mistralai.client import
+  Mistral` for compatibility with `mistralai >= 2.5.0`.
+
+### Changed
+- GitHub URLs throughout updated from the archived `anomalyco` org to `42-grad`.
+
 ## [0.1.3] - 2026-06-24
 
 ### Changed
@@ -78,7 +98,8 @@ Initial open-source release.
 ### Removed
 - The test-only `Stats` cardinality helper is gated out of release builds.
 
-[Unreleased]: https://github.com/42-grad/trillian/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/42-grad/trillian/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/42-grad/trillian/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/42-grad/trillian/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/42-grad/trillian/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/42-grad/trillian/compare/v0.1.0...v0.1.1
