@@ -1,0 +1,41 @@
+# Supply-chain policy enforced by `cargo deny check` in CI.
+#
+# Strict by design: a dependency anywhere in the tree fails the build if it has a
+# known security advisory, is unmaintained or yanked, carries a non-permissive
+# license, or comes from anywhere other than crates.io.
+
+[advisories]
+# Security vulnerabilities always fail. Also reject unmaintained and yanked deps.
+unmaintained = "all"
+yanked = "deny"
+# Add reviewed RUSTSEC ids here (with a comment) only when an advisory is
+# unavoidable and assessed as not exploitable for our usage.
+ignore = []
+
+[licenses]
+# Permissive licenses only — no copyleft (GPL/LGPL/AGPL).
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "BSL-1.0",
+    "Unlicense",
+    "MPL-2.0",
+    "CC0-1.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Duplicate versions are hygiene, not security — warn rather than fail.
+multiple-versions = "warn"
+# Wildcard ("*") version requirements are forbidden.
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

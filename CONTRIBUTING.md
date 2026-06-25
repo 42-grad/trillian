@@ -101,7 +101,11 @@ requests whose commits are not signed off cannot be merged.
   cargo fmt --check
   cargo clippy --all-targets -- -D warnings
   cargo test
+  cargo deny check   # supply-chain policy (deny.toml); needs `cargo install cargo-deny`
   ```
+- **Dependencies** must satisfy `deny.toml` (permissive licenses only, no known
+  advisories, crates.io sources). New deps are reviewed by a maintainer — never
+  auto-merged.
 - **Tests.** New behaviour comes with tests; bug fixes come with a regression
   test that fails before the fix.
 - **Comments and docs in English.**

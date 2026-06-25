@@ -34,3 +34,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --locked --verbose
       - run: cargo test --locked --verbose
+
+  deny:
+    name: Supply chain
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Checks advisories, licenses, sources, and bans per deny.toml.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
