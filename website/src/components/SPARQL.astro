@@ -1,0 +1,124 @@
+---
+const supported = [
+  "SELECT and ASK; projection, DISTINCT, LIMIT, OFFSET",
+  "Basic graph patterns, OPTIONAL (left joins), UNION",
+  "FILTER — 3-valued logic: comparisons, && / || / !, BOUND, arithmetic, IN, IF",
+  "String functions: STR, LANG, DATATYPE, STRLEN, UCASE, LCASE, CONTAINS, STRSTARTS, STRENDS",
+  "isIRI / isLiteral / isNumeric / isBlank type checks",
+  "ORDER BY (type-aware: numeric before lexical), with LIMIT / DISTINCT",
+  "Property paths: / ^ | * + ? and negated property sets",
+  "IRIs, typed / @lang literals, blank nodes",
+  "INSERT DATA / DELETE DATA via WAL",
+];
+
+const planned = [
+  "BIND, sub-SELECT, and nested/multiple OPTIONAL patterns",
+  "Aggregation: GROUP BY with COUNT / SUM / MIN / MAX / AVG",
+  "REGEX in FILTER",
+  "Turtle (.ttl) input",
+  "WAL checkpointing and snapshot rotation",
+];
+---
+
+<section id="sparql">
+  <div class="container">
+    <span class="section-label">SPARQL 1.1</span>
+    <h2>Supported <span class="accent-gradient">query language</span></h2>
+    <p class="section-sub">
+      Trillian implements a growing subset of SPARQL 1.1. The basic-graph-pattern
+      core is provably correct — 930 WDBench queries, zero result deviations.
+    </p>
+    <div class="support-grid">
+      <div class="support-col">
+        <h3>Currently supported</h3>
+        <ul class="check-list">
+          {supported.map((item) => (
+            <li>
+              <span class="check-icon">
+                <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 7l3 3 5-5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </span>
+              {item}
+            </li>
+          ))}
+        </ul>
+      </div>
+      <div class="support-col">
+        <h3>On the roadmap</h3>
+        <ul class="planned-list">
+          {planned.map((item) => (
+            <li>
+              <span class="planned-icon">
+                <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7" r="5.5" stroke="currentColor" stroke-width="1.5" stroke-dasharray="2.5 2.5"/><path d="M7 4v3m0 2v.01" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+              </span>
+              {item}
+            </li>
+          ))}
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<style>
+  .support-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 3rem;
+    margin-top: 3rem;
+  }
+
+  .support-col h3 {
+    font-size: 0.82rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+    margin-bottom: 1.5rem;
+    padding-bottom: 0.75rem;
+    border-bottom: 1px solid var(--border);
+  }
+
+  ul {
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 0.9rem;
+  }
+
+  ul li {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.75rem;
+    font-size: 0.9rem;
+    color: var(--text-secondary);
+    line-height: 1.55;
+  }
+
+  .check-icon, .planned-icon {
+    flex-shrink: 0;
+    margin-top: 0.2rem;
+    width: 20px;
+    height: 20px;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .check-icon {
+    background: rgba(0, 212, 176, 0.1);
+    color: var(--accent);
+  }
+
+  .planned-icon {
+    background: var(--surface);
+    color: var(--text-muted);
+  }
+
+  @media (max-width: 768px) {
+    .support-grid {
+      grid-template-columns: 1fr;
+      gap: 2.5rem;
+    }
+  }
+</style>

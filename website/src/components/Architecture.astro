@@ -1,0 +1,146 @@
+---
+---
+
+<section id="architecture">
+  <div class="container">
+    <span class="section-label">How it works</span>
+    <h2>Architecture <span class="accent-gradient">at a glance</span></h2>
+    <p class="section-sub">
+      Three CSR permutation indexes, a dual-mode mmap dictionary, and a hybrid
+      query engine that routes cyclic patterns to WCOJ and acyclic to a pipelined cost-based plan.
+    </p>
+
+    <div class="pipeline">
+      <div class="pipe-step">
+        <div class="step-num">01</div>
+        <h3>Ingest</h3>
+        <p>N-Triples are parsed; each term is interned to a u32 ID via the dictionary.</p>
+      </div>
+      <div class="pipe-arrow">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none"><path d="M5 12h14m0 0l-4-4m4 4l-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <div class="pipe-step">
+        <div class="step-num">02</div>
+        <h3>Index</h3>
+        <p>Three flat-CSR permutations (SPO, POS, OSP) built in contiguous u32 vectors.</p>
+      </div>
+      <div class="pipe-arrow">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none"><path d="M5 12h14m0 0l-4-4m4 4l-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <div class="pipe-step">
+        <div class="step-num">03</div>
+        <h3>Persist</h3>
+        <p>Index and dictionary written to a single file, then memory-mapped for zero-copy serving.</p>
+      </div>
+      <div class="pipe-arrow">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none"><path d="M5 12h14m0 0l-4-4m4 4l-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <div class="pipe-step">
+        <div class="step-num">04</div>
+        <h3>Query</h3>
+        <p>SPARQL parsed, planner picks joins, hybrid engine executes — WCOJ for cycles, pipelined for trees.</p>
+      </div>
+    </div>
+
+    <div class="arch-cols">
+      <div class="arch-card">
+        <h3>Term Dictionary</h3>
+        <p>Every IRI, literal, and blank node is interned to a u32 ID. Type is encoded in the key prefix — no separate type table. Namespace folding compresses repeated Wikidata prefixes to 2-byte escapes.</p>
+      </div>
+      <div class="arch-card">
+        <h3>CSR Indexes</h3>
+        <p>Three permutations (SPO, POS, OSP) mean any access pattern with at least one bound term answers from a sorted slice. A base + delta overlay keeps updates incremental; reads return Cow&lt;[u32]&gt;.</p>
+      </div>
+      <div class="arch-card">
+        <h3>Hybrid Engine</h3>
+        <p>Cyclic patterns (triangles) route to leapfrog triejoin. Acyclic patterns (stars, paths) use a cost-based, left-deep plan with a pipelined DFS executor. A configurable row cap prevents OOM.</p>
+      </div>
+      <div class="arch-card">
+        <h3>Persistence</h3>
+        <p>Snapshots are a single versioned file; load memory-maps it, so indexes and dictionary are served zero-copy. A WAL appends INSERT / DELETE DATA and replays on restart.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<style>
+  .pipeline {
+    display: flex;
+    align-items: stretch;
+    gap: 0.75rem;
+    margin-top: 3rem;
+    padding: 2rem;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+  }
+
+  .pipe-step {
+    flex: 1;
+    text-align: center;
+    padding: 0.5rem;
+  }
+
+  .step-num {
+    font-size: 0.68rem;
+    font-weight: 700;
+    color: var(--accent);
+    margin-bottom: 0.5rem;
+    letter-spacing: 0.12em;
+  }
+
+  .pipe-step h3 {
+    font-size: 1rem;
+    font-weight: 600;
+    margin-bottom: 0.4rem;
+  }
+
+  .pipe-step p {
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    line-height: 1.55;
+  }
+
+  .pipe-arrow {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    color: var(--text-muted);
+  }
+
+  .arch-cols {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 1.25rem;
+    margin-top: 2rem;
+  }
+
+  .arch-card {
+    padding: 1.75rem;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    transition: border-color var(--transition);
+  }
+
+  .arch-card:hover {
+    border-color: var(--border-bright);
+  }
+
+  .arch-card h3 {
+    font-size: 1rem;
+    font-weight: 600;
+    margin-bottom: 0.6rem;
+  }
+
+  .arch-card p {
+    font-size: 0.86rem;
+    color: var(--text-secondary);
+    line-height: 1.65;
+  }
+
+  @media (max-width: 768px) {
+    .pipeline { flex-direction: column; gap: 0.5rem; }
+    .pipe-arrow { transform: rotate(90deg); justify-content: center; }
+  }
+</style>
