@@ -62,6 +62,12 @@ Dependabot opens PRs against `develop` (cargo + github-actions + docker). Prefer
 consolidating several bumps into one branch — and fixing any breaking change
 there — over many separate merges.
 
+Every PR runs `cargo deny check` (CI job "Supply chain", policy in `deny.toml`):
+it fails on security advisories, unmaintained/yanked crates, non-permissive
+licenses, or non-crates.io sources, so a new dependency must satisfy it. Run it
+locally with `cargo deny check` (`cargo install cargo-deny` first). Dependencies
+are **not** auto-merged — a maintainer reviews every bump.
+
 ## Maintainer notes
 
 - Rulesets `protect-master` / `protect-develop` enforce the rules above.
