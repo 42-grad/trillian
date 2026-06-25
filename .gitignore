@@ -43,3 +43,7 @@ infra/**/duel_key
 infra/**/duel_key.pub
 infra/**/inventory.ini
 infra/aws/solo_csv/
+
+# Astro website build output (source is committed, dist is not)
+/website/dist/
+/website/node_modules/
