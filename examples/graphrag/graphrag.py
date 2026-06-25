@@ -144,7 +144,7 @@ def generate(question: str, facts: list[str]) -> str:
     if not api_key:
         return None
     try:
-        from mistralai import Mistral
+        from mistralai.client import Mistral
     except ImportError:
         print("(mistralai not installed — `pip install mistralai`; showing retrieval only)\n",
               file=sys.stderr)
