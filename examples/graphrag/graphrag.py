@@ -34,12 +34,25 @@ import os
 import re
 import sys
 import json
+import time
+import resource
+from datetime import datetime
 import urllib.parse
 import urllib.request
 
 SPARQL_URL = os.environ.get("TRILLIAN_SPARQL", "http://localhost:9090/sparql")
 RDFS_LABEL = "http://www.w3.org/2000/01/rdf-schema#label"
 MODEL = os.environ.get("MISTRAL_MODEL", "mistral-small-latest")
+
+# Metrics accumulators — populated by instrumented functions and printed at the end.
+_METRICS: dict[str, object] = {}
+
+def _memory_kb() -> int:
+    """Resident set size in kB (macOS/Linux)."""
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
+
+def _stamp() -> str:
+    return datetime.now().time().isoformat(timespec="milliseconds")
 
 # Words too generic to be useful as entity-label matches.
 STOPWORDS = {
@@ -123,7 +136,10 @@ def pred_label(p: str) -> str:
 
 def retrieve(question: str):
     """Return (fact_sentences, debug_entities)."""
+    mem_before = _memory_kb()
+    t0 = time.perf_counter()
     entities = match_entities(question)
+    t1 = time.perf_counter()
     seen = set()
     facts = []
     for e in entities:
@@ -135,6 +151,13 @@ def retrieve(question: str):
                 continue
             seen.add(key)
             facts.append(f"{term_str(s)} {pred_label(p['value'])} {term_str(o)}.")
+    t2 = time.perf_counter()
+    _METRICS["retrieval"] = {
+        "entity_match_ms": round((t1 - t0) * 1000, 1),
+        "neighbourhood_ms": round((t2 - t1) * 1000, 1),
+        "total_retrieval_ms": round((t2 - t0) * 1000, 1),
+        "memory_kb": _memory_kb() - mem_before,
+    }
     return facts, [label(e) for e in entities]
 
 
@@ -144,11 +167,12 @@ def generate(question: str, facts: list[str]) -> str:
     if not api_key:
         return None
     try:
-        from mistralai import Mistral
+        from mistralai.client import Mistral
     except ImportError:
         print("(mistralai not installed — `pip install mistralai`; showing retrieval only)\n",
               file=sys.stderr)
         return None
+    t0 = time.perf_counter()
     context = "\n".join(f"- {f}" for f in facts)
     prompt = (
         "Answer the question using ONLY the facts below. If the facts are not "
@@ -160,6 +184,11 @@ def generate(question: str, facts: list[str]) -> str:
         model=MODEL,
         messages=[{"role": "user", "content": prompt}],
     )
+    dt = time.perf_counter() - t0
+    _METRICS["generation"] = {
+        "llm_ms": round(dt * 1000, 1),
+        "model": MODEL,
+    }
     return resp.choices[0].message.content
 
 
@@ -169,8 +198,14 @@ def main():
         sys.exit(1)
     question = " ".join(sys.argv[1:])
 
+    t_start = time.perf_counter()
+
     facts, entities = retrieve(question)
-    print(f"Q: {question}\n")
+    elapsed_ms = (time.perf_counter() - t_start) * 1000
+
+    print(f"Q: {question}")
+    print(f"  timestamp .. {_stamp()}")
+    print(f"  process rss . {_memory_kb()} kB\n")
     print(f"Matched entities: {', '.join(entities) or '(none)'}")
     print("Retrieved subgraph:")
     for f in facts:
@@ -186,7 +221,15 @@ def main():
         print("(set MISTRAL_API_KEY to get a generated answer; retrieval shown above)")
     else:
         print("Answer (grounded in the subgraph above):")
-        print(answer)
+        print(f"  {answer}\n")
+
+    # Metrics summary
+    print("── Metrics ──────────────────────────────")
+    print(f"  total wall .. {elapsed_ms:.0f} ms")
+    print(f"  process rss . {_memory_kb()} kB")
+    for phase, m in _METRICS.items():
+        items = "  ".join(f"{k} {v}" for k, v in m.items())
+        print(f"  {phase} ..... {items}")
 
 
 if __name__ == "__main__":

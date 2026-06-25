@@ -1,0 +1,377 @@
+---
+const repoUrl = "https://github.com/42-grad/trillian";
+const starsUrl = `${repoUrl}/stargazers`;
+const B = import.meta.env.BASE_URL;
+---
+
+<section class="hero">
+  <div class="bg-grid"></div>
+  <div class="bg-glow"></div>
+  <div class="bg-planet"></div>
+
+  <nav class="nav" id="nav">
+    <a href={B} class="nav-brand">
+      <img src={`${B}logo.png`} alt="Trillian" width="140" height="78" />
+    </a>
+    <div class="nav-links">
+      <a href="#features">Features</a>
+      <a href="#benchmarks">Benchmarks</a>
+      <a href="#architecture">Architecture</a>
+      <a href="#quickstart">Quickstart</a>
+    </div>
+    <div class="nav-cta">
+      <a href={repoUrl} class="btn-ghost" target="_blank" rel="noopener">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
+        <span>GitHub</span>
+      </a>
+    </div>
+  </nav>
+
+  <div class="container hero-inner">
+    <div class="hero-badge">
+      <span class="pulse-dot"></span>
+      Don't panic &middot; Apache 2.0 &middot; Built by 42grad
+    </div>
+
+    <h1 class="hero-title">
+      A lean, fast<br />
+      <span class="gradient-text">RDF triple store</span><br />
+      in Rust
+    </h1>
+
+    <p class="hero-sub">
+      Trillian keeps the whole graph in memory with flat, cache-friendly indexes and
+      <code>u32</code> term IDs, serves SPARQL over HTTP, and persists to a zero-copy
+      memory-mapped snapshot. Worst-case-optimal joins for cyclic patterns.
+    </p>
+
+    <div class="hero-cta">
+      <a href="#quickstart" class="btn-primary">
+        Get started
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 8h10m0 0L9 4m4 4l-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </a>
+      <a href="#benchmarks" class="btn-secondary">View benchmarks</a>
+    </div>
+
+    <div class="stats-strip">
+      <div class="stat">
+        <div class="stat-value">1.26<span class="stat-unit">B</span></div>
+        <div class="stat-label">triples loaded</div>
+      </div>
+      <div class="stat-divider"></div>
+      <div class="stat">
+        <div class="stat-value">~1<span class="stat-unit">ms</span></div>
+        <div class="stat-label">median BGP query</div>
+      </div>
+      <div class="stat-divider"></div>
+      <div class="stat">
+        <div class="stat-value">35<span class="stat-unit">B</span></div>
+        <div class="stat-label">per triple in RAM</div>
+      </div>
+      <div class="stat-divider"></div>
+      <div class="stat">
+        <div class="stat-value">930<span class="stat-unit"></span></div>
+        <div class="stat-label">queries, 0 deviations</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<style>
+  .hero {
+    position: relative;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    overflow: hidden;
+    padding: 6rem 1.5rem 2rem;
+  }
+
+  .bg-grid {
+    position: absolute;
+    inset: 0;
+    background-image:
+      linear-gradient(to right, rgba(28, 28, 56, 0.4) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(28, 28, 56, 0.4) 1px, transparent 1px);
+    background-size: 64px 64px;
+    mask-image: radial-gradient(ellipse 80% 50% at 50% 40%, black 30%, transparent 80%);
+    -webkit-mask-image: radial-gradient(ellipse 80% 50% at 50% 40%, black 30%, transparent 80%);
+    pointer-events: none;
+  }
+
+  .bg-glow {
+    position: absolute;
+    top: -10%;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 1100px;
+    height: 700px;
+    background:
+      radial-gradient(ellipse 60% 50% at 40% 50%, rgba(0, 212, 176, 0.12), transparent 70%),
+      radial-gradient(ellipse 50% 40% at 65% 40%, rgba(0, 102, 255, 0.08), transparent 70%);
+    pointer-events: none;
+    filter: blur(30px);
+  }
+
+  .bg-planet {
+    position: absolute;
+    top: 8%;
+    right: -8%;
+    width: 380px;
+    height: 380px;
+    border-radius: 50%;
+    background: radial-gradient(circle at 35% 35%, rgba(0, 212, 176, 0.08), rgba(0, 102, 255, 0.04) 50%, transparent 70%);
+    border: 1px solid rgba(28, 28, 56, 0.6);
+    box-shadow: inset 0 0 80px rgba(0, 212, 176, 0.05), 0 0 120px rgba(0, 102, 255, 0.04);
+    pointer-events: none;
+    opacity: 0.6;
+  }
+
+  .nav {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 100;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 1rem 2rem;
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    background: rgba(6, 6, 12, 0.72);
+    border-bottom: 1px solid transparent;
+    transition: border-color 0.3s, background 0.3s;
+  }
+
+  .nav.scrolled {
+    border-bottom-color: var(--border);
+    background: rgba(6, 6, 12, 0.88);
+  }
+
+  .nav-brand img {
+    height: 36px;
+    width: auto;
+  }
+
+  .nav-links {
+    display: flex;
+    gap: 2.2rem;
+  }
+
+  .nav-links a {
+    color: var(--text-secondary);
+    font-size: 0.88rem;
+    font-weight: 500;
+    transition: color var(--transition);
+  }
+
+  .nav-links a:hover {
+    color: var(--text);
+  }
+
+  .nav-cta {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+  }
+
+  .btn-ghost {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 1rem;
+    border-radius: var(--radius-xs);
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+    font-weight: 500;
+    transition: all var(--transition);
+  }
+
+  .btn-ghost:hover {
+    border-color: var(--border-bright);
+    color: var(--text);
+    background: var(--surface);
+  }
+
+  .hero-inner {
+    position: relative;
+    z-index: 1;
+    max-width: var(--max-width);
+    padding: 2rem 0 4rem;
+    text-align: left;
+  }
+
+  .hero-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.6rem;
+    padding: 0.4rem 0.95rem;
+    border-radius: 100px;
+    font-size: 0.78rem;
+    font-weight: 500;
+    color: var(--text-secondary);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    margin-bottom: 2.25rem;
+  }
+
+  .pulse-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 0 0 rgba(0, 212, 176, 0.5);
+    animation: pulse 2s infinite;
+  }
+
+  @keyframes pulse {
+    0% { box-shadow: 0 0 0 0 rgba(0, 212, 176, 0.5); }
+    70% { box-shadow: 0 0 0 8px rgba(0, 212, 176, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(0, 212, 176, 0); }
+  }
+
+  .hero-title {
+    font-size: clamp(2.6rem, 6.5vw, 4.6rem);
+    font-weight: 800;
+    letter-spacing: -0.045em;
+    line-height: 1.04;
+    margin-bottom: 1.75rem;
+  }
+
+  .gradient-text {
+    background: var(--accent-gradient);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  .hero-sub {
+    font-size: clamp(1rem, 1.8vw, 1.15rem);
+    color: var(--text-secondary);
+    max-width: 620px;
+    line-height: 1.7;
+    margin-bottom: 2.5rem;
+  }
+
+  .hero-sub code {
+    font-size: 0.88em;
+    padding: 0.1em 0.4em;
+    background: var(--surface);
+    border-radius: var(--radius-xs);
+    border: 1px solid var(--border);
+    color: var(--accent);
+  }
+
+  .hero-cta {
+    display: flex;
+    gap: 0.85rem;
+    flex-wrap: wrap;
+    margin-bottom: 4rem;
+  }
+
+  .btn-primary, .btn-secondary {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.8rem 1.6rem;
+    border-radius: var(--radius-sm);
+    font-size: 0.9rem;
+    font-weight: 600;
+    transition: all var(--transition);
+  }
+
+  .btn-primary {
+    background: var(--accent-gradient);
+    color: #fff;
+    border: none;
+    box-shadow: 0 4px 20px rgba(0, 212, 176, 0.25);
+  }
+
+  .btn-primary:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 6px 28px rgba(0, 212, 176, 0.35);
+  }
+
+  .btn-secondary {
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--border);
+  }
+
+  .btn-secondary:hover {
+    border-color: var(--border-bright);
+    background: var(--surface-raised);
+  }
+
+  .stats-strip {
+    display: flex;
+    align-items: center;
+    gap: 0;
+    padding: 1.75rem 2rem;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+  }
+
+  .stat {
+    flex: 1;
+    text-align: center;
+  }
+
+  .stat-value {
+    font-size: 1.7rem;
+    font-weight: 700;
+    letter-spacing: -0.03em;
+    color: var(--text);
+    line-height: 1;
+  }
+
+  .stat-unit {
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: var(--accent);
+    margin-left: 0.1em;
+  }
+
+  .stat-label {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    margin-top: 0.4rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+
+  .stat-divider {
+    width: 1px;
+    height: 36px;
+    background: var(--border);
+    margin: 0 0.5rem;
+  }
+
+  @media (max-width: 768px) {
+    .nav-links { display: none; }
+    .hero-inner { padding-top: 1rem; }
+    .hero { min-height: auto; padding-top: 5rem; padding-bottom: 2rem; }
+    .stats-strip {
+      flex-wrap: wrap;
+      gap: 1rem;
+      padding: 1.25rem;
+    }
+    .stat { flex: 1 1 40%; }
+    .stat-divider { display: none; }
+  }
+</style>
+
+<script>
+  const nav = document.getElementById('nav');
+  const onScroll = () => {
+    if (window.scrollY > 20) nav.classList.add('scrolled');
+    else nav.classList.remove('scrolled');
+  };
+  window.addEventListener('scroll', onScroll, { passive: true });
+  onScroll();
+</script>

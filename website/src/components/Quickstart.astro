@@ -1,0 +1,231 @@
+---
+const queryCode = `curl -G 'http://localhost:9090/sparql' \\
+  --data-urlencode \\
+  'query=SELECT ?s ?o WHERE { ?s <http://example.org/knows> ?o } LIMIT 10' \\
+  -H 'Accept: application/sparql-results+json'`;
+---
+
+<section id="quickstart">
+  <div class="container">
+    <span class="section-label">Get started</span>
+    <h2>From zero to <span class="accent-gradient">SPARQL</span><br />in two commands</h2>
+    <p class="section-sub">
+      Trillian requires Rust 1.85+. Clone the repo, build, and run.
+    </p>
+
+    <div class="code-grid">
+      <div class="code-block">
+        <div class="code-header">
+          <div class="code-dots">
+            <span></span><span></span><span></span>
+          </div>
+          <span class="code-lang">bash</span>
+        </div>
+        <pre><code>git clone https://github.com/42-grad/trillian.git
+cd trillian
+
+cargo build --release --bin server
+cargo test</code></pre>
+      </div>
+
+      <div class="code-block">
+        <div class="code-header">
+          <div class="code-dots">
+            <span></span><span></span><span></span>
+          </div>
+          <span class="code-lang">bash</span>
+        </div>
+        <pre><code>{`# Build index from N-Triples and persist
+./target/release/server build data.nt /tmp/data.bin
+
+# Serve the snapshot on port 9090
+./target/release/server load /tmp/data.bin 9090`}</code></pre>
+      </div>
+    </div>
+
+    <div class="code-block code-wide">
+      <div class="code-header">
+        <div class="code-dots">
+          <span></span><span></span><span></span>
+        </div>
+        <span class="code-lang">bash</span>
+        <button class="copy-btn" data-copy-target={queryCode}>Copy</button>
+      </div>
+      <pre><code>{queryCode}</code></pre>
+    </div>
+
+    <div class="endpoints">
+      <h3>HTTP endpoints</h3>
+      <div class="ep-grid">
+        <div class="ep-row"><code>GET / POST</code><span class="ep-path">/sparql</span><span class="ep-desc">SPARQL 1.1 JSON results</span></div>
+        <div class="ep-row"><code>GET / POST</code><span class="ep-path">/stream</span><span class="ep-desc">NDJSON stream (header + one binding per line)</span></div>
+        <div class="ep-row"><code>GET / POST</code><span class="ep-path">/count</span><span class="ep-desc">Result count for SELECT / ASK</span></div>
+        <div class="ep-row"><code>POST</code><span class="ep-path">/update</span><span class="ep-desc">INSERT DATA / DELETE DATA</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<script>
+  document.querySelectorAll('.copy-btn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const text = btn.getAttribute('data-copy-target') || '';
+      try {
+        await navigator.clipboard.writeText(text);
+        const orig = btn.textContent;
+        btn.textContent = 'Copied!';
+        btn.classList.add('copied');
+        setTimeout(() => {
+          btn.textContent = orig;
+          btn.classList.remove('copied');
+        }, 1600);
+      } catch {}
+    });
+  });
+</script>
+
+<style>
+  .code-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1.25rem;
+    margin-top: 2.5rem;
+  }
+
+  .code-block {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+  }
+
+  .code-wide {
+    margin-top: 1.25rem;
+  }
+
+  .code-header {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.7rem 1rem;
+    border-bottom: 1px solid var(--border);
+    background: rgba(255, 255, 255, 0.02);
+  }
+
+  .code-dots {
+    display: flex;
+    gap: 6px;
+  }
+
+  .code-dots span {
+    width: 11px;
+    height: 11px;
+    border-radius: 50%;
+    background: var(--border-bright);
+  }
+
+  .code-lang {
+    font-size: 0.72rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--text-muted);
+    margin-left: auto;
+  }
+
+  .copy-btn {
+    margin-left: auto;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+    font-size: 0.72rem;
+    font-family: var(--font-sans);
+    padding: 0.25rem 0.7rem;
+    border-radius: var(--radius-xs);
+    cursor: pointer;
+    transition: all var(--transition);
+  }
+
+  .copy-btn:hover {
+    border-color: var(--border-bright);
+    color: var(--text);
+  }
+
+  .copy-btn.copied {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  pre {
+    padding: 1.1rem 1.25rem;
+    overflow-x: auto;
+    font-family: var(--font-mono);
+    font-size: 0.83rem;
+    line-height: 1.7;
+    color: var(--text);
+  }
+
+  pre code {
+    font-family: var(--font-mono);
+  }
+
+  .endpoints {
+    margin-top: 2.5rem;
+    padding: 1.75rem;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+  }
+
+  .endpoints h3 {
+    font-size: 0.82rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+    margin-bottom: 1.25rem;
+  }
+
+  .ep-grid {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .ep-row {
+    display: grid;
+    grid-template-columns: 90px 100px 1fr;
+    align-items: center;
+    gap: 1rem;
+    padding: 0.65rem 0;
+    border-bottom: 1px solid rgba(28, 28, 56, 0.5);
+    font-size: 0.88rem;
+  }
+
+  .ep-row:last-child {
+    border-bottom: none;
+  }
+
+  .ep-row code {
+    color: var(--text-muted);
+    font-size: 0.78rem;
+    font-weight: 500;
+  }
+
+  .ep-path {
+    color: var(--accent);
+    font-family: var(--font-mono);
+    font-size: 0.84rem;
+    font-weight: 500;
+  }
+
+  .ep-desc {
+    color: var(--text-secondary);
+    font-size: 0.86rem;
+  }
+
+  @media (max-width: 768px) {
+    .code-grid { grid-template-columns: 1fr; }
+    .ep-row { grid-template-columns: 70px 1fr; }
+    .ep-desc { grid-column: 1 / -1; padding-left: 0; }
+  }
+</style>

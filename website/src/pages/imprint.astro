@@ -1,0 +1,190 @@
+---
+import Layout from '../layouts/Layout.astro';
+import Footer from '../components/Footer.astro';
+
+const B = import.meta.env.BASE_URL;
+---
+
+<Layout title="Impressum — Trillian" description="Impressum und Anbieterkennzeichnung für trilliandb.org">
+  <nav class="nav" id="nav">
+    <a href={`${B}`} class="nav-brand">
+      <img src={`${B}logo.png`} alt="Trillian" width="140" height="78" />
+    </a>
+    <div class="nav-links">
+      <a href={`${B}#features`}>Features</a>
+      <a href={`${B}#benchmarks`}>Benchmarks</a>
+      <a href={`${B}#quickstart`}>Quickstart</a>
+    </div>
+    <a href={`${B}imprint`} class="btn-ghost">Impressum</a>
+  </nav>
+
+  <main class="legal">
+    <div class="container">
+      <span class="section-label">Anbieterkennzeichnung</span>
+      <h1>Impressum</h1>
+
+      <div class="legal-section">
+        <h2>Angaben gemäß § 5 TMG</h2>
+        <p>
+          42grad GmbH<br />
+          Thaddäusstraße 23<br />
+          33415 Verl<br />
+          Deutschland
+        </p>
+        <p>
+          Tel.: +49 5246 82831 0<br />
+          E-Mail: <a href="mailto:info@42-grad.com">info@42-grad.com</a>
+        </p>
+      </div>
+
+      <div class="legal-section">
+        <h2>Vertretungsberechtigte</h2>
+        <p>Vertreten durch die Geschäftsführer: Jonas Fröhleke und Johann-Georg Vogelhuber</p>
+      </div>
+
+      <div class="legal-section">
+        <h2>Umsatzsteuer-ID</h2>
+        <p>
+          Umsatzsteuer-Identifikationsnummer gemäß § 27 a Umsatzsteuergesetz:<br />
+          <strong>DE404724429</strong>
+        </p>
+      </div>
+
+      <div class="legal-section">
+        <h2>Handelsregister</h2>
+        <p>
+          Registergericht: Amtsgericht Gütersloh<br />
+          Registernummer: HRB 13777
+        </p>
+      </div>
+
+      <div class="legal-section">
+        <h2>Verbraucherstreitbeilegung</h2>
+        <p>
+          Wir sind nicht bereit oder verpflichtet, an Streitbeilegungsverfahren vor einer
+          Verbraucherschlichtungsstelle teilzunehmen.
+        </p>
+      </div>
+
+      <div class="legal-section">
+        <h2>Haftung für Inhalte</h2>
+        <p>
+          Als Diensteanbieter sind wir gemäß § 7 Abs.1 TMG für eigene Inhalte auf diesen Seiten
+          nach den allgemeinen Gesetzen verantwortlich. Nach §§ 8 bis 10 TMG sind wir als
+          Diensteanbieter jedoch nicht verpflichtet, übermittelte oder gespeicherte fremde
+          Informationen zu überwachen oder nach Umständen zu forschen, die auf eine
+          rechtswidrige Tätigkeit hinweisen.
+        </p>
+      </div>
+
+      <div class="legal-section">
+        <h2>Quellenangaben</h2>
+        <p>
+          Trillian ist eine Open-Source-Software unter Apache 2.0-Lizenz.
+          Quellcode: <a href="https://github.com/42-grad/trillian" target="_blank" rel="noopener">github.com/42-grad/trillian</a>
+        </p>
+      </div>
+    </div>
+  </main>
+
+  <Footer />
+</Layout>
+
+<style>
+  .nav {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 100;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 1rem 2rem;
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    background: rgba(6, 6, 12, 0.88);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .nav-brand img {
+    height: 36px;
+    width: auto;
+  }
+
+  .nav-links {
+    display: flex;
+    gap: 2.2rem;
+  }
+
+  .nav-links a {
+    color: var(--text-secondary);
+    font-size: 0.88rem;
+    font-weight: 500;
+    transition: color var(--transition);
+  }
+
+  .nav-links a:hover {
+    color: var(--text);
+  }
+
+  .btn-ghost {
+    padding: 0.5rem 1rem;
+    border-radius: var(--radius-xs);
+    border: 1px solid var(--border-bright);
+    color: var(--text);
+    font-size: 0.85rem;
+    font-weight: 500;
+  }
+
+  .legal {
+    padding: 8rem 1.5rem 2rem;
+    max-width: 760px;
+    margin: 0 auto;
+  }
+
+  .legal h1 {
+    font-size: clamp(2rem, 4vw, 2.8rem);
+    font-weight: 800;
+    letter-spacing: -0.035em;
+    margin-bottom: 2.5rem;
+  }
+
+  .legal-section {
+    margin-bottom: 2.25rem;
+  }
+
+  .legal-section h2 {
+    font-size: 1.05rem;
+    font-weight: 600;
+    color: var(--text);
+    margin-bottom: 0.65rem;
+    letter-spacing: -0.01em;
+  }
+
+  .legal-section p {
+    font-size: 0.92rem;
+    color: var(--text-secondary);
+    line-height: 1.75;
+  }
+
+  .legal-section a {
+    color: var(--accent);
+    text-decoration: none;
+    transition: color var(--transition);
+  }
+
+  .legal-section a:hover {
+    color: var(--accent-bright);
+  }
+
+  .legal-section strong {
+    color: var(--text);
+    font-weight: 600;
+  }
+
+  @media (max-width: 768px) {
+    .nav-links { display: none; }
+    .legal { padding: 6rem 1.25rem 2rem; }
+  }
+</style>

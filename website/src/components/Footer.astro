@@ -1,0 +1,147 @@
+---
+const year = new Date().getFullYear();
+const B = import.meta.env.BASE_URL;
+---
+
+<footer>
+  <div class="container">
+    <div class="footer-top">
+      <div class="footer-brand">
+        <img src={`${B}logo.png`} alt="Trillian" width="130" height="73" />
+        <p class="footer-desc">
+          A lean, fast RDF triple store and SPARQL engine written in Rust.
+          Built and maintained by <a href="https://42-grad.com" target="_blank" rel="noopener">42grad GmbH</a>
+          as a contribution to open, sovereign, and sustainable data infrastructure.
+        </p>
+      </div>
+      <div class="footer-cols">
+        <div class="footer-col">
+          <h4>Repository</h4>
+          <a href="https://github.com/42-grad/trillian" target="_blank" rel="noopener">GitHub</a>
+          <a href="https://github.com/42-grad/trillian/blob/master/ARCHITECTURE.md" target="_blank" rel="noopener">Architecture</a>
+          <a href="https://github.com/42-grad/trillian/blob/master/CONTRIBUTING.md" target="_blank" rel="noopener">Contributing</a>
+          <a href="https://github.com/42-grad/trillian/blob/master/SECURITY.md" target="_blank" rel="noopener">Security</a>
+          <a href="https://github.com/42-grad/trillian/blob/master/ROADMAP.md" target="_blank" rel="noopener">Roadmap</a>
+        </div>
+        <div class="footer-col">
+          <h4>Docs</h4>
+          <a href="#features">Features</a>
+          <a href="#benchmarks">Benchmarks</a>
+          <a href="#sparql">SPARQL support</a>
+          <a href="#quickstart">Quickstart</a>
+        </div>
+        <div class="footer-col">
+          <h4>Company</h4>
+          <a href="https://42-grad.com" target="_blank" rel="noopener">42grad GmbH</a>
+          <a href="https://42-grad.com/karriere/" target="_blank" rel="noopener">Careers</a>
+          <a href="https://42-grad.com/kontakt/" target="_blank" rel="noopener">Contact</a>
+          <a href={`${B}imprint`}>Impressum</a>
+        </div>
+      </div>
+    </div>
+    <div class="footer-bottom">
+      <span>&copy; {year} 42grad GmbH &middot; Licensed under Apache 2.0</span>
+      <span class="footer-hint">The answer to life, the universe, and triple stores &middot; <em>Don't panic</em></span>
+    </div>
+  </div>
+</footer>
+
+<style>
+  footer {
+    border-top: 1px solid var(--border);
+    padding: 4rem 1.5rem 2rem;
+    margin-top: 3rem;
+    background: var(--bg-elevated);
+  }
+
+  .footer-top {
+    display: grid;
+    grid-template-columns: 1.6fr 2fr;
+    gap: 3rem;
+    padding-bottom: 3rem;
+  }
+
+  .footer-brand img {
+    height: 44px;
+    width: auto;
+    margin-bottom: 1.25rem;
+  }
+
+  .footer-desc {
+    font-size: 0.86rem;
+    color: var(--text-muted);
+    line-height: 1.7;
+    max-width: 360px;
+  }
+
+  .footer-desc a {
+    color: var(--accent);
+    transition: color var(--transition);
+  }
+
+  .footer-desc a:hover {
+    color: var(--accent-bright);
+  }
+
+  .footer-cols {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 2rem;
+  }
+
+  .footer-col h4 {
+    font-size: 0.74rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--text-muted);
+    margin-bottom: 1.1rem;
+  }
+
+  .footer-col a {
+    display: block;
+    color: var(--text-secondary);
+    font-size: 0.88rem;
+    padding: 0.32rem 0;
+    transition: color var(--transition);
+  }
+
+  .footer-col a:hover {
+    color: var(--text);
+  }
+
+  .footer-bottom {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding-top: 1.75rem;
+    border-top: 1px solid var(--border);
+    font-size: 0.8rem;
+    color: var(--text-muted);
+  }
+
+  .footer-hint em {
+    font-style: italic;
+  }
+
+  @media (max-width: 768px) {
+    .footer-top {
+      grid-template-columns: 1fr;
+      gap: 2.5rem;
+    }
+    .footer-cols {
+      grid-template-columns: repeat(3, 1fr);
+    }
+    .footer-bottom {
+      flex-direction: column;
+      gap: 0.5rem;
+      align-items: flex-start;
+    }
+  }
+
+  @media (max-width: 480px) {
+    .footer-cols {
+      grid-template-columns: 1fr 1fr;
+    }
+  }
+</style>
