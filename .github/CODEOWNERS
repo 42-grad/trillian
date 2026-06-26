@@ -1,0 +1,20 @@
+# CODEOWNERS — automatic review assignment
+# https://docs.github.com/repositories/managing-your-repositories-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default: 42grad developer team reviews everything not matched below
+*                           @42-grad/developer
+
+# Rust source code — core engine
+/src/                       @cpthappy @42gradJonas
+/Cargo.toml                 @cpthappy @42gradJonas
+/Cargo.lock                 @cpthappy @42gradJonas
+
+# Website (Astro) — frontend
+/website/                   @niicolaai
+
+# CI/CD and infrastructure
+/.github/                   @42-grad/admin
+/infra/                     @42-grad/admin
+
+# Docs and governance
+/*.md                       @42gradJonas
