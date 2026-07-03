@@ -98,6 +98,7 @@ are streamed directly to SPARQL-JSON. The HTTP server (`axum`) exposes
 | `hypertrie/query.rs` | `TripleStore`: ingest, queries, updates, snapshot |
 | `hypertrie/stats.rs` | `CardEstimator` trait |
 | `hypertrie/export.rs` | N-Triples parser/serializer |
-| `sparql.rs` | SPARQL evaluation + HTTP endpoint |
+| `inference.rs` | RDFS backward-chaining inference (query-rewrite, no index change) |
+| `sparql.rs` | SPARQL evaluation + HTTP endpoint (`infer=rdfs` parameter) |
 | `wal.rs` | write-ahead log |
 | `bin/server.rs` | `build` / `load` / `profile` CLI |

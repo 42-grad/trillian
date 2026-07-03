@@ -104,6 +104,9 @@ pub async fn serve_durable(store: TripleStore, port: u16, wal: Option<crate::wal
 #[derive(serde::Deserialize, Debug, Default)]
 pub struct SparqlQueryParams {
     query: Option<String>,
+    /// Enable RDFS inference via backward chaining. Supported values: `rdfs`.
+    #[serde(alias = "infer")]
+    infer: Option<String>,
 }
 
 #[derive(serde::Deserialize, Debug, Default)]
@@ -134,7 +137,13 @@ pub async fn sparql_handler(
     }
 
     let store = state.store.read().unwrap_or_else(|e| e.into_inner());
-    match execute_sparql(&store, &state.engine, &query_str) {
+    let infer = params.infer.as_deref();
+    let result = if infer == Some("rdfs") {
+        execute_sparql_infer(&store, &state.engine, &query_str)
+    } else {
+        execute_sparql(&store, &state.engine, &query_str)
+    };
+    match result {
         Ok(body) => {
             if let Ok(mut cache) = state.cache.lock() {
                 cache.put(query_str, body.clone());
@@ -162,10 +171,15 @@ pub async fn stream_handler(
     // NDJSON before the full JSON body is built.
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::convert::Infallible>>(128);
     let state = Arc::clone(&state);
+    let infer = params.infer.clone();
 
     tokio::task::spawn_blocking(move || {
         let store = state.store.read().unwrap_or_else(|e| e.into_inner());
-        let result = evaluate_select(&store, &state.engine, &query_str);
+        let result = if infer.as_deref() == Some("rdfs") {
+            evaluate_select_infer(&store, &state.engine, &query_str)
+        } else {
+            evaluate_select(&store, &state.engine, &query_str)
+        };
         match result {
             Ok(select) => {
                 let var_order = select.var_order;
@@ -226,7 +240,13 @@ pub async fn count_handler(
     }
 
     let store = state.store.read().unwrap_or_else(|e| e.into_inner());
-    match execute_count(&store, &state.engine, &query_str) {
+    let infer = params.infer.as_deref();
+    let result = if infer == Some("rdfs") {
+        execute_count_infer(&store, &state.engine, &query_str)
+    } else {
+        execute_count(&store, &state.engine, &query_str)
+    };
+    match result {
         Ok(result) => (StatusCode::OK, axum::Json(result)).into_response(),
         Err(e) => sparql_error(&e, StatusCode::BAD_REQUEST),
     }
@@ -392,6 +412,97 @@ pub fn execute_sparql(
             ))
         }
         _ => Err("Only SELECT and ASK queries are supported".to_string()),
+    }
+}
+
+/// Execute a SPARQL query with RDFS inference enabled (backward chaining).
+///
+/// The query algebra is rewritten **after** parsing so that every `Bgp` node
+/// is expanded via `Union` with branches that capture RDFS-derivable triples.
+/// The stored index is never modified — inference is purely at query time.
+///
+/// See [`crate::inference`] for the supported rule set.
+///
+/// When `infer` is passed as a query parameter (e.g. `?infer=rdfs`) the HTTP
+/// handlers call this function automatically.
+pub fn execute_sparql_infer(
+    store: &TripleStore,
+    engine: &HybridEngine,
+    query_str: &str,
+) -> Result<String, String> {
+    use spargebra::algebra::GraphPattern as GP;
+    let mut query = SparqlParser::new()
+        .parse_query(query_str)
+        .map_err(|e| e.to_string())?;
+
+    match &mut query {
+        SparqlQuery::Select { pattern, .. } => {
+            let old = std::mem::replace(pattern, GP::Bgp { patterns: vec![] });
+            *pattern = crate::inference::rewrite(old);
+            let m = peel_modifiers(pattern);
+            let result = evaluate_select_with_modifiers(store, engine, &m)?;
+            Ok(write_sparql_json(&result, store))
+        }
+        SparqlQuery::Ask { pattern, .. } => {
+            let old = std::mem::replace(pattern, GP::Bgp { patterns: vec![] });
+            *pattern = crate::inference::rewrite(old);
+            let m = peel_modifiers(pattern);
+            let result = evaluate_select_with_modifiers(store, engine, &m)?;
+            Ok(format!(
+                "{{\"head\":{{}},\"boolean\":{}}}",
+                result.rows.n_rows() > 0
+            ))
+        }
+        _ => Err("Only SELECT and ASK queries are supported".to_string()),
+    }
+}
+
+fn evaluate_select_infer(
+    store: &TripleStore,
+    engine: &HybridEngine,
+    query_str: &str,
+) -> Result<SelectResult, String> {
+    use spargebra::algebra::GraphPattern as GP;
+    let mut query = SparqlParser::new()
+        .parse_query(query_str)
+        .map_err(|e| e.to_string())?;
+
+    let SparqlQuery::Select { pattern, .. } = &mut query else {
+        return Err("Only SELECT queries are supported here".to_string());
+    };
+
+    let old = std::mem::replace(pattern, GP::Bgp { patterns: vec![] });
+    *pattern = crate::inference::rewrite(old);
+    let m = peel_modifiers(pattern);
+    evaluate_select_with_modifiers(store, engine, &m)
+}
+
+fn execute_count_infer(
+    store: &TripleStore,
+    engine: &HybridEngine,
+    query_str: &str,
+) -> Result<Value, String> {
+    use spargebra::algebra::GraphPattern as GP;
+    let mut query = SparqlParser::new()
+        .parse_query(query_str)
+        .map_err(|e| e.to_string())?;
+
+    match &mut query {
+        SparqlQuery::Select { pattern, .. } => {
+            let old = std::mem::replace(pattern, GP::Bgp { patterns: vec![] });
+            *pattern = crate::inference::rewrite(old);
+            let m = peel_modifiers(pattern);
+            let result = evaluate_select_with_modifiers(store, engine, &m)?;
+            Ok(json!({ "count": result.rows.n_rows() }))
+        }
+        SparqlQuery::Ask { pattern, .. } => {
+            let old = std::mem::replace(pattern, GP::Bgp { patterns: vec![] });
+            *pattern = crate::inference::rewrite(old);
+            let m = peel_modifiers(pattern);
+            let result = evaluate_select_with_modifiers(store, engine, &m)?;
+            Ok(json!({ "boolean": result.rows.n_rows() > 0 }))
+        }
+        _ => Err("Only SELECT and ASK queries are supported for /count".to_string()),
     }
 }
 
@@ -2830,5 +2941,113 @@ mod tests {
             "SELECT ?b WHERE { ?a <http://example.org/knows> ?b FILTER(BOUND(?b)) }",
         );
         assert_eq!(bound.len(), 3);
+    }
+
+    // ── Inference integration tests ──────────────────────────────────────
+
+    #[test]
+    fn inference_subclasof_returns_additional_results() {
+        let mut store = TripleStore::new();
+        // RDFS schema: Dog subClassOf Animal
+        store.ingest_str_triples(&[
+            (
+                "http://example.org/Dog",
+                "http://www.w3.org/2000/01/rdf-schema#subClassOf",
+                "http://example.org/Animal",
+            ),
+            // Data: Fido is a Dog
+            (
+                "http://example.org/Fido",
+                "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                "http://example.org/Dog",
+            ),
+        ]);
+
+        let engine = HybridEngine::new();
+
+        // Without inference: only direct type matches
+        let no_infer: Value = serde_json::from_str(
+            &execute_sparql(
+                &store,
+                &engine,
+                "SELECT ?s WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Animal> }",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let no_infer_rows = no_infer["results"]["bindings"].as_array().unwrap().len();
+        assert_eq!(no_infer_rows, 0, "without inference, no direct Animal type");
+
+        // With inference: Fido is a Dog and Dog subClassOf Animal -> Fido type Animal
+        let with_infer: Value = serde_json::from_str(
+            &execute_sparql_infer(
+                &store,
+                &engine,
+                "SELECT ?s WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Animal> }",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let with_infer_rows: Vec<&Value> = with_infer["results"]["bindings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .collect();
+        assert_eq!(
+            with_infer_rows.len(),
+            1,
+            "inference should find Fido as Animal"
+        );
+        assert_eq!(with_infer_rows[0]["s"]["value"], "http://example.org/Fido");
+    }
+
+    #[test]
+    fn inference_subproperty_returns_additional_results() {
+        let mut store = TripleStore::new();
+        // RDFS schema: hasPet subPropertyOf hasAnimal
+        store.ingest_str_triples(&[
+            (
+                "http://example.org/hasPet",
+                "http://www.w3.org/2000/01/rdf-schema#subPropertyOf",
+                "http://example.org/hasAnimal",
+            ),
+            // Data: Alice hasPet Fido
+            (
+                "http://example.org/Alice",
+                "http://example.org/hasPet",
+                "http://example.org/Fido",
+            ),
+        ]);
+
+        let engine = HybridEngine::new();
+
+        // Without inference: no direct hasAnimal triples
+        let no_infer: Value = serde_json::from_str(
+            &execute_sparql(
+                &store,
+                &engine,
+                "SELECT ?s ?o WHERE { ?s <http://example.org/hasAnimal> ?o }",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            no_infer["results"]["bindings"].as_array().unwrap().len(),
+            0,
+            "no direct hasAnimal triples"
+        );
+
+        // With inference: hasPet subPropertyOf hasAnimal -> Alice hasAnimal Fido
+        let with_infer: Value = serde_json::from_str(
+            &execute_sparql_infer(
+                &store,
+                &engine,
+                "SELECT ?s ?o WHERE { ?s <http://example.org/hasAnimal> ?o }",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let rows = with_infer["results"]["bindings"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "inference should find Alice hasAnimal Fido");
     }
 }
