@@ -32,6 +32,13 @@ contribution to open, sovereign, and sustainable data infrastructure.
 - **Fast.** Sub-millisecond entity lookups; single-pattern WDBench queries
   answer in ~1 ms median.
 - **Durable updates.** `INSERT DATA`/`DELETE DATA` via a write-ahead log.
+- **RDFS inference.** Backward-chaining query rewriter — no index changes,
+  purely at query time. Enable with `?infer=rdfs`.
+- **No cluster, no full ACID.** Trillian is deliberately a single-node,
+  read-optimized triple store. Distributed consensus, distributed transactions,
+  and heavyweight locking are traded away for simplicity and maximum query
+  throughput. The `RwLock` + WAL pattern is sufficient for the typical
+  read-many-write-rarely workload.
 
 ## Supported SPARQL
 
@@ -44,7 +51,26 @@ contribution to open, sovereign, and sustainable data infrastructure.
 - **Property paths**: `/ ^ | * + ?` and negated property sets
 - IRIs, typed/`@lang` literals, blank nodes; `INSERT DATA`/`DELETE DATA`
 
-Not yet supported: `BIND`, `GROUP BY`/aggregation, sub-`SELECT`, `REGEX`.
+Not yet supported (but planned): `BIND`, `GROUP BY`/aggregation, sub-`SELECT`, `REGEX`.
+
+### Inference (RDFS backward chaining)
+
+All `/sparql`, `/stream`, and `/count` endpoints accept an optional `infer=rdfs`
+parameter. When set, the query is rewritten at parse time to infer triples
+reachable through RDFS rules:
+
+| Rule | Effect |
+|------|--------|
+| `rdfs:subClassOf` | `?x a :C` also matches `?x a :D` when `:D subClassOf :C` |
+| `rdfs:subPropertyOf` | `?x :p ?y` also matches `?x :q ?y` when `:q subPropertyOf :p` |
+| `rdfs:domain` | `?x a :C` triggers `?x :p ?y` where `:p domain :C` |
+| `rdfs:range` | `?x a :C` triggers `?y :p ?x` where `:p range :C` |
+
+```bash
+curl -G 'http://localhost:9090/sparql' \
+  --data-urlencode 'query=SELECT ?s WHERE { ?s rdf:type ex:Animal }' \
+  --data-urlencode 'infer=rdfs'
+```
 
 ## Quickstart
 
