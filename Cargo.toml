@@ -1,6 +1,6 @@
 [package]
 name = "trillian"
-version = "0.1.4"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.87"
 # Not published to crates.io yet; flip to allow `cargo publish` when ready.
