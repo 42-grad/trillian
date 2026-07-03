@@ -74,6 +74,15 @@ curl -G 'http://localhost:9090/sparql' \
 | `/count`  | GET/POST | Result count for a SELECT/ASK |
 | `/update` | POST    | `INSERT DATA` / `DELETE DATA` |
 
+All query endpoints support an optional `infer=rdfs` query parameter that enables
+RDFS backward-chaining inference (subclass, subproperty, domain, range). Example:
+
+```bash
+curl -G 'http://localhost:9090/sparql' \
+  --data-urlencode 'query=SELECT ?s WHERE { ?s rdf:type ex:Animal }' \
+  --data-urlencode 'infer=rdfs'
+```
+
 ## Example: GraphRAG with Mistral AI
 
 [`examples/graphrag/`](examples/graphrag/) is a runnable tutorial that uses
