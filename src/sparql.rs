@@ -57,6 +57,23 @@ impl AppState {
     }
 }
 
+/// Either lock guard on [`AppState::store`], for call sites (like
+/// `stream_handler`) that pick read vs. write access at runtime depending on
+/// whether the query needs to intern a `BIND`-computed value.
+enum StoreGuard<'a> {
+    Read(std::sync::RwLockReadGuard<'a, TripleStore>),
+    Write(std::sync::RwLockWriteGuard<'a, TripleStore>),
+}
+
+impl StoreGuard<'_> {
+    fn as_ref(&self) -> &TripleStore {
+        match self {
+            StoreGuard::Read(g) => g,
+            StoreGuard::Write(g) => g,
+        }
+    }
+}
+
 /// Start the SPARQL HTTP endpoint on the given port (without durability).
 pub async fn serve(store: TripleStore, port: u16) {
     serve_durable(store, port, None).await
@@ -136,12 +153,19 @@ pub async fn sparql_handler(
         }
     }
 
-    let store = state.store.read().unwrap_or_else(|e| e.into_inner());
     let infer = params.infer.as_deref();
-    let result = if infer == Some("rdfs") {
-        execute_sparql_infer(&store, &state.engine, &query_str)
+    // BIND may intern a newly computed value into the dictionary, so it needs
+    // write access; everything else keeps the fully concurrent read lock.
+    let result = if infer != Some("rdfs") && query_needs_write(&query_str) {
+        let mut store = state.store.write().unwrap_or_else(|e| e.into_inner());
+        execute_sparql_bind(&mut store, &state.engine, &query_str)
     } else {
-        execute_sparql(&store, &state.engine, &query_str)
+        let store = state.store.read().unwrap_or_else(|e| e.into_inner());
+        if infer == Some("rdfs") {
+            execute_sparql_infer(&store, &state.engine, &query_str)
+        } else {
+            execute_sparql(&store, &state.engine, &query_str)
+        }
     };
     match result {
         Ok(body) => {
@@ -174,12 +198,22 @@ pub async fn stream_handler(
     let infer = params.infer.clone();
 
     tokio::task::spawn_blocking(move || {
-        let store = state.store.read().unwrap_or_else(|e| e.into_inner());
-        let result = if infer.as_deref() == Some("rdfs") {
-            evaluate_select_infer(&store, &state.engine, &query_str)
+        // BIND may intern a newly computed value into the dictionary, so it
+        // needs write access; everything else keeps the read lock.
+        let needs_write = infer.as_deref() != Some("rdfs") && query_needs_write(&query_str);
+        let mut guard = if needs_write {
+            StoreGuard::Write(state.store.write().unwrap_or_else(|e| e.into_inner()))
         } else {
-            evaluate_select(&store, &state.engine, &query_str)
+            StoreGuard::Read(state.store.read().unwrap_or_else(|e| e.into_inner()))
         };
+        let result = match &mut guard {
+            StoreGuard::Write(store) => evaluate_select_bind(store, &state.engine, &query_str),
+            StoreGuard::Read(store) if infer.as_deref() == Some("rdfs") => {
+                evaluate_select_infer(store, &state.engine, &query_str)
+            }
+            StoreGuard::Read(store) => evaluate_select(store, &state.engine, &query_str),
+        };
+        let dict = &guard.as_ref().dict;
         match result {
             Ok(select) => {
                 let var_order = select.var_order;
@@ -201,7 +235,7 @@ pub async fn stream_handler(
                         .enumerate()
                         .filter_map(|(i, var)| {
                             let id = row[var_indices[i]?];
-                            Some((var.clone(), term_to_json(id, &store.dict)))
+                            Some((var.clone(), term_to_json(id, dict)))
                         })
                         .collect();
                     let line = serde_json::to_string(&obj).unwrap_or_default() + "\n";
@@ -239,12 +273,17 @@ pub async fn count_handler(
         );
     }
 
-    let store = state.store.read().unwrap_or_else(|e| e.into_inner());
     let infer = params.infer.as_deref();
-    let result = if infer == Some("rdfs") {
-        execute_count_infer(&store, &state.engine, &query_str)
+    let result = if infer != Some("rdfs") && query_needs_write(&query_str) {
+        let mut store = state.store.write().unwrap_or_else(|e| e.into_inner());
+        execute_count_bind(&mut store, &state.engine, &query_str)
     } else {
-        execute_count(&store, &state.engine, &query_str)
+        let store = state.store.read().unwrap_or_else(|e| e.into_inner());
+        if infer == Some("rdfs") {
+            execute_count_infer(&store, &state.engine, &query_str)
+        } else {
+            execute_count(&store, &state.engine, &query_str)
+        }
     };
     match result {
         Ok(result) => (StatusCode::OK, axum::Json(result)).into_response(),
@@ -301,6 +340,19 @@ fn normalize_query(query_param: Option<String>, body: String) -> String {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| body.trim().to_string())
+}
+
+/// Whether executing `query_str` may need write access to the store, i.e. it
+/// contains `BIND` (see [`contains_extend`]). A parse failure is reported by
+/// the normal (read-locked) execution path, so this conservatively returns
+/// `false` here rather than duplicating error handling.
+fn query_needs_write(query_str: &str) -> bool {
+    match SparqlParser::new().parse_query(query_str) {
+        Ok(SparqlQuery::Select { pattern, .. } | SparqlQuery::Ask { pattern, .. }) => {
+            contains_extend(&pattern)
+        }
+        _ => false,
+    }
 }
 
 fn sparql_error(msg: &str, status: StatusCode) -> Response {
@@ -384,6 +436,24 @@ fn evaluate_select(
     evaluate_select_with_modifiers(store, engine, &m)
 }
 
+/// Mutable twin of [`evaluate_select`] for queries containing `BIND`.
+fn evaluate_select_bind(
+    store: &mut TripleStore,
+    engine: &HybridEngine,
+    query_str: &str,
+) -> Result<SelectResult, String> {
+    let query = SparqlParser::new()
+        .parse_query(query_str)
+        .map_err(|e| e.to_string())?;
+
+    let SparqlQuery::Select { pattern, .. } = query else {
+        return Err("Only SELECT queries are supported here".to_string());
+    };
+
+    let m = peel_modifiers(&pattern);
+    evaluate_select_with_modifiers_mut(store, engine, &m)
+}
+
 /// Executes a SPARQL `SELECT`/`ASK` query against the store and returns the
 /// SPARQL-results JSON body (the same payload the HTTP `/sparql` endpoint
 /// serves). Lets embedders and tests run queries without standing up the server.
@@ -406,6 +476,36 @@ pub fn execute_sparql(
             // ASK over the full WHERE path (incl. OPTIONAL/FILTER/UNION) -> ≥1 solution?
             let m = peel_modifiers(&pattern);
             let result = evaluate_select_with_modifiers(store, engine, &m)?;
+            Ok(format!(
+                "{{\"head\":{{}},\"boolean\":{}}}",
+                result.rows.n_rows() > 0
+            ))
+        }
+        _ => Err("Only SELECT and ASK queries are supported".to_string()),
+    }
+}
+
+/// Mutable twin of [`execute_sparql`] for queries containing `BIND`: a
+/// computed value not yet in the dictionary must be interned, which needs
+/// write access to the store (see [`contains_extend`], [`eval_where_mut`]).
+pub fn execute_sparql_bind(
+    store: &mut TripleStore,
+    engine: &HybridEngine,
+    query_str: &str,
+) -> Result<String, String> {
+    let query = SparqlParser::new()
+        .parse_query(query_str)
+        .map_err(|e| e.to_string())?;
+
+    match query {
+        SparqlQuery::Select { pattern, .. } => {
+            let m = peel_modifiers(&pattern);
+            let result = evaluate_select_with_modifiers_mut(store, engine, &m)?;
+            Ok(write_sparql_json(&result, store))
+        }
+        SparqlQuery::Ask { pattern, .. } => {
+            let m = peel_modifiers(&pattern);
+            let result = evaluate_select_with_modifiers_mut(store, engine, &m)?;
             Ok(format!(
                 "{{\"head\":{{}},\"boolean\":{}}}",
                 result.rows.n_rows() > 0
@@ -615,6 +715,125 @@ fn eval_where(
             Err("Unsupported WHERE pattern (only BGP/FILTER/OPTIONAL/UNION/Join/Path)".to_string())
         }
     }
+}
+
+/// Whether `gp` contains a `BIND` (`Extend`) node anywhere in the tree. BIND
+/// is the only WHERE-pattern node that can materialize a value not yet in the
+/// dictionary, so queries containing it need write access to the store (see
+/// [`eval_where_mut`]) instead of the usual read lock.
+fn contains_extend(gp: &spargebra::algebra::GraphPattern) -> bool {
+    use spargebra::algebra::GraphPattern as GP;
+    match gp {
+        GP::Extend { .. } => true,
+        GP::Bgp { .. } | GP::Path { .. } | GP::Values { .. } => false,
+        GP::Join { left, right }
+        | GP::LeftJoin { left, right, .. }
+        | GP::Union { left, right }
+        | GP::Minus { left, right } => contains_extend(left) || contains_extend(right),
+        GP::Filter { inner, .. }
+        | GP::Graph { inner, .. }
+        | GP::OrderBy { inner, .. }
+        | GP::Project { inner, .. }
+        | GP::Distinct { inner }
+        | GP::Reduced { inner }
+        | GP::Slice { inner, .. }
+        | GP::Group { inner, .. }
+        | GP::Service { inner, .. } => contains_extend(inner),
+    }
+}
+
+/// Mutable twin of [`eval_where`], used only for queries containing `BIND`.
+/// Identical to `eval_where` except for the added `Extend` arm — kept in sync
+/// with it by hand since Rust has no way to share one body across an `&`/`&mut`
+/// store parameter here without a larger refactor.
+fn eval_where_mut(
+    gp: &spargebra::algebra::GraphPattern,
+    store: &mut TripleStore,
+    engine: &HybridEngine,
+    limit: Option<usize>,
+) -> Result<(RowBlock, Vec<String>), String> {
+    use spargebra::algebra::GraphPattern as GP;
+    match gp {
+        GP::Bgp { patterns } => eval_bgp(patterns, store, engine, limit),
+        GP::Filter { expr, inner } => {
+            let (rows, vo) = eval_where_mut(inner, store, engine, None)?;
+            let mut kept = RowBlock::new(rows.n_vars());
+            for row in rows.rows() {
+                if row_passes(&[expr], row, &vo, store) {
+                    kept.push_row(row);
+                }
+            }
+            Ok((kept, vo))
+        }
+        GP::LeftJoin { left, right, .. } => {
+            let (lr, lvo) = eval_where_mut(left, store, engine, None)?;
+            let (rr, rvo) = eval_where_mut(right, store, engine, None)?;
+            hash_join(lr, &lvo, rr, &rvo, true)
+        }
+        GP::Join { left, right } => {
+            let (lr, lvo) = eval_where_mut(left, store, engine, None)?;
+            let (rr, rvo) = eval_where_mut(right, store, engine, None)?;
+            hash_join(lr, &lvo, rr, &rvo, false)
+        }
+        GP::Union { left, right } => {
+            let (lr, lvo) = eval_where_mut(left, store, engine, None)?;
+            let (rr, rvo) = eval_where_mut(right, store, engine, None)?;
+            union_rows(lr, &lvo, rr, &rvo)
+        }
+        GP::Path {
+            subject,
+            path,
+            object,
+        } => eval_path(store, subject, path, object),
+        GP::Extend {
+            inner,
+            variable,
+            expression,
+        } => {
+            let (rows, mut vo) = eval_where_mut(inner, store, engine, None)?;
+            let mut extended = RowBlock::new(rows.n_vars() + 1);
+            for row in rows.rows() {
+                // BIND leaves the variable unbound on a type error rather than
+                // dropping the row (unlike FILTER).
+                let id = match eval(expression, row, &vo, store) {
+                    Ok(fv) => intern_fv(store, &fv),
+                    Err(()) => NULL_ID,
+                };
+                extended.push_row_concat(row, &[id]);
+            }
+            vo.push(variable.as_str().to_string());
+            Ok((extended, vo))
+        }
+        _ => Err(
+            "Unsupported WHERE pattern (only BGP/FILTER/OPTIONAL/UNION/Join/Path/BIND)".to_string(),
+        ),
+    }
+}
+
+/// Interns a `BIND`-computed value into the dictionary, reusing the existing
+/// term if the same value is already present — so equality/joins against
+/// stored data keep working for the bound variable. Requires write access to
+/// the store.
+fn intern_fv(store: &mut TripleStore, fv: &Fv) -> u32 {
+    let (lex, typ) = match fv {
+        Fv::Iri(s) => (s.clone(), TermType::iri()),
+        Fv::Blank(s) => (s.clone(), TermType::BlankNode),
+        Fv::Str(s) => (s.clone(), TermType::literal_plain()),
+        Fv::Num(n) => (
+            format_num(*n),
+            TermType::literal_datatype(format!("{XSD}double")),
+        ),
+        Fv::Bool(b) => (
+            b.to_string(),
+            TermType::literal_datatype(format!("{XSD}boolean")),
+        ),
+        Fv::Lang(s, l) => (s.clone(), TermType::literal_lang(l.clone())),
+        Fv::Typed(s, dt) => (s.clone(), TermType::literal_datatype(dt.clone())),
+    };
+    store
+        .dict
+        .lookup_term(&lex, &typ)
+        .unwrap_or_else(|| store.dict.insert_with_type(&lex, typ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1185,6 +1404,63 @@ fn evaluate_select_with_modifiers(
     })
 }
 
+/// Mutable twin of [`evaluate_select_with_modifiers`] for queries containing
+/// `BIND`, routed to [`eval_where_mut`] instead of [`eval_where`].
+fn evaluate_select_with_modifiers_mut(
+    store: &mut TripleStore,
+    engine: &HybridEngine,
+    m: &Modifiers,
+) -> Result<SelectResult, String> {
+    let pushdown = if m.order_by.is_empty() && !m.distinct {
+        m.limit.map(|l| l.saturating_add(m.offset.unwrap_or(0)))
+    } else {
+        None
+    };
+    let (mut rows, var_order) = eval_where_mut(m.where_pat, store, engine, pushdown)?;
+
+    if !m.order_by.is_empty() {
+        sort_rows(&mut rows, &var_order, &m.order_by, store);
+    }
+
+    let vars = m.projection.clone().unwrap_or_else(|| {
+        var_order
+            .iter()
+            .filter(|v| !v.starts_with("__bn_"))
+            .cloned()
+            .collect()
+    });
+    let mut var_indices = Vec::with_capacity(vars.len());
+    for var in &vars {
+        match var_order.iter().position(|v| v == var) {
+            Some(pos) => var_indices.push(pos),
+            None => {
+                return Err(format!(
+                    "SELECT variable ?{} does not appear in pattern",
+                    var
+                ));
+            }
+        }
+    }
+
+    let mut rows = rows.project(&var_indices);
+    let var_order = vars.clone();
+
+    if m.distinct {
+        if m.order_by.is_empty() {
+            rows.sort_distinct();
+        } else {
+            rows.dedup_preserving_order();
+        }
+    }
+    rows.apply_offset_limit(m.offset.unwrap_or(0), m.limit);
+
+    Ok(SelectResult {
+        vars,
+        rows,
+        var_order,
+    })
+}
+
 fn variables_in_bgp(bgp: &[spargebra::term::TriplePattern]) -> Vec<String> {
     let mut vars = Vec::new();
     let mut seen = rustc_hash::FxHashSet::default();
@@ -1345,6 +1621,31 @@ fn execute_count(
         SparqlQuery::Ask { pattern, .. } => {
             let m = peel_modifiers(&pattern);
             let result = evaluate_select_with_modifiers(store, engine, &m)?;
+            Ok(json!({ "boolean": result.rows.n_rows() > 0 }))
+        }
+        _ => Err("Only SELECT and ASK queries are supported for /count".to_string()),
+    }
+}
+
+/// Mutable twin of [`execute_count`] for queries containing `BIND`.
+fn execute_count_bind(
+    store: &mut TripleStore,
+    engine: &HybridEngine,
+    query_str: &str,
+) -> Result<Value, String> {
+    let query = SparqlParser::new()
+        .parse_query(query_str)
+        .map_err(|e| e.to_string())?;
+
+    match query {
+        SparqlQuery::Select { pattern, .. } => {
+            let m = peel_modifiers(&pattern);
+            let result = evaluate_select_with_modifiers_mut(store, engine, &m)?;
+            Ok(json!({ "count": result.rows.n_rows() }))
+        }
+        SparqlQuery::Ask { pattern, .. } => {
+            let m = peel_modifiers(&pattern);
+            let result = evaluate_select_with_modifiers_mut(store, engine, &m)?;
             Ok(json!({ "boolean": result.rows.n_rows() > 0 }))
         }
         _ => Err("Only SELECT and ASK queries are supported for /count".to_string()),
@@ -1843,12 +2144,53 @@ fn eval_func(
         Function::IsBlank => Ok(Fv::Bool(matches!(arg(0)?, Fv::Blank(_)))),
         Function::IsLiteral => Ok(Fv::Bool(!matches!(arg(0)?, Fv::Iri(_) | Fv::Blank(_)))),
         Function::IsNumeric => Ok(Fv::Bool(matches!(arg(0)?, Fv::Num(_)))),
+        Function::Regex => {
+            let text = as_str(&arg(0)?).ok_or(())?.to_string();
+            let pattern = as_str(&arg(1)?).ok_or(())?.to_string();
+            let flags = match args.get(2) {
+                Some(_) => as_str(&arg(2)?).ok_or(())?.to_string(),
+                None => String::new(),
+            };
+            let re = cached_regex(&pattern, &flags)?;
+            Ok(Fv::Bool(re.is_match(&text)))
+        }
         _ => Err(()),
     }
 }
 
 fn str2(a: &Fv, b: &Fv, f: impl Fn(&str, &str) -> bool) -> Result<Fv, ()> {
     Ok(Fv::Bool(f(as_str(a).ok_or(())?, as_str(b).ok_or(())?)))
+}
+
+/// Compiles (and process-wide caches) a `REGEX(text, pattern, flags)` regex.
+/// Patterns are typically literal in the query and re-evaluated per row, so a
+/// cache avoids recompiling the same pattern for every row of a large result.
+/// SPARQL/XPath flags: `i` case-insensitive, `s` dot matches newline, `m`
+/// multiline (`^`/`$` match at line boundaries); `x` (extended) is not
+/// supported and is rejected like any other unknown flag.
+fn cached_regex(pattern: &str, flags: &str) -> Result<regex::Regex, ()> {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<rustc_hash::FxHashMap<(String, String), regex::Regex>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(rustc_hash::FxHashMap::default()));
+    let key = (pattern.to_string(), flags.to_string());
+    if let Some(re) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return Ok(re.clone());
+    }
+    if !flags.chars().all(|c| matches!(c, 'i' | 's' | 'm')) {
+        return Err(());
+    }
+    let re = regex::RegexBuilder::new(pattern)
+        .case_insensitive(flags.contains('i'))
+        .dot_matches_new_line(flags.contains('s'))
+        .multi_line(flags.contains('m'))
+        .build()
+        .map_err(|_| ())?;
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, re.clone());
+    Ok(re)
 }
 
 fn format_num(n: f64) -> String {
@@ -3049,5 +3391,182 @@ mod tests {
         .unwrap();
         let rows = with_infer["results"]["bindings"].as_array().unwrap();
         assert_eq!(rows.len(), 1, "inference should find Alice hasAnimal Fido");
+    }
+
+    // -------------------------------------------------------------------
+    // REGEX in FILTER
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn regex_filter_matches_case_insensitive() {
+        let store = test_store(); // alice, bob, charlie
+        let engine = HybridEngine::new();
+        let query = "SELECT ?a ?b WHERE { ?a <http://example.org/knows> ?b \
+                     FILTER(REGEX(STR(?a), \"ALICE$\", \"i\")) }";
+        let result: Value =
+            serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
+        let rows = result["results"]["bindings"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["a"]["value"], "http://example.org/alice");
+    }
+
+    #[test]
+    fn regex_filter_no_match_drops_row() {
+        let store = test_store();
+        let engine = HybridEngine::new();
+        let query = "SELECT ?a ?b WHERE { ?a <http://example.org/knows> ?b \
+                     FILTER(REGEX(STR(?a), \"^nobody\")) }";
+        let result: Value =
+            serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
+        assert_eq!(result["results"]["bindings"].as_array().unwrap().len(), 0);
+    }
+
+    /// An invalid pattern/flag is a type error per SPARQL semantics: the row
+    /// is dropped rather than the query panicking or erroring out entirely.
+    #[test]
+    fn regex_filter_invalid_pattern_drops_row_not_panics() {
+        let store = test_store();
+        let engine = HybridEngine::new();
+        let bad_pattern = "SELECT ?a ?b WHERE { ?a <http://example.org/knows> ?b \
+                     FILTER(REGEX(STR(?a), \"(unclosed\")) }";
+        let result: Value =
+            serde_json::from_str(&execute_sparql(&store, &engine, bad_pattern).unwrap()).unwrap();
+        assert_eq!(result["results"]["bindings"].as_array().unwrap().len(), 0);
+
+        let bad_flag = "SELECT ?a ?b WHERE { ?a <http://example.org/knows> ?b \
+                     FILTER(REGEX(STR(?a), \"alice\", \"z\")) }";
+        let result: Value =
+            serde_json::from_str(&execute_sparql(&store, &engine, bad_flag).unwrap()).unwrap();
+        assert_eq!(result["results"]["bindings"].as_array().unwrap().len(), 0);
+    }
+
+    // -------------------------------------------------------------------
+    // BIND
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn contains_extend_detects_bind() {
+        let with_bind = SparqlParser::new()
+            .parse_query("SELECT ?y WHERE { ?a <http://example.org/p> ?x BIND(?x + 1 AS ?y) }")
+            .unwrap();
+        let without_bind = SparqlParser::new()
+            .parse_query("SELECT ?x WHERE { ?a <http://example.org/p> ?x }")
+            .unwrap();
+        let SparqlQuery::Select { pattern, .. } = with_bind else {
+            unreachable!()
+        };
+        assert!(contains_extend(&pattern));
+        let SparqlQuery::Select { pattern, .. } = without_bind else {
+            unreachable!()
+        };
+        assert!(!contains_extend(&pattern));
+    }
+
+    #[test]
+    fn bind_computes_new_arithmetic_value() {
+        let mut store = TripleStore::new();
+        let dt = "http://www.w3.org/2001/XMLSchema#integer";
+        let alice = store.dict.insert("http://example.org/alice");
+        let age = store.dict.insert("http://example.org/age");
+        let v25 = store
+            .dict
+            .insert_with_type("25", TermType::literal_datatype(dt));
+        store.insert_triple(alice, age, v25);
+        let engine = HybridEngine::new();
+        let query = "SELECT ?p ?doubled WHERE { \
+                     ?p <http://example.org/age> ?a BIND(?a * 2 AS ?doubled) }";
+        let result: Value =
+            serde_json::from_str(&execute_sparql_bind(&mut store, &engine, query).unwrap())
+                .unwrap();
+        let rows = result["results"]["bindings"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["doubled"]["value"], "50");
+        assert_eq!(
+            rows[0]["doubled"]["datatype"],
+            "http://www.w3.org/2001/XMLSchema#double"
+        );
+    }
+
+    /// BIND is not a filter: a type error in the expression (here, an
+    /// unbound operand) leaves the variable unbound rather than dropping
+    /// the row — unlike FILTER, which would drop it.
+    #[test]
+    fn bind_leaves_variable_unbound_on_error() {
+        let mut store = test_store(); // 3 knows-triples
+        let engine = HybridEngine::new();
+        let query = "SELECT ?a ?y WHERE { \
+                     ?a <http://example.org/knows> ?b BIND(?missing + 1 AS ?y) }";
+        let result: Value =
+            serde_json::from_str(&execute_sparql_bind(&mut store, &engine, query).unwrap())
+                .unwrap();
+        let rows = result["results"]["bindings"].as_array().unwrap();
+        assert_eq!(rows.len(), 3, "rows are kept, not dropped");
+        for row in rows {
+            assert!(
+                row.get("y").is_none(),
+                "?y stays unbound and is omitted, not null"
+            );
+        }
+    }
+
+    /// The value BIND interns must be usable in a subsequent FILTER on the
+    /// same bound variable.
+    #[test]
+    fn bind_value_usable_in_subsequent_filter() {
+        let mut store = TripleStore::new();
+        let dt = "http://www.w3.org/2001/XMLSchema#integer";
+        let alice = store.dict.insert("http://example.org/alice");
+        let bob = store.dict.insert("http://example.org/bob");
+        let age = store.dict.insert("http://example.org/age");
+        let v30 = store
+            .dict
+            .insert_with_type("30", TermType::literal_datatype(dt));
+        let v10 = store
+            .dict
+            .insert_with_type("10", TermType::literal_datatype(dt));
+        store.insert_triple(alice, age, v30);
+        store.insert_triple(bob, age, v10);
+        let engine = HybridEngine::new();
+        let query = "SELECT ?p WHERE { \
+                     ?p <http://example.org/age> ?a BIND(?a * 2 AS ?y) FILTER(?y > 40) }";
+        let result: Value =
+            serde_json::from_str(&execute_sparql_bind(&mut store, &engine, query).unwrap())
+                .unwrap();
+        let rows = result["results"]["bindings"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "only alice: 30*2=60 > 40");
+        assert_eq!(rows[0]["p"]["value"], "http://example.org/alice");
+    }
+
+    /// A BIND-computed value must intern to the *same* dictionary ID as an
+    /// identical existing value, so a subsequent join on the bound variable
+    /// against real triple data still matches (raw-ID equi-join, not just
+    /// value equality).
+    #[test]
+    fn bind_computed_value_joins_with_existing_data() {
+        let mut store = TripleStore::new();
+        // Arithmetic results are always `Fv::Num`, which BIND interns as
+        // xsd:double (see `intern_fv`/`Function::Datatype`) — so the age
+        // literal and the baseline literal must share that datatype for the
+        // interned ID to line up with the pre-existing one.
+        let dt = "http://www.w3.org/2001/XMLSchema#double";
+        let alice = store.dict.insert("http://example.org/alice");
+        let age = store.dict.insert("http://example.org/age");
+        let refnode = store.dict.insert("http://example.org/baseline");
+        let has_baseline = store.dict.insert("http://example.org/hasBaseline");
+        let v25 = store
+            .dict
+            .insert_with_type("25", TermType::literal_datatype(dt));
+        store.insert_triple(alice, age, v25);
+        store.insert_triple(refnode, has_baseline, v25);
+        let engine = HybridEngine::new();
+        let query = "SELECT ?p ?ref WHERE { \
+                     ?p <http://example.org/age> ?a BIND(?a + 0 AS ?y) . \
+                     ?ref <http://example.org/hasBaseline> ?y }";
+        let result: Value =
+            serde_json::from_str(&execute_sparql_bind(&mut store, &engine, query).unwrap())
+                .unwrap();
+        let rows = result["results"]["bindings"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["ref"]["value"], "http://example.org/baseline");
     }
 }
