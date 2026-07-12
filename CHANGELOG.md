@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **`BIND`** — computes an expression and binds it to a new variable
+  (`src/sparql.rs`). A value not yet in the dictionary (e.g. an arithmetic or
+  string result) is interned on the fly, so the query needs write access to
+  the store for that one request; queries without `BIND` are unaffected and
+  keep the fully concurrent read lock. Not yet supported together with
+  `?infer=rdfs`.
+- **`REGEX` in `FILTER`** — `REGEX(text, pattern, flags?)` with the `i`
+  (case-insensitive), `s` (dot matches newline), and `m` (multiline) flags.
+  Compiled patterns are cached process-wide to avoid recompiling per row.
+
 ## [0.2.0] - 2026-07-03
 
 ### Added
