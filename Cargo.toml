@@ -27,6 +27,7 @@ tokio-stream = "0.1"
 memmap2 = "0.9"
 bytemuck = "1"
 string-interner = "0.20"
+regex = "1"
 dhat = { version = "0.3", optional = true }
 
 [dev-dependencies]
