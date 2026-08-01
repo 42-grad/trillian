@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use serde_json::Value;
 use trillian::hypertrie::{HybridEngine, TripleStore};
-use trillian::sparql::execute_sparql;
+use trillian::sparql::{execute_sparql, execute_sparql_bind};
 
 const EX: &str = "http://example.org/";
 
@@ -125,4 +125,49 @@ fn load_snapshot_corrupt_file_errors() {
     std::fs::write(&path, vec![0u8; 50]).unwrap();
     assert!(TripleStore::load_snapshot(path.to_str().unwrap()).is_err());
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn group_by_count_star() {
+    let mut store = social_store();
+    let engine = HybridEngine::new();
+    let q = format!("SELECT ?s (COUNT(*) AS ?cnt) WHERE {{ ?s <{EX}knows> ?o }} GROUP BY ?s");
+    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    // alice, bob, charlie each have exactly one outgoing knows edge.
+    assert_eq!(rows.len(), 3);
+    for row in &rows {
+        assert_eq!(row["cnt"]["value"], "1");
+        assert_eq!(row["cnt"]["type"], "literal");
+        assert_eq!(
+            row["cnt"]["datatype"],
+            "http://www.w3.org/2001/XMLSchema#integer"
+        );
+    }
+}
+
+#[test]
+fn group_by_count_with_having() {
+    let mut store = social_store();
+    let engine = HybridEngine::new();
+    let q = format!(
+        "SELECT ?s (COUNT(*) AS ?cnt) WHERE {{ ?s <{EX}knows> ?o }} GROUP BY ?s HAVING (COUNT(*) > 0)"
+    );
+    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    assert_eq!(rows.len(), 3);
+}
+
+#[test]
+fn group_by_count_order_by_aggregate() {
+    let mut store = social_store();
+    let engine = HybridEngine::new();
+    let q = format!(
+        "SELECT ?s (COUNT(*) AS ?cnt) WHERE {{ ?s <{EX}knows> ?o }} GROUP BY ?s ORDER BY DESC(?cnt)"
+    );
+    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    assert_eq!(rows.len(), 3);
+    // All counts are 1; the main assertion is that ordering by the aggregate
+    // variable does not panic and returns a stable result.
+    for row in &rows {
+        assert_eq!(row["cnt"]["value"], "1");
+    }
 }

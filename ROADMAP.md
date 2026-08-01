@@ -9,7 +9,8 @@ open an issue first to agree on the approach (see [CONTRIBUTING.md](CONTRIBUTING
 - `BIND` combined with `?infer=rdfs` (currently rejected as "unsupported WHERE
   pattern" — the RDFS rewrite path doesn't route through the write-locked
   `eval_where_mut` that `BIND` needs).
-- Aggregation: `GROUP BY` with `COUNT`/`SUM`/`MIN`/`MAX`/`AVG`.
+- `GROUP BY` with `COUNT` is done; remaining aggregates (`SUM`, `AVG`, `MIN`,
+  `MAX`, `GROUP_CONCAT`, `SAMPLE`) are planned for follow-up.
 - Property-path edge cases: tighten result-count parity on the remaining
   WDBench paths/C2RPQ deviations (notably blank-node-bearing transitive paths).
 - Pipeline execution across `OPTIONAL`/`LeftJoin` so those classes get the same
