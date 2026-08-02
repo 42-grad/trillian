@@ -171,3 +171,37 @@ fn group_by_count_order_by_aggregate() {
         assert_eq!(row["cnt"]["value"], "1");
     }
 }
+
+#[test]
+fn group_by_count_empty_group_returns_zero() {
+    let mut store = TripleStore::new();
+    let engine = HybridEngine::new();
+    let q = format!("SELECT (COUNT(*) AS ?cnt) WHERE {{ ?s <{EX}knows> ?o }}");
+    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    // SPARQL 1.1: without GROUP BY there is always one (empty) group, so an
+    // aggregate-only query over no solutions yields one row with COUNT = 0.
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["cnt"]["value"], "0");
+    assert_eq!(
+        rows[0]["cnt"]["datatype"],
+        "http://www.w3.org/2001/XMLSchema#integer"
+    );
+}
+
+#[test]
+fn count_distinct_star_dedupes_within_group() {
+    let mut store = social_store();
+    let engine = HybridEngine::new();
+    // Overlapping UNION branches produce duplicate full solutions within a
+    // group; COUNT(*) must see both, COUNT(DISTINCT *) only one.
+    let q = format!(
+        "SELECT ?s (COUNT(*) AS ?c_all) (COUNT(DISTINCT *) AS ?c_dist) WHERE {{ \
+         {{ ?s <{EX}knows> ?o }} UNION {{ ?s <{EX}knows> ?o }} }} GROUP BY ?s"
+    );
+    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    assert_eq!(rows.len(), 3);
+    for row in &rows {
+        assert_eq!(row["c_all"]["value"], "2");
+        assert_eq!(row["c_dist"]["value"], "1");
+    }
+}

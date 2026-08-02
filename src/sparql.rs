@@ -867,6 +867,7 @@ fn eval_group(
     engine: &HybridEngine,
 ) -> Result<(RowBlock, Vec<String>), String> {
     use rustc_hash::FxHashMap;
+    use rustc_hash::FxHashSet;
     use spargebra::algebra::AggregateExpression as AE;
 
     // 1. Evaluate the inner pattern.
@@ -889,6 +890,13 @@ fn eval_group(
         groups.entry(key).or_default().push(i);
     }
 
+    // SPARQL 1.1: without GROUP BY variables there is always one (possibly
+    // empty) group, so an aggregate-only query over no solutions still yields
+    // one row (e.g. COUNT(*) = 0) instead of no rows at all.
+    if groups.is_empty() && group_by_vars.is_empty() {
+        groups.insert(Vec::new(), Vec::new());
+    }
+
     // 4. Output variable order: group keys first, then aggregate results.
     let mut out_vo = Vec::with_capacity(group_by_vars.len() + aggregates.len());
     for v in group_by_vars {
@@ -906,13 +914,25 @@ fn eval_group(
         for (_, agg_expr) in aggregates {
             let id = match agg_expr {
                 AE::CountSolutions { distinct } => {
-                    // COUNT(*) / COUNT(DISTINCT *). Within a single group every
-                    // solution is distinct (they differ on at least one non-key
-                    // variable), so both collapse to the group cardinality.
-                    let _ = distinct; // reserved for future COUNT(DISTINCT ?x)
-                    intern_count(store, row_indices.len() as i64)
+                    // COUNT(*) counts the solutions in the group;
+                    // COUNT(DISTINCT *) counts only distinct full solutions
+                    // (duplicates arise e.g. from overlapping UNION branches).
+                    let n = if *distinct {
+                        let mut seen: FxHashSet<&[u32]> = FxHashSet::default();
+                        row_indices
+                            .iter()
+                            .filter(|&&i| seen.insert(rows.row(i)))
+                            .count() as i64
+                    } else {
+                        row_indices.len() as i64
+                    };
+                    intern_count(store, n)
                 }
-                _ => return Err("Only COUNT aggregate is currently supported".to_string()),
+                _ => {
+                    return Err(
+                        "Only COUNT(*) / COUNT(DISTINCT *) are currently supported".to_string()
+                    );
+                }
             };
             out_row.push(id);
         }
