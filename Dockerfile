@@ -7,7 +7,7 @@
 #
 # The server listens on 0.0.0.0:<port> (default 9080); mount your data under /data.
 
-FROM rust:1.96-slim AS builder
+FROM rust:1.97-slim AS builder
 WORKDIR /build
 # Copy the full source (Cargo.lock pins dependencies for a reproducible build).
 COPY . .
