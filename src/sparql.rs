@@ -11,6 +11,7 @@ use serde_json::{Map, Value, json};
 use spargebra::algebra::{Expression, Function, PropertyPathExpression as Ppe};
 use spargebra::term::{
     GroundQuad, GroundTerm, Literal, NamedNode, NamedOrBlankNode, Quad, Term as SparqlTerm,
+    Variable,
 };
 use spargebra::{Query as SparqlQuery, SparqlParser};
 use tokio_stream::wrappers::ReceiverStream;
@@ -349,7 +350,7 @@ fn normalize_query(query_param: Option<String>, body: String) -> String {
 fn query_needs_write(query_str: &str) -> bool {
     match SparqlParser::new().parse_query(query_str) {
         Ok(SparqlQuery::Select { pattern, .. } | SparqlQuery::Ask { pattern, .. }) => {
-            contains_extend(&pattern)
+            contains_extend(&pattern) || contains_group(&pattern)
         }
         _ => false,
     }
@@ -485,9 +486,10 @@ pub fn execute_sparql(
     }
 }
 
-/// Mutable twin of [`execute_sparql`] for queries containing `BIND`: a
-/// computed value not yet in the dictionary must be interned, which needs
-/// write access to the store (see [`contains_extend`], [`eval_where_mut`]).
+/// Mutable twin of [`execute_sparql`] for queries that materialize new values
+/// into the dictionary: `BIND` and `GROUP BY` aggregates. These computed values
+/// must be interned, so the caller needs write access to the store (see
+/// [`contains_extend`], [`contains_group`], [`eval_where_mut`]).
 pub fn execute_sparql_bind(
     store: &mut TripleStore,
     engine: &HybridEngine,
@@ -711,9 +713,9 @@ fn eval_where(
             path,
             object,
         } => eval_path(store, subject, path, object),
-        _ => {
-            Err("Unsupported WHERE pattern (only BGP/FILTER/OPTIONAL/UNION/Join/Path)".to_string())
-        }
+        _ => Err(
+            "Unsupported WHERE pattern (only BGP/FILTER/OPTIONAL/UNION/Join/Path; use the mutable API for BIND/GROUP BY)".to_string(),
+        ),
     }
 }
 
@@ -742,10 +744,35 @@ fn contains_extend(gp: &spargebra::algebra::GraphPattern) -> bool {
     }
 }
 
-/// Mutable twin of [`eval_where`], used only for queries containing `BIND`.
-/// Identical to `eval_where` except for the added `Extend` arm — kept in sync
-/// with it by hand since Rust has no way to share one body across an `&`/`&mut`
-/// store parameter here without a larger refactor.
+/// Whether `gp` contains a `GROUP BY` (`Group`) node anywhere in the tree.
+/// Aggregate results are computed values that must be interned into the
+/// dictionary, so such queries also need write access to the store.
+fn contains_group(gp: &spargebra::algebra::GraphPattern) -> bool {
+    use spargebra::algebra::GraphPattern as GP;
+    match gp {
+        GP::Group { .. } => true,
+        GP::Bgp { .. } | GP::Path { .. } | GP::Values { .. } => false,
+        GP::Join { left, right }
+        | GP::LeftJoin { left, right, .. }
+        | GP::Union { left, right }
+        | GP::Minus { left, right } => contains_group(left) || contains_group(right),
+        GP::Filter { inner, .. }
+        | GP::Extend { inner, .. }
+        | GP::Graph { inner, .. }
+        | GP::OrderBy { inner, .. }
+        | GP::Project { inner, .. }
+        | GP::Distinct { inner }
+        | GP::Reduced { inner }
+        | GP::Slice { inner, .. }
+        | GP::Service { inner, .. } => contains_group(inner),
+    }
+}
+
+/// Mutable twin of [`eval_where`] for queries that need to intern computed
+/// values (`BIND` and `GROUP BY` aggregates). Identical to `eval_where` except
+/// for the added `Extend` and `Group` arms — kept in sync with it by hand since
+/// Rust has no way to share one body across an `&`/`&mut` store parameter here
+/// without a larger refactor.
 fn eval_where_mut(
     gp: &spargebra::algebra::GraphPattern,
     store: &mut TripleStore,
@@ -795,19 +822,135 @@ fn eval_where_mut(
             for row in rows.rows() {
                 // BIND leaves the variable unbound on a type error rather than
                 // dropping the row (unlike FILTER).
-                let id = match eval(expression, row, &vo, store) {
-                    Ok(fv) => intern_fv(store, &fv),
-                    Err(()) => NULL_ID,
+                let id = match expression {
+                    // Fast path: alias such as `COUNT(*) AS ?cnt`. Preserving
+                    // the original dictionary ID keeps the datatype (e.g.
+                    // xsd:integer) instead of re-interning as xsd:double.
+                    Expression::Variable(v) => vo
+                        .iter()
+                        .position(|x| x == v.as_str())
+                        .map(|c| row[c])
+                        .filter(|&id| id != NULL_ID)
+                        .unwrap_or(NULL_ID),
+                    _ => match eval(expression, row, &vo, store) {
+                        Ok(fv) => intern_fv(store, &fv),
+                        Err(()) => NULL_ID,
+                    },
                 };
                 extended.push_row_concat(row, &[id]);
             }
             vo.push(variable.as_str().to_string());
             Ok((extended, vo))
         }
+        GP::Group {
+            inner,
+            variables,
+            aggregates,
+        } => eval_group(inner, variables, aggregates, store, engine),
         _ => Err(
-            "Unsupported WHERE pattern (only BGP/FILTER/OPTIONAL/UNION/Join/Path/BIND)".to_string(),
+            "Unsupported WHERE pattern (only BGP/FILTER/OPTIONAL/UNION/Join/Path/BIND/GROUP BY)"
+                .to_string(),
         ),
     }
+}
+
+/// Evaluates a `GROUP BY ... (COUNT(...) AS ?var)` pattern. The inner pattern
+/// is evaluated, rows are partitioned by the GROUP BY variables, and one row
+/// per group is emitted containing the group key plus the aggregate values.
+/// Aggregate results are interned into the dictionary, so this needs write
+/// access to the store.
+fn eval_group(
+    inner: &spargebra::algebra::GraphPattern,
+    group_by_vars: &[Variable],
+    aggregates: &[(Variable, spargebra::algebra::AggregateExpression)],
+    store: &mut TripleStore,
+    engine: &HybridEngine,
+) -> Result<(RowBlock, Vec<String>), String> {
+    use rustc_hash::FxHashMap;
+    use rustc_hash::FxHashSet;
+    use spargebra::algebra::AggregateExpression as AE;
+
+    // 1. Evaluate the inner pattern.
+    let (rows, vo) = eval_where_mut(inner, store, engine, None)?;
+
+    // 2. Find the column indices for the GROUP BY variables.
+    let group_cols: Vec<usize> = group_by_vars
+        .iter()
+        .map(|v| {
+            vo.iter()
+                .position(|x| x == v.as_str())
+                .ok_or_else(|| format!("GROUP BY variable ?{} is not in scope", v.as_str()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // 3. Partition rows into groups keyed by the GROUP BY column values.
+    let mut groups: FxHashMap<Vec<u32>, Vec<usize>> = FxHashMap::default();
+    for (i, row) in rows.rows().enumerate() {
+        let key: Vec<u32> = group_cols.iter().map(|&c| row[c]).collect();
+        groups.entry(key).or_default().push(i);
+    }
+
+    // SPARQL 1.1: without GROUP BY variables there is always one (possibly
+    // empty) group, so an aggregate-only query over no solutions still yields
+    // one row (e.g. COUNT(*) = 0) instead of no rows at all.
+    if groups.is_empty() && group_by_vars.is_empty() {
+        groups.insert(Vec::new(), Vec::new());
+    }
+
+    // 4. Output variable order: group keys first, then aggregate results.
+    let mut out_vo = Vec::with_capacity(group_by_vars.len() + aggregates.len());
+    for v in group_by_vars {
+        out_vo.push(v.as_str().to_string());
+    }
+    for (var, _) in aggregates {
+        out_vo.push(var.as_str().to_string());
+    }
+
+    // 5. Build one output row per group.
+    let mut result = RowBlock::new(out_vo.len());
+    for (key, row_indices) in groups {
+        let mut out_row: Vec<u32> = Vec::with_capacity(out_vo.len());
+        out_row.extend_from_slice(&key);
+        for (_, agg_expr) in aggregates {
+            let id = match agg_expr {
+                AE::CountSolutions { distinct } => {
+                    // COUNT(*) counts the solutions in the group;
+                    // COUNT(DISTINCT *) counts only distinct full solutions
+                    // (duplicates arise e.g. from overlapping UNION branches).
+                    let n = if *distinct {
+                        let mut seen: FxHashSet<&[u32]> = FxHashSet::default();
+                        row_indices
+                            .iter()
+                            .filter(|&&i| seen.insert(rows.row(i)))
+                            .count() as i64
+                    } else {
+                        row_indices.len() as i64
+                    };
+                    intern_count(store, n)
+                }
+                _ => {
+                    return Err(
+                        "Only COUNT(*) / COUNT(DISTINCT *) are currently supported".to_string()
+                    );
+                }
+            };
+            out_row.push(id);
+        }
+        result.push_row(&out_row);
+    }
+
+    Ok((result, out_vo))
+}
+
+/// Interns an integer count as an `xsd:integer` literal. COUNT results are
+/// defined as integer typed literals by SPARQL 1.1.
+fn intern_count(store: &mut TripleStore, n: i64) -> u32 {
+    let lex = n.to_string();
+    let typ = TermType::literal_datatype(format!("{XSD}integer"));
+    store
+        .dict
+        .lookup_term(&lex, &typ)
+        .unwrap_or_else(|| store.dict.insert_with_type(&lex, typ))
 }
 
 /// Interns a `BIND`-computed value into the dictionary, reusing the existing
@@ -1349,9 +1492,10 @@ fn evaluate_select_with_modifiers(
     m: &Modifiers,
 ) -> Result<SelectResult, String> {
     // LIMIT pushdown only if result-preserving: no ORDER BY (needs the full
-    // sort) and no DISTINCT (may need more raw rows for N distinct ones). Then
-    // offset+limit rows suffice; apply_offset_limit trims exactly.
-    let pushdown = if m.order_by.is_empty() && !m.distinct {
+    // sort), no DISTINCT (may need more raw rows for N distinct ones), and no
+    // GROUP BY (needs the full groups to aggregate and possibly HAVING-filter).
+    // Then offset+limit rows suffice; apply_offset_limit trims exactly.
+    let pushdown = if m.order_by.is_empty() && !m.distinct && !contains_group(m.where_pat) {
         m.limit.map(|l| l.saturating_add(m.offset.unwrap_or(0)))
     } else {
         None
@@ -1411,7 +1555,7 @@ fn evaluate_select_with_modifiers_mut(
     engine: &HybridEngine,
     m: &Modifiers,
 ) -> Result<SelectResult, String> {
-    let pushdown = if m.order_by.is_empty() && !m.distinct {
+    let pushdown = if m.order_by.is_empty() && !m.distinct && !contains_group(m.where_pat) {
         m.limit.map(|l| l.saturating_add(m.offset.unwrap_or(0)))
     } else {
         None

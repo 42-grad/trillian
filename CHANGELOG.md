@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-01
+
 ### Added
 - **`BIND`** — computes an expression and binds it to a new variable
   (`src/sparql.rs`). A value not yet in the dictionary (e.g. an arithmetic or
@@ -16,6 +18,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`REGEX` in `FILTER`** — `REGEX(text, pattern, flags?)` with the `i`
   (case-insensitive), `s` (dot matches newline), and `m` (multiline) flags.
   Compiled patterns are cached process-wide to avoid recompiling per row.
+- **`GROUP BY` with `COUNT`** — basic aggregation support. `COUNT(*)` and
+  `COUNT(DISTINCT *)` are evaluated per group and interned as `xsd:integer`
+  literals. `HAVING` works out of the box because it is represented as a
+  `Filter` over the grouped results. Other aggregates (`SUM`, `AVG`, `MIN`,
+  `MAX`, `GROUP_CONCAT`, `SAMPLE`) return a clear "not supported" error.
+
+### Changed
+- Queries containing `GROUP BY` now take a write lock (like `BIND`) because
+  aggregate results must be interned into the dictionary. Non-aggregation
+  queries keep the fully concurrent read lock.
+- LIMIT pushdown is disabled when `GROUP BY` is present, so the full result
+  set is available for aggregation, `HAVING`, and ordering.
 
 ## [0.2.0] - 2026-07-03
 
@@ -118,7 +132,8 @@ Initial open-source release.
 ### Removed
 - The test-only `Stats` cardinality helper is gated out of release builds.
 
-[Unreleased]: https://github.com/42-grad/trillian/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/42-grad/trillian/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/42-grad/trillian/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/42-grad/trillian/compare/v0.1.4...v0.2.0
 [0.1.4]: https://github.com/42-grad/trillian/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/42-grad/trillian/compare/v0.1.2...v0.1.3
