@@ -29,18 +29,18 @@ fn social_store() -> TripleStore {
         "<{EX}alice> <{EX}knows> <{EX}bob> .\n\
          <{EX}bob> <{EX}knows> <{EX}charlie> .\n\
          <{EX}charlie> <{EX}knows> <{EX}alice> .\n\
-         <{EX}bob> <{EX}age> \"25\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n"
+         <{EX}bob> <{EX}age> \"25\"^^<{XSD_INT}> .\n"
     ))
 }
 
 /// A small store with multiple scores per subject in order to test aggregate functions.
 fn score_store() -> TripleStore {
     store_from_nt(&format!(
-        "<{EX}alice> <{EX}score> \"7\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n\
-         <{EX}alice> <{EX}score> \"10\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n\
-         <{EX}alice> <{EX}score> \"9\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n\
-         <{EX}bob> <{EX}score> \"8\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n\
-         <{EX}bob> <{EX}score> \"5\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n"
+        "<{EX}alice> <{EX}score> \"7\"^^<{XSD_INT}> .\n\
+         <{EX}alice> <{EX}score> \"10\"^^<{XSD_INT}> .\n\
+         <{EX}alice> <{EX}score> \"9\"^^<{XSD_INT}> .\n\
+         <{EX}bob> <{EX}score> \"8\"^^<{XSD_INT}> .\n\
+         <{EX}bob> <{EX}score> \"5\"^^<{XSD_INT}> .\n"
     ))
 }
 
@@ -154,10 +154,7 @@ fn group_by_count_star() {
     for row in &rows {
         assert_eq!(row["cnt"]["value"], "1");
         assert_eq!(row["cnt"]["type"], "literal");
-        assert_eq!(
-            row["cnt"]["datatype"],
-            "http://www.w3.org/2001/XMLSchema#integer"
-        );
+        assert_eq!(row["cnt"]["datatype"], XSD_INT);
     }
 }
 
@@ -198,10 +195,7 @@ fn group_by_count_empty_group_returns_zero() {
     // aggregate-only query over no solutions yields one row with COUNT = 0.
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["cnt"]["value"], "0");
-    assert_eq!(
-        rows[0]["cnt"]["datatype"],
-        "http://www.w3.org/2001/XMLSchema#integer"
-    );
+    assert_eq!(rows[0]["cnt"]["datatype"], XSD_INT);
 }
 
 #[test]
@@ -402,4 +396,67 @@ fn aggregate_over_mixed_group_ignores_unbound_rows() {
     ] {
         assert_mixed_group_agg(agg, expected);
     }
+}
+
+#[test]
+fn count_var_ignores_unbound_rows() {
+    // alice knows two people but only bob has an age, so the OPTIONAL leaves
+    // one row unbound.
+    let mut store = store_from_nt(&format!(
+        "<{EX}alice> <{EX}knows> <{EX}bob> .\n\
+         <{EX}alice> <{EX}knows> <{EX}dave> .\n\
+         <{EX}bob> <{EX}age> \"25\"^^<{XSD_INT}> .\n"
+    ));
+    let engine = HybridEngine::new();
+    let q = format!(
+        "SELECT (COUNT(*) AS ?rows) (COUNT(?age) AS ?ages) WHERE {{ \
+         <{EX}alice> <{EX}knows> ?b OPTIONAL {{ ?b <{EX}age> ?age }} }}"
+    );
+    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["rows"]["value"], "2",
+        "COUNT(*) counts both solutions"
+    );
+    assert_eq!(
+        rows[0]["ages"]["value"], "1",
+        "COUNT(?age) counts only bob's"
+    );
+    assert_eq!(rows[0]["ages"]["datatype"], XSD_INT);
+}
+
+#[test]
+fn count_distinct_var_dedupes_within_group() {
+    let mut store = social_store();
+    let engine = HybridEngine::new();
+    // Overlapping UNION branches bind ?o to the same term twice per group.
+    let q = format!(
+        "SELECT ?s (COUNT(?o) AS ?c_all) (COUNT(DISTINCT ?o) AS ?c_dist) WHERE {{ \
+         {{ ?s <{EX}knows> ?o }} UNION {{ ?s <{EX}knows> ?o }} }} GROUP BY ?s"
+    );
+    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    assert_eq!(rows.len(), 3);
+    for row in &rows {
+        assert_eq!(row["c_all"]["value"], "2", "both bindings counted");
+        assert_eq!(
+            row["c_dist"]["value"], "1",
+            "the two bindings are the same term"
+        );
+    }
+}
+
+#[test]
+fn count_var_over_empty_group_is_zero() {
+    let mut store = social_store();
+    let engine = HybridEngine::new();
+    // Unlike MIN/MAX/SAMPLE, COUNT is *bound* over an empty group.
+    let q = format!("SELECT (COUNT(?v) AS ?c) WHERE {{ ?s <{EX}missing> ?v }}");
+    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    assert_eq!(
+        rows.len(),
+        1,
+        "the implicit group survives with no solutions"
+    );
+    assert_eq!(rows[0]["c"]["value"], "0");
+    assert_eq!(rows[0]["c"]["datatype"], XSD_INT);
 }

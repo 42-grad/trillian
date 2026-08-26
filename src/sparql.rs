@@ -932,44 +932,52 @@ fn eval_group(
                 AE::FunctionCall {
                     name,
                     expr,
-                    // Irrelevant for MIN/MAX/SAMPLE
-                    distinct: _,
-                } => match name {
-                    AF::Min | AF::Max | AF::Sample => {
-                        let col = agg_col(expr, &vo)?;
-                        // Unbound rows are skipped; a group with nothing bound is unbound.
-                        let mut bound =
-                            row_indices.iter().filter(|&&i| rows.row(i)[col] != NULL_ID);
-                        match name {
-                            // SPARQL lets SAMPLE return any element, so take the first.
-                            AF::Sample => bound.next().map_or(NULL_ID, |&i| rows.row(i)[col]),
-                            _ => {
-                                // MIN/MAX are defined by the ORDER BY ordering, hence
-                                // order_key/cmp_key - ids follow interning order, not value
-                                // order, so comparing them directly would be wrong.
-                                let want_max = matches!(name, AF::Max);
-                                bound
-                                    .map(|&i| {
-                                        (rows.row(i)[col], order_key(expr, rows.row(i), &vo, store))
-                                    })
-                                    .reduce(|best, cur| {
-                                        let ord = cmp_key(&cur.1, &best.1);
-                                        if ord.is_gt() == want_max && ord.is_ne() {
-                                            cur
-                                        } else {
-                                            best
-                                        }
-                                    })
-                                    .map_or(NULL_ID, |(id, _)| id)
-                            }
+                    distinct,
+                } => {
+                    let col = agg_col(expr, &vo)?;
+                    let bound = || row_indices.iter().filter(|&&i| rows.row(i)[col] != NULL_ID);
+                    match name {
+                        // COUNT(?x) counts the non-null values of ?x in the group; COUNT(DISTINCT ?x) counts only distinct non-null values.
+                        AF::Count => {
+                            let n = if *distinct {
+                                // Dictionary ids are one-to-one with terms, so
+                                // deduping ids is exactly term-distinctness.
+                                bound()
+                                    .map(|&i| rows.row(i)[col])
+                                    .collect::<FxHashSet<u32>>()
+                                    .len()
+                            } else {
+                                bound().count()
+                            };
+                            intern_count(store, n as i64)
+                        }
+                        // SPARQL lets SAMPLE return any element, so take the first.
+                        AF::Sample => bound().next().map_or(NULL_ID, |&i| rows.row(i)[col]),
+                        AF::Min | AF::Max => {
+                            // By the ORDER BY ordering, not by id: ids follow interning
+                            // order, not value order.
+                            let want_max = matches!(name, AF::Max);
+                            bound()
+                                .map(|&i| {
+                                    (rows.row(i)[col], order_key(expr, rows.row(i), &vo, store))
+                                })
+                                .reduce(|best, cur| {
+                                    let ord = cmp_key(&cur.1, &best.1);
+                                    if ord.is_gt() == want_max && ord.is_ne() {
+                                        cur
+                                    } else {
+                                        best
+                                    }
+                                })
+                                .map_or(NULL_ID, |(id, _)| id)
+                        }
+                        _ => {
+                            return Err(
+                                "Only COUNT, MIN(?x), MAX(?x) and SAMPLE(?x) are currently supported".to_string()
+                            );
                         }
                     }
-                    _ => {
-                        return Err(
-                            "Only COUNT(*), MIN(?x), MAX(?x) and SAMPLE(?x) are currently supported".to_string()
-                        );
-                    }
-                },
+                }
             };
             out_row.push(id);
         }

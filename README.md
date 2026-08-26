@@ -49,15 +49,15 @@ contribution to open, sovereign, and sustainable data infrastructure.
   `STRSTARTS`/`STRENDS`/`isIRI`/`isLiteral`/`isNumeric`/`isBlank`
 - `ORDER BY` (type-aware: numeric before lexical), with `LIMIT`/`DISTINCT`
 - `BIND`
-- `GROUP BY` with `HAVING` and the `COUNT(*)`, `MIN`, `MAX`, `SAMPLE`
-  aggregates. Aggregate arguments must be a bare variable — `MIN(?v)`, not
-  `MIN(?v + 1)` — so the result is a term taken straight from the group and
-  keeps its original datatype
+- `GROUP BY` with `HAVING` and the `COUNT`, `MIN`, `MAX`, `SAMPLE` aggregates,
+  each accepting `DISTINCT`. Aggregate arguments must be a bare variable —
+  `MIN(?v)`, not `MIN(?v + 1)`. `MIN`/`MAX`/`SAMPLE` hand back the stored
+  term, so the result keeps its original datatype
 - **Property paths**: `/ ^ | * + ?` and negated property sets
 - IRIs, typed/`@lang` literals, blank nodes; `INSERT DATA`/`DELETE DATA`
 
-Not yet supported (but planned): the `SUM`, `AVG`, `GROUP_CONCAT` and
-`COUNT(?x)` aggregates, sub-`SELECT`, `REGEX`.
+Not yet supported (but planned): the `SUM`, `AVG` and `GROUP_CONCAT`
+aggregates, sub-`SELECT`, `REGEX`.
 
 ### Inference (RDFS backward chaining)
 
