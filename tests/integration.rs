@@ -460,3 +460,96 @@ fn count_var_over_empty_group_is_zero() {
     assert_eq!(rows[0]["c"]["value"], "0");
     assert_eq!(rows[0]["c"]["datatype"], XSD_INT);
 }
+
+/// GROUP_CONCAT's element order is unspecified, so compare the joined value as a
+/// multiset of its parts rather than pinning one ordering. Also checks the
+/// result is a plain string: no `datatype`, whatever the inputs were.
+fn assert_concat_parts(actual: &Value, sep: &str, expected: &[&str]) {
+    assert_eq!(actual["type"], "literal");
+    assert!(
+        actual["datatype"].is_null(),
+        "GROUP_CONCAT yields a plain string, got {actual}"
+    );
+    let mut got: Vec<&str> = actual["value"].as_str().unwrap().split(sep).collect();
+    let mut want: Vec<&str> = expected.to_vec();
+    got.sort_unstable();
+    want.sort_unstable();
+    assert_eq!(got, want);
+}
+
+#[test]
+fn group_concat_within_group() {
+    let mut store = score_store();
+    let engine = HybridEngine::new();
+    // No SEPARATOR given, so the default single space applies.
+    let q = format!("SELECT ?s (GROUP_CONCAT(?v) AS ?g) WHERE {{ ?s <{EX}score> ?v }} GROUP BY ?s");
+    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    assert_eq!(rows.len(), 2, "one row per grouped subject");
+    for row in &rows {
+        let parts: &[&str] = if row["s"]["value"] == format!("{EX}alice") {
+            &["7", "10", "9"]
+        } else {
+            &["8", "5"]
+        };
+        assert_concat_parts(&row["g"], " ", parts);
+    }
+}
+
+#[test]
+fn group_concat_honours_separator() {
+    let mut store = score_store();
+    let engine = HybridEngine::new();
+    let q = format!(
+        "SELECT ?s (GROUP_CONCAT(?v; SEPARATOR=\", \") AS ?g) \
+         WHERE {{ ?s <{EX}score> ?v }} GROUP BY ?s"
+    );
+    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    assert_eq!(rows.len(), 2);
+    for row in &rows {
+        let parts: &[&str] = if row["s"]["value"] == format!("{EX}alice") {
+            &["7", "10", "9"]
+        } else {
+            &["8", "5"]
+        };
+        // Splitting on ", " only recovers the parts if the separator was used;
+        // the default single space would leave one unsplit chunk.
+        assert_concat_parts(&row["g"], ", ", parts);
+    }
+}
+
+#[test]
+fn group_concat_distinct_dedupes_within_group() {
+    let mut store = social_store();
+    let engine = HybridEngine::new();
+    // Overlapping UNION branches bind ?o to the same term twice per group.
+    let q = format!(
+        "SELECT ?s (GROUP_CONCAT(?o; SEPARATOR=\",\") AS ?all) \
+         (GROUP_CONCAT(DISTINCT ?o; SEPARATOR=\",\") AS ?dist) WHERE {{ \
+         {{ ?s <{EX}knows> ?o }} UNION {{ ?s <{EX}knows> ?o }} }} GROUP BY ?s"
+    );
+    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    assert_eq!(rows.len(), 3);
+    for row in &rows {
+        // Each subject knows exactly one person, so DISTINCT leaves one term and
+        // the undeduped form is that same term twice - one possible ordering.
+        let dist = row["dist"]["value"].as_str().unwrap();
+        assert!(dist.starts_with(EX), "expected a single IRI, got {dist}");
+        assert_eq!(row["all"]["value"], format!("{dist},{dist}"));
+    }
+}
+
+#[test]
+fn group_concat_over_empty_group_is_empty_string() {
+    let mut store = social_store();
+    let engine = HybridEngine::new();
+    // Unlike MIN/MAX/SAMPLE, GROUP_CONCAT is *bound* over an empty group.
+    let q = format!("SELECT (GROUP_CONCAT(?v) AS ?g) WHERE {{ ?s <{EX}missing> ?v }}");
+    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    assert_eq!(
+        rows.len(),
+        1,
+        "the implicit group survives with no solutions"
+    );
+    assert_eq!(rows[0]["g"]["type"], "literal");
+    assert_eq!(rows[0]["g"]["value"], "");
+}

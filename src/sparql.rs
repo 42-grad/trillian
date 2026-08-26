@@ -951,6 +951,22 @@ fn eval_group(
                             };
                             intern_count(store, n as i64)
                         }
+                        // Joins the terms' lexical forms. Always a plain string, and
+                        // "" over an empty group rather than unbound.
+                        AF::GroupConcat { separator } => {
+                            let sep = separator.as_deref().unwrap_or(" ");
+                            let mut ids: Vec<u32> = bound().map(|&i| rows.row(i)[col]).collect();
+                            if *distinct {
+                                let mut seen = FxHashSet::default();
+                                ids.retain(|&id| seen.insert(id));
+                            }
+                            let joined = ids
+                                .iter()
+                                .filter_map(|&id| store.dict.resolve(id))
+                                .collect::<Vec<_>>()
+                                .join(sep);
+                            intern_fv(store, &Fv::Str(joined))
+                        }
                         // SPARQL lets SAMPLE return any element, so take the first.
                         AF::Sample => bound().next().map_or(NULL_ID, |&i| rows.row(i)[col]),
                         AF::Min | AF::Max => {
@@ -973,7 +989,7 @@ fn eval_group(
                         }
                         _ => {
                             return Err(
-                                "Only COUNT, MIN(?x), MAX(?x) and SAMPLE(?x) are currently supported".to_string()
+                                "Only COUNT, MIN(?x), MAX(?x), SAMPLE(?x) and GROUP_CONCAT(?x) are currently supported".to_string()
                             );
                         }
                     }
