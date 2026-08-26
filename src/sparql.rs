@@ -934,6 +934,21 @@ fn eval_group(
                     expr,
                     distinct,
                 } => {
+                    // SUM/AVG compute a fresh number instead of handing back a
+                    // term from the group, so they take any expression argument
+                    // rather than the bare column the others need.
+                    if matches!(name, AF::Sum | AF::Avg) {
+                        out_row.push(agg_sum_avg(
+                            expr,
+                            &rows,
+                            &vo,
+                            &row_indices,
+                            *distinct,
+                            matches!(name, AF::Avg),
+                            store,
+                        )?);
+                        continue;
+                    }
                     let col = agg_col(expr, &vo)?;
                     let bound = || row_indices.iter().filter(|&&i| rows.row(i)[col] != NULL_ID);
                     match name {
@@ -989,7 +1004,7 @@ fn eval_group(
                         }
                         _ => {
                             return Err(
-                                "Only COUNT, MIN(?x), MAX(?x), SAMPLE(?x) and GROUP_CONCAT(?x) are currently supported".to_string()
+                                "Only COUNT, SUM, AVG, MIN, MAX, SAMPLE and GROUP_CONCAT are currently supported".to_string()
                             );
                         }
                     }
@@ -1042,18 +1057,76 @@ fn intern_fv(store: &mut TripleStore, fv: &Fv) -> u32 {
 
 /// Column read by a bare-variable aggregate argument, e.g. the `?v` in MIN(?v).
 ///
-/// Computed arguments such as `MIN(?v + 1)` are rejected. MIN/MAX/SAMPLE return
-/// a term taken straight out of the group, so restricting to a variable lets
-/// them reuse that row's dictionary id and keep the source datatype, rather
-/// than interning a fresh term (which would coerce numerics to `xsd:double`).
+/// Every aggregate except SUM/AVG hands back (or splices together) a term taken
+/// straight out of the group, so restricting those to a variable lets them reuse
+/// that row's dictionary id and keep the source datatype, rather than interning
+/// a fresh term — which would coerce numerics to `xsd:double`. `MIN(?v + 1)` is
+/// therefore rejected. SUM/AVG intern a computed value anyway and accept any
+/// expression; they call this only to scope-check a bare variable.
 fn agg_col(expr: &Expression, vo: &[String]) -> Result<usize, String> {
     match expr {
         Expression::Variable(v) => vo
             .iter()
             .position(|x| x == v.as_str())
             .ok_or_else(|| format!("aggregate variable ?{} is not in scope", v.as_str())),
-        _ => Err("aggregates take a bare variable argument".to_string()),
+        _ => Err(
+            "COUNT, MIN, MAX, SAMPLE and GROUP_CONCAT take a bare variable argument".to_string(),
+        ),
     }
+}
+
+/// Folds `SUM`/`AVG` over one group.
+///
+/// Both intern a computed number instead of returning a term from the group, so
+/// the argument may be any expression and the result is always `xsd:double`:
+/// `Fv::Num` is an `f64`, so the input datatypes are gone before the fold sees
+/// a value. A group with no contributors is `0`, as SPARQL 1.1 defines for both
+/// — unlike MIN/MAX/SAMPLE, which are unbound over an empty group.
+fn agg_sum_avg(
+    expr: &Expression,
+    rows: &RowBlock,
+    vo: &[String],
+    row_indices: &[usize],
+    distinct: bool,
+    avg: bool,
+    store: &mut TripleStore,
+) -> Result<u32, String> {
+    use rustc_hash::FxHashSet;
+
+    // A bare variable is still scope-checked, so a typo'd `SUM(?scr)` reports
+    // the same error as `MIN(?scr)` instead of silently summing to zero.
+    if matches!(expr, Expression::Variable(_)) {
+        agg_col(expr, vo)?;
+    }
+
+    let mut vals: Vec<f64> = Vec::with_capacity(row_indices.len());
+    for &i in row_indices {
+        // An unbound argument - or one whose evaluation errors - is simply not
+        // a contributor; a bound non-numeric one is a type error that makes the
+        // whole aggregate unbound.
+        if let Ok(fv) = eval(expr, rows.row(i), vo, store) {
+            match as_num(&fv) {
+                Some(n) => vals.push(n),
+                None => return Ok(NULL_ID),
+            }
+        }
+    }
+    if distinct {
+        // Value-distinct, not term-distinct as the other aggregates are: a
+        // computed argument has no term behind it to compare.
+        let mut seen = FxHashSet::default();
+        vals.retain(|n| seen.insert(n.to_bits()));
+    }
+    if vals.is_empty() {
+        return Ok(intern_count(store, 0));
+    }
+    let total: f64 = vals.iter().sum();
+    let n = if avg {
+        total / vals.len() as f64
+    } else {
+        total
+    };
+    Ok(intern_fv(store, &Fv::Num(n)))
 }
 
 // ---------------------------------------------------------------------------

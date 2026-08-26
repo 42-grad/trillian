@@ -10,6 +10,7 @@ use trillian::sparql::{execute_sparql, execute_sparql_bind};
 
 const EX: &str = "http://example.org/";
 const XSD_INT: &str = "http://www.w3.org/2001/XMLSchema#integer";
+const XSD_DOUBLE: &str = "http://www.w3.org/2001/XMLSchema#double";
 
 /// Generic store creation helper: write the given N-Triples to a temporary file, ingest it into a new store, and return the store.
 /// Built from N-Triples on disk so the example also exercises the
@@ -552,4 +553,166 @@ fn group_concat_over_empty_group_is_empty_string() {
     );
     assert_eq!(rows[0]["g"]["type"], "literal");
     assert_eq!(rows[0]["g"]["value"], "");
+}
+
+// --- SUM / AVG --------------------------------------------------------------
+
+/// SUM and AVG build a new number rather than returning a stored term, so the
+/// result is an `xsd:double` whatever the inputs were. Values are compared as
+/// numbers: AVG rarely lands on an exact decimal.
+fn assert_double(actual: &Value, expected: f64) {
+    assert_eq!(
+        actual["datatype"], XSD_DOUBLE,
+        "SUM/AVG intern a computed value, got {actual}"
+    );
+    let got: f64 = actual["value"]
+        .as_str()
+        .unwrap_or_else(|| panic!("?out must be bound, got {actual}"))
+        .parse()
+        .expect("numeric lexical form");
+    assert!(
+        (got - expected).abs() < 1e-9,
+        "expected {expected}, got {got}"
+    );
+}
+
+#[test]
+fn sum_and_avg_global() {
+    let mut store = score_store();
+    let engine = HybridEngine::new();
+    let q = format!(
+        "SELECT (SUM(?score) AS ?total) (AVG(?score) AS ?mean) \
+         WHERE {{ ?s <{EX}score> ?score }}"
+    );
+    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    assert_eq!(rows.len(), 1, "no GROUP BY yields exactly one group");
+    assert_double(&rows[0]["total"], 39.0); // 7 + 10 + 9 + 8 + 5
+    assert_double(&rows[0]["mean"], 7.8); // 39 / 5
+}
+
+#[test]
+fn sum_and_avg_within_group() {
+    let mut store = score_store();
+    let engine = HybridEngine::new();
+    let q = format!(
+        "SELECT ?s (SUM(?v) AS ?total) (AVG(?v) AS ?mean) \
+         WHERE {{ ?s <{EX}score> ?v }} GROUP BY ?s"
+    );
+    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    assert_eq!(rows.len(), 2, "one row per grouped subject");
+    for row in &rows {
+        // Group order is unspecified, so dispatch on the subject.
+        let (total, mean) = if row["s"]["value"] == format!("{EX}alice") {
+            (26.0, 26.0 / 3.0) // 7 + 10 + 9
+        } else {
+            (13.0, 6.5) // 8 + 5
+        };
+        assert_double(&row["total"], total);
+        assert_double(&row["mean"], mean);
+    }
+}
+
+#[test]
+fn sum_distinct_dedupes_within_group() {
+    let mut store = score_store();
+    let engine = HybridEngine::new();
+    // Overlapping UNION branches bind ?v to each score twice per group.
+    let q = format!(
+        "SELECT ?s (SUM(?v) AS ?all) (SUM(DISTINCT ?v) AS ?dist) WHERE {{ \
+         {{ ?s <{EX}score> ?v }} UNION {{ ?s <{EX}score> ?v }} }} GROUP BY ?s"
+    );
+    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    assert_eq!(rows.len(), 2);
+    for row in &rows {
+        let dist = if row["s"]["value"] == format!("{EX}alice") {
+            26.0
+        } else {
+            13.0
+        };
+        assert_double(&row["all"], dist * 2.0);
+        assert_double(&row["dist"], dist);
+    }
+}
+
+#[test]
+fn sum_and_avg_over_empty_group_are_zero() {
+    let mut store = social_store();
+    let engine = HybridEngine::new();
+    // Unlike MIN/MAX/SAMPLE, these are *bound* over an empty group - and like
+    // COUNT they yield an xsd:integer zero, not a double.
+    for agg in ["SUM", "AVG"] {
+        let q = format!("SELECT ({agg}(?v) AS ?out) WHERE {{ ?s <{EX}missing> ?v }}");
+        let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+        assert_eq!(
+            rows.len(),
+            1,
+            "the implicit group survives with no solutions"
+        );
+        assert_eq!(rows[0]["out"]["value"], "0", "{agg} over an empty group");
+        assert_eq!(rows[0]["out"]["datatype"], XSD_INT);
+    }
+}
+
+#[test]
+fn sum_and_avg_ignore_unbound_rows() {
+    // alice knows two people but only bob has an age, so the OPTIONAL leaves
+    // one row of alice's group unbound; it must not drag the average down.
+    let mut store = store_from_nt(&format!(
+        "<{EX}alice> <{EX}knows> <{EX}bob> .\n\
+         <{EX}alice> <{EX}knows> <{EX}dave> .\n\
+         <{EX}bob> <{EX}age> \"25\"^^<{XSD_INT}> .\n"
+    ));
+    let engine = HybridEngine::new();
+    let q = format!(
+        "SELECT ?a (SUM(?age) AS ?total) (AVG(?age) AS ?mean) \
+         WHERE {{ ?a <{EX}knows> ?b OPTIONAL {{ ?b <{EX}age> ?age }} }} GROUP BY ?a"
+    );
+    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    assert_eq!(rows.len(), 1, "one group: alice");
+    assert_double(&rows[0]["total"], 25.0);
+    assert_double(&rows[0]["mean"], 25.0);
+}
+
+#[test]
+fn sum_over_non_numeric_group_is_unbound() {
+    let mut store = store_from_nt(&format!("<{EX}alice> <{EX}name> \"Alice\" .\n"));
+    let engine = HybridEngine::new();
+    // A bound but non-numeric term is a type error for the whole aggregate.
+    let q = format!("SELECT (SUM(?n) AS ?out) WHERE {{ ?s <{EX}name> ?n }}");
+    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    assert_eq!(rows.len(), 1);
+    assert!(
+        rows[0]["out"].is_null(),
+        "SUM over a string must be unbound, got {}",
+        rows[0]["out"]
+    );
+}
+
+#[test]
+fn sum_accepts_a_computed_argument() {
+    let mut store = score_store();
+    let engine = HybridEngine::new();
+    // SUM/AVG intern a fresh value anyway, so unlike MIN/MAX/SAMPLE they do not
+    // need a bare variable to preserve a stored term's datatype.
+    let q = format!(
+        "SELECT (SUM(?v + 1) AS ?total) (AVG(?v * 2) AS ?mean) \
+         WHERE {{ ?s <{EX}score> ?v }}"
+    );
+    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    assert_double(&rows[0]["total"], 44.0); // 39 + 5 rows
+    assert_double(&rows[0]["mean"], 15.6); // 7.8 * 2
+}
+
+#[test]
+fn having_filters_on_sum() {
+    let mut store = score_store();
+    let engine = HybridEngine::new();
+    let q = format!(
+        "SELECT ?s (SUM(?v) AS ?total) WHERE {{ ?s <{EX}score> ?v }} \
+         GROUP BY ?s HAVING (SUM(?v) > 20)"
+    );
+    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    assert_eq!(rows.len(), 1, "only alice's scores sum above 20");
+    assert_eq!(rows[0]["s"]["value"], format!("{EX}alice"));
+    assert_double(&rows[0]["total"], 26.0);
 }

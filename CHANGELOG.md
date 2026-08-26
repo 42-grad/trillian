@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **The remaining `GROUP BY` aggregates** — `COUNT(?x)`, `SUM`, `AVG`, `MIN`,
+  `MAX`, `SAMPLE` and `GROUP_CONCAT` (with `SEPARATOR`), each accepting
+  `DISTINCT` (`src/sparql.rs`); the "not supported" error from 0.3.0 is gone.
+  `MIN`/`MAX`/`SAMPLE` return the stored term and keep its datatype,
+  `GROUP_CONCAT` yields a plain string, and `SUM`/`AVG` intern a computed
+  number so they yield `xsd:double` and are `0` over an empty group where the
+  others are unbound.
+- **Expression arguments for `SUM`/`AVG`** — `SUM(?v + 1)`. The others still
+  need a bare variable, which is what lets them return the source term.
+
 ## [0.3.0] - 2026-08-01
 
 ### Added

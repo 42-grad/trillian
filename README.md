@@ -49,16 +49,18 @@ contribution to open, sovereign, and sustainable data infrastructure.
   `STRSTARTS`/`STRENDS`/`isIRI`/`isLiteral`/`isNumeric`/`isBlank`
 - `ORDER BY` (type-aware: numeric before lexical), with `LIMIT`/`DISTINCT`
 - `BIND`
-- `GROUP BY` with `HAVING` and the `COUNT`, `MIN`, `MAX`, `SAMPLE` and
-  `GROUP_CONCAT` aggregates, each accepting `DISTINCT`. Aggregate arguments
-  must be a bare variable — `MIN(?v)`, not `MIN(?v + 1)`. `MIN`/`MAX`/`SAMPLE`
-  hand back the stored term, so the result keeps its original datatype;
-  `GROUP_CONCAT` always yields a plain string
+- `GROUP BY` with `HAVING` and the `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`,
+  `SAMPLE` and `GROUP_CONCAT` aggregates, each accepting `DISTINCT`.
+  `MIN`/`MAX`/`SAMPLE` hand back the stored term, so the result keeps its
+  original datatype; `GROUP_CONCAT` always yields a plain string; `SUM`/`AVG`
+  compute a new number and yield `xsd:double`, as `BIND` arithmetic does.
+  Because they build a fresh value, `SUM` and `AVG` accept any expression
+  argument (`SUM(?v + 1)`); the others need a bare variable — `MIN(?v)`, not
+  `MIN(?v + 1)` — to keep the term they return intact
 - **Property paths**: `/ ^ | * + ?` and negated property sets
 - IRIs, typed/`@lang` literals, blank nodes; `INSERT DATA`/`DELETE DATA`
 
-Not yet supported (but planned): the `SUM` and `AVG` aggregates, sub-`SELECT`,
-`REGEX`.
+Not yet supported (but planned): sub-`SELECT` and `REGEX`.
 
 ### Inference (RDFS backward chaining)
 
