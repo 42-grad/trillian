@@ -12,8 +12,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `DISTINCT` (`src/sparql.rs`); the "not supported" error from 0.3.0 is gone.
   `MIN`/`MAX`/`SAMPLE` return the stored term and keep its datatype,
   `GROUP_CONCAT` yields a plain string, and `SUM`/`AVG` intern a computed
-  number so they yield `xsd:double` and are `0` over an empty group where the
-  others are unbound.
+  number so they yield `xsd:double`. Over an empty group `SUM`/`AVG` are `0`
+  (an `xsd:integer`, as SPARQL 1.1 defines) and `GROUP_CONCAT` is `""`, while
+  `MIN`/`MAX`/`SAMPLE` are unbound.
 - **Expression arguments for `SUM`/`AVG`** — `SUM(?v + 1)`. The others still
   need a bare variable, which is what lets them return the source term.
 

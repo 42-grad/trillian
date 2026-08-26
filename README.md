@@ -47,6 +47,7 @@ contribution to open, sovereign, and sustainable data infrastructure.
 - `FILTER` — 3-valued logic: comparisons, `&&`/`||`/`!`, `BOUND`, arithmetic,
   `IN`, `IF`, and `STR`/`LANG`/`DATATYPE`/`STRLEN`/`U`-`LCASE`/`CONTAINS`/
   `STRSTARTS`/`STRENDS`/`isIRI`/`isLiteral`/`isNumeric`/`isBlank`
+- `REGEX` in `FILTER`, with the `i`, `s`, and `m` flags
 - `ORDER BY` (type-aware: numeric before lexical), with `LIMIT`/`DISTINCT`
 - `BIND`
 - `GROUP BY` with `HAVING` and the `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`,
@@ -56,11 +57,14 @@ contribution to open, sovereign, and sustainable data infrastructure.
   compute a new number and yield `xsd:double`, as `BIND` arithmetic does.
   Because they build a fresh value, `SUM` and `AVG` accept any expression
   argument (`SUM(?v + 1)`); the others need a bare variable — `MIN(?v)`, not
-  `MIN(?v + 1)` — to keep the term they return intact
+  `MIN(?v + 1)` — to keep the term they return intact. Over an empty group
+  `COUNT`, `SUM` and `AVG` are `0` (an `xsd:integer`, as SPARQL 1.1 defines)
+  and `GROUP_CONCAT` is `""`, while `MIN`/`MAX`/`SAMPLE` are unbound.
 - **Property paths**: `/ ^ | * + ?` and negated property sets
 - IRIs, typed/`@lang` literals, blank nodes; `INSERT DATA`/`DELETE DATA`
 
-Not yet supported (but planned): sub-`SELECT` and `REGEX`.
+Not yet supported (but planned): sub-`SELECT`, and `BIND` together with
+`?infer=rdfs`.
 
 ### Inference (RDFS backward chaining)
 
