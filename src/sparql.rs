@@ -723,15 +723,19 @@ fn eval_where(
             }
             Ok((kept, vo))
         }
-        GP::LeftJoin { left, right, .. } => {
+        GP::LeftJoin {
+            left,
+            right,
+            expression,
+        } => {
             let (lr, lvo) = eval_where(left, store, engine, None)?;
             let (rr, rvo) = eval_where(right, store, engine, None)?;
-            hash_join(lr, &lvo, rr, &rvo, true)
+            hash_join(lr, &lvo, rr, &rvo, true, expression.as_ref(), store)
         }
         GP::Join { left, right } => {
             let (lr, lvo) = eval_where(left, store, engine, None)?;
             let (rr, rvo) = eval_where(right, store, engine, None)?;
-            hash_join(lr, &lvo, rr, &rvo, false)
+            hash_join(lr, &lvo, rr, &rvo, false, None, store)
         }
         GP::Union { left, right } => {
             let (lr, lvo) = eval_where(left, store, engine, None)?;
@@ -836,15 +840,20 @@ fn eval_where_mut(
             }
             Ok((kept, vo))
         }
-        GP::LeftJoin { left, right, .. } => {
+        GP::LeftJoin {
+            left,
+            right,
+            expression,
+        } => {
             let (lr, lvo) = eval_where_mut(left, store, engine, None)?;
             let (rr, rvo) = eval_where_mut(right, store, engine, None)?;
-            hash_join(lr, &lvo, rr, &rvo, true)
+            let expression = expression.clone();
+            hash_join(lr, &lvo, rr, &rvo, true, expression.as_ref(), store)
         }
         GP::Join { left, right } => {
             let (lr, lvo) = eval_where_mut(left, store, engine, None)?;
             let (rr, rvo) = eval_where_mut(right, store, engine, None)?;
-            hash_join(lr, &lvo, rr, &rvo, false)
+            hash_join(lr, &lvo, rr, &rvo, false, None, store)
         }
         GP::Union { left, right } => {
             let (lr, lvo) = eval_where_mut(left, store, engine, None)?;
@@ -1522,6 +1531,8 @@ fn hash_join(
     right: RowBlock,
     rvo: &[String],
     left_outer: bool,
+    on: Option<&Expression>,
+    store: &TripleStore,
 ) -> Result<(RowBlock, Vec<String>), String> {
     let cap = max_result_rows();
     let mut shared: Vec<(usize, usize)> = Vec::new(); // (left_pos, right_pos)
@@ -1557,26 +1568,39 @@ fn hash_join(
     }
 
     let mut out = RowBlock::new(new_var_order.len());
+    let mut merged: Vec<u32> = Vec::with_capacity(new_var_order.len());
+    // A match that fails `on` does not count, so the left row still falls
+    // through to the unbound-padded branch below.
+    let keeps = |merged: &[u32]| match on {
+        Some(e) => ebv(e, merged, &new_var_order, store) == Ok(true),
+        None => true,
+    };
     for row in left.rows() {
         let key: Vec<u32> = shared.iter().map(|&(lp, _)| row[lp]).collect();
-        match index.get(&key) {
-            Some(&(count, ref flat)) => {
-                if new_arity == 0 {
-                    // Match with no new columns -> one row per right hit.
+        let mut matched = false;
+        if let Some(&(count, ref flat)) = index.get(&key) {
+            if new_arity == 0 {
+                // Match with no new columns -> one row per right hit.
+                if keeps(row) {
                     for _ in 0..count {
                         out.push_row_padded(row, NULL_ID);
                     }
-                } else {
-                    for chunk in flat.chunks(new_arity) {
+                    matched = count > 0;
+                }
+            } else {
+                for chunk in flat.chunks(new_arity) {
+                    merged.clear();
+                    merged.extend_from_slice(row);
+                    merged.extend_from_slice(chunk);
+                    if keeps(&merged) {
                         out.push_row_concat(row, chunk);
+                        matched = true;
                     }
                 }
             }
-            None => {
-                if left_outer {
-                    out.push_row_padded(row, NULL_ID);
-                }
-            }
+        }
+        if !matched && left_outer {
+            out.push_row_padded(row, NULL_ID);
         }
         if out.n_rows() > cap {
             return Err(op_too_large());

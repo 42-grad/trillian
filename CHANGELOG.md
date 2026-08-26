@@ -51,6 +51,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `SELECT ?s WHERE { { SELECT * WHERE { ?s ?p ?o } } }` returned `?s`, `?p` and
   `?o`. (A sub-`SELECT` joined with anything else errored out instead, so only
   the whole-body form returned wrong results silently.)
+- **A `FILTER` inside `OPTIONAL` was silently ignored** (`src/sparql.rs`). The
+  `LeftJoin` arm destructured the algebra node as `{ left, right, .. }`, and the
+  `..` dropped the left-join expression, so
+  `OPTIONAL { ?b :age ?age FILTER(?age < 30) }` returned every match regardless
+  of the filter. It is now applied during the join, with SPARQL 1.1 semantics:
+  a match that fails the expression does not count, so the left row falls
+  through and keeps the optional variables **unbound** rather than being
+  dropped. A `FILTER` placed *after* the `OPTIONAL` is unaffected — it still
+  filters the joined result, and that contrast is now covered by a test.
 
 ## [0.3.0] - 2026-08-01
 
