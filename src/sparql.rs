@@ -869,6 +869,7 @@ fn eval_group(
     use rustc_hash::FxHashMap;
     use rustc_hash::FxHashSet;
     use spargebra::algebra::AggregateExpression as AE;
+    use spargebra::algebra::AggregateFunction as AF;
 
     // 1. Evaluate the inner pattern.
     let (rows, vo) = eval_where_mut(inner, store, engine, None)?;
@@ -928,11 +929,47 @@ fn eval_group(
                     };
                     intern_count(store, n)
                 }
-                _ => {
-                    return Err(
-                        "Only COUNT(*) / COUNT(DISTINCT *) are currently supported".to_string()
-                    );
-                }
+                AE::FunctionCall {
+                    name,
+                    expr,
+                    // Irrelevant for MIN/MAX/SAMPLE
+                    distinct: _,
+                } => match name {
+                    AF::Min | AF::Max | AF::Sample => {
+                        let col = agg_col(expr, &vo)?;
+                        // Unbound rows are skipped; a group with nothing bound is unbound.
+                        let mut bound =
+                            row_indices.iter().filter(|&&i| rows.row(i)[col] != NULL_ID);
+                        match name {
+                            // SPARQL lets SAMPLE return any element, so take the first.
+                            AF::Sample => bound.next().map_or(NULL_ID, |&i| rows.row(i)[col]),
+                            _ => {
+                                // MIN/MAX are defined by the ORDER BY ordering, hence
+                                // order_key/cmp_key - ids follow interning order, not value
+                                // order, so comparing them directly would be wrong.
+                                let want_max = matches!(name, AF::Max);
+                                bound
+                                    .map(|&i| {
+                                        (rows.row(i)[col], order_key(expr, rows.row(i), &vo, store))
+                                    })
+                                    .reduce(|best, cur| {
+                                        let ord = cmp_key(&cur.1, &best.1);
+                                        if ord.is_gt() == want_max && ord.is_ne() {
+                                            cur
+                                        } else {
+                                            best
+                                        }
+                                    })
+                                    .map_or(NULL_ID, |(id, _)| id)
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(
+                            "Only COUNT(*), MIN(?x), MAX(?x) and SAMPLE(?x) are currently supported".to_string()
+                        );
+                    }
+                },
             };
             out_row.push(id);
         }
@@ -977,6 +1014,22 @@ fn intern_fv(store: &mut TripleStore, fv: &Fv) -> u32 {
         .dict
         .lookup_term(&lex, &typ)
         .unwrap_or_else(|| store.dict.insert_with_type(&lex, typ))
+}
+
+/// Column read by a bare-variable aggregate argument, e.g. the `?v` in MIN(?v).
+///
+/// Computed arguments such as `MIN(?v + 1)` are rejected. MIN/MAX/SAMPLE return
+/// a term taken straight out of the group, so restricting to a variable lets
+/// them reuse that row's dictionary id and keep the source datatype, rather
+/// than interning a fresh term (which would coerce numerics to `xsd:double`).
+fn agg_col(expr: &Expression, vo: &[String]) -> Result<usize, String> {
+    match expr {
+        Expression::Variable(v) => vo
+            .iter()
+            .position(|x| x == v.as_str())
+            .ok_or_else(|| format!("aggregate variable ?{} is not in scope", v.as_str())),
+        _ => Err("aggregates take a bare variable argument".to_string()),
+    }
 }
 
 // ---------------------------------------------------------------------------

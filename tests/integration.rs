@@ -9,23 +9,39 @@ use trillian::hypertrie::{HybridEngine, TripleStore};
 use trillian::sparql::{execute_sparql, execute_sparql_bind};
 
 const EX: &str = "http://example.org/";
+const XSD_INT: &str = "http://www.w3.org/2001/XMLSchema#integer";
 
-/// A small social graph: alice -> bob -> charlie -> alice (knows), plus a typed
-/// integer age. Built from N-Triples on disk so the example also exercises the
+/// Generic store creation helper: write the given N-Triples to a temporary file, ingest it into a new store, and return the store.
+/// Built from N-Triples on disk so the example also exercises the
 /// streaming loader and a typed literal (needed for the numeric FILTER test).
-fn social_store() -> TripleStore {
-    let nt = format!(
-        "<{EX}alice> <{EX}knows> <{EX}bob> .\n\
-         <{EX}bob> <{EX}knows> <{EX}charlie> .\n\
-         <{EX}charlie> <{EX}knows> <{EX}alice> .\n\
-         <{EX}bob> <{EX}age> \"25\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n"
-    );
+fn store_from_nt(nt: &str) -> TripleStore {
     let path = unique_path("graph.nt");
     std::fs::write(&path, nt).unwrap();
     let mut store = TripleStore::new();
     store.ingest_ntriples_file(path.to_str().unwrap()).unwrap();
     let _ = std::fs::remove_file(&path);
     store
+}
+
+/// A small social graph: alice -> bob -> charlie -> alice (knows), plus a typed integer age.
+fn social_store() -> TripleStore {
+    store_from_nt(&format!(
+        "<{EX}alice> <{EX}knows> <{EX}bob> .\n\
+         <{EX}bob> <{EX}knows> <{EX}charlie> .\n\
+         <{EX}charlie> <{EX}knows> <{EX}alice> .\n\
+         <{EX}bob> <{EX}age> \"25\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n"
+    ))
+}
+
+/// A small store with multiple scores per subject in order to test aggregate functions.
+fn score_store() -> TripleStore {
+    store_from_nt(&format!(
+        "<{EX}alice> <{EX}score> \"7\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n\
+         <{EX}alice> <{EX}score> \"10\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n\
+         <{EX}alice> <{EX}score> \"9\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n\
+         <{EX}bob> <{EX}score> \"8\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n\
+         <{EX}bob> <{EX}score> \"5\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n"
+    ))
 }
 
 /// Parse a SPARQL-results JSON body and return the `bindings` array.
@@ -203,5 +219,187 @@ fn count_distinct_star_dedupes_within_group() {
     for row in &rows {
         assert_eq!(row["c_all"]["value"], "2");
         assert_eq!(row["c_dist"]["value"], "1");
+    }
+}
+
+// --- Aggregate function tests ----------------------------------------------
+
+/// Runs `SELECT (AGG(?score) AS ?out)` with no GROUP BY; one implicit group
+/// over every solution and asserts the single result row.
+fn assert_global_agg(agg: &str, expected: &str) {
+    let mut store = score_store();
+    let engine = HybridEngine::new();
+    let q = format!("SELECT ({agg}(?score) AS ?out) WHERE {{ ?s <{EX}score> ?score }}");
+    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    assert_eq!(rows.len(), 1, "no GROUP BY yields exactly one group");
+    // Must be the stored term, not a value re-interned as xsd:double.
+    assert_eq!(rows[0]["out"]["datatype"], XSD_INT);
+    assert_eq!(
+        rows[0]["out"]["value"], expected,
+        "{agg} over the whole store"
+    );
+}
+
+/// Runs `SELECT ?s (AGG(?v) AS ?out) ... GROUP BY ?s` and checks each group's
+/// result against the values that group is allowed to produce. MIN/MAX pass a
+/// single permitted value; SAMPLE passes the whole group, since SPARQL leaves
+/// its choice unspecified. Group order is unspecified too (groups come out of a
+/// hash map), so rows are looked up by subject rather than by position.
+fn assert_grouped_agg(agg: &str, expected: &[(&str, &[&str])]) {
+    let mut store = score_store();
+    let engine = HybridEngine::new();
+    let q = format!("SELECT ?s ({agg}(?v) AS ?out) WHERE {{ ?s <{EX}score> ?v }} GROUP BY ?s");
+    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    assert_eq!(rows.len(), expected.len(), "one row per grouped subject");
+
+    let got: std::collections::HashMap<&str, &str> = rows
+        .iter()
+        .map(|r| {
+            (
+                r["s"]["value"].as_str().unwrap(),
+                r["out"]["value"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    for (subject, allowed) in expected {
+        let v = got[format!("{EX}{subject}").as_str()];
+        assert!(
+            allowed.contains(&v),
+            "{agg} for ?s = {subject} returned {v}, expected one of {allowed:?}"
+        );
+    }
+}
+
+#[test]
+fn select_min_global() {
+    assert_global_agg("MIN", "5");
+}
+
+#[test]
+fn select_max_global() {
+    assert_global_agg("MAX", "10");
+}
+
+#[test]
+fn select_min_within_group() {
+    assert_grouped_agg("MIN", &[("alice", &["7"]), ("bob", &["5"])]);
+}
+
+#[test]
+fn select_max_within_group() {
+    assert_grouped_agg("MAX", &[("alice", &["10"]), ("bob", &["8"])]);
+}
+
+#[test]
+fn select_sample_within_group() {
+    // Any member of the group is a conformant answer.
+    assert_grouped_agg(
+        "SAMPLE",
+        &[("alice", &["7", "10", "9"]), ("bob", &["8", "5"])],
+    );
+}
+
+/// A group whose rows all leave the aggregate variable unbound must yield an
+/// unbound result rather than a bogus term, i.e. `?out` is omitted from those
+/// bindings. Only bob has an age, so of the three knows-edges only alice's
+/// group aggregates over anything; bob's and charlie's groups have a row but
+/// nothing bound in it.
+fn assert_unbound_group_agg(agg: &str) {
+    let mut store = social_store();
+    let engine = HybridEngine::new();
+    let q = format!(
+        "SELECT ?a ({agg}(?age) AS ?out) WHERE {{ ?a <{EX}knows> ?b \
+         OPTIONAL {{ ?b <{EX}age> ?age }} }} GROUP BY ?a"
+    );
+    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    assert_eq!(rows.len(), 3, "one row per grouped subject, bound or not");
+    for row in &rows {
+        let a = row["a"]["value"].as_str().unwrap();
+        if a == format!("{EX}alice") {
+            assert_eq!(
+                row["out"]["value"], "25",
+                "{agg}: alice knows bob, who has an age"
+            );
+        } else {
+            assert!(
+                row["out"].is_null(),
+                "{agg}: ?out must be omitted for {a}, got {}",
+                row["out"]
+            );
+        }
+    }
+}
+
+/// With no solutions and no GROUP BY there is still one implicit group, and
+/// these aggregates are unbound over it - unlike COUNT, which yields 0.
+fn assert_empty_group_agg(agg: &str) {
+    let mut store = social_store();
+    let engine = HybridEngine::new();
+    let q = format!("SELECT ({agg}(?v) AS ?out) WHERE {{ ?s <{EX}missing> ?v }}");
+    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    assert_eq!(
+        rows.len(),
+        1,
+        "the implicit group survives with no solutions"
+    );
+    assert!(
+        rows[0]["out"].is_null(),
+        "{agg} over an empty group is unbound"
+    );
+}
+
+#[test]
+fn aggregate_over_unbound_group_is_unbound() {
+    for agg in ["MIN", "MAX", "SAMPLE"] {
+        assert_unbound_group_agg(agg);
+    }
+}
+
+#[test]
+fn aggregate_over_empty_group_is_unbound() {
+    for agg in ["MIN", "MAX", "SAMPLE"] {
+        assert_empty_group_agg(agg);
+    }
+}
+
+/// A group mixing bound and unbound rows must aggregate over the bound ones
+/// only. This is the case that pins the `NULL_ID` filter: an unbound row sorts
+/// below every real term in the ORDER BY ordering, so without the filter MIN
+/// would hand back the unbound row instead of the smallest actual value.
+fn assert_mixed_group_agg(agg: &str, expected: &[&str]) {
+    // alice knows two people, but only bob has an age - so alice's group has
+    // one bound row and one unbound row.
+    let mut store = store_from_nt(&format!(
+        "<{EX}alice> <{EX}knows> <{EX}bob> .\n\
+         <{EX}alice> <{EX}knows> <{EX}dave> .\n\
+         <{EX}bob> <{EX}age> \"25\"^^<{XSD_INT}> .\n"
+    ));
+    let engine = HybridEngine::new();
+    let q = format!(
+        "SELECT ?a ({agg}(?age) AS ?out) WHERE {{ ?a <{EX}knows> ?b \
+         OPTIONAL {{ ?b <{EX}age> ?age }} }} GROUP BY ?a"
+    );
+    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    assert_eq!(rows.len(), 1, "one group: alice");
+    let v = rows[0]["out"]["value"].as_str().unwrap_or_else(|| {
+        panic!(
+            "{agg}: ?out must be bound, the group has a bound row; got {}",
+            rows[0]["out"]
+        )
+    });
+    assert!(
+        expected.contains(&v),
+        "{agg} over a mixed group returned {v}, expected one of {expected:?}"
+    );
+}
+
+#[test]
+fn aggregate_over_mixed_group_ignores_unbound_rows() {
+    for (agg, expected) in [
+        ("MIN", &["25"][..]),
+        ("MAX", &["25"][..]),
+        ("SAMPLE", &["25"][..]),
+    ] {
+        assert_mixed_group_agg(agg, expected);
     }
 }
