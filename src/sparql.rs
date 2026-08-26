@@ -949,6 +949,10 @@ fn eval_group(
                         )?);
                         continue;
                     }
+                    // Before agg_col, so it reports the right reason.
+                    if let AF::Custom(n) = name {
+                        return Err(format!("Aggregate <{}> is not supported", n.as_str()));
+                    }
                     let col = agg_col(expr, &vo)?;
                     let bound = || row_indices.iter().filter(|&&i| rows.row(i)[col] != NULL_ID);
                     match name {
@@ -1002,10 +1006,10 @@ fn eval_group(
                                 })
                                 .map_or(NULL_ID, |(id, _)| id)
                         }
-                        _ => {
-                            return Err(
-                                "Only COUNT, SUM, AVG, MIN, MAX, SAMPLE and GROUP_CONCAT are currently supported".to_string()
-                            );
+                        // Unreachable, but listed so a new spargebra aggregate
+                        // is a compile error rather than a silent fallthrough.
+                        AF::Sum | AF::Avg | AF::Custom(_) => {
+                            return Err("Unsupported aggregate".to_string());
                         }
                     }
                 }
