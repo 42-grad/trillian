@@ -1990,8 +1990,11 @@ fn classify(lex: &str, datatype: Option<&str>, lang: Option<&str>) -> Fv {
     }
     match datatype {
         None => Fv::Str(lex.to_string()),
-        Some(dt) if dt == format!("{XSD}string") => Fv::Str(lex.to_string()),
-        Some(dt) if dt == format!("{XSD}boolean") => Fv::Bool(lex == "true" || lex == "1"),
+        // strip_prefix, not format!: the guards ran on every row. With this, the compiler can optimize the string comparison to a single pointer comparison.
+        Some(dt) if dt.strip_prefix(XSD) == Some("string") => Fv::Str(lex.to_string()),
+        Some(dt) if dt.strip_prefix(XSD) == Some("boolean") => {
+            Fv::Bool(lex == "true" || lex == "1")
+        }
         Some(dt) if is_numeric_dt(dt) => match lex.parse::<f64>() {
             Ok(n) => Fv::Num(n),
             Err(_) => Fv::Typed(lex.to_string(), dt.to_string()),
@@ -2079,8 +2082,9 @@ enum TermKey {
 /// explicit `xsd:string` literal are the same term, so `xsd:string` collapses
 /// to "no datatype".
 fn lit_key(lexical: &str, datatype: Option<&str>, lang: Option<&str>) -> TermKey {
-    let xsd_string = format!("{XSD}string");
-    let dt = datatype.filter(|d| *d != xsd_string).map(str::to_string);
+    let dt = datatype
+        .filter(|d| d.strip_prefix(XSD) != Some("string"))
+        .map(str::to_string);
     TermKey::Lit(lexical.to_string(), dt, lang.map(str::to_string))
 }
 
