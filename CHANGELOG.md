@@ -18,6 +18,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Expression arguments for `SUM`/`AVG`** — `SUM(?v + 1)`. The others still
   need a bare variable, which is what lets them return the source term.
 
+### Changed
+- **Turning a term into a value no longer allocates twice per row** —
+  `classify()` and `lit_key()` (`src/sparql.rs`) built a constant datatype IRI
+  with `format!("{XSD}string")`/`boolean` on every call, just to compare it;
+  they now use `dt.strip_prefix(XSD)`, as `is_numeric_dt` already did. This sits
+  under every `FILTER`, `ORDER BY` and `BIND`. Measured over 200k typed integer
+  literals: `FILTER(?v > 0)` 336 → 161 ns/row (2.1x), the same filter with two
+  comparisons 591 → 241 ns/row (2.5x), `ORDER BY ?v` 369 → 229 ns/row (1.6x),
+  and `BIND(?v + 1)` 570 → 414 ns/row (1.4x). Behaviour is unchanged — both
+  forms test the same datatype IRI.
+
 ## [0.3.0] - 2026-08-01
 
 ### Added
