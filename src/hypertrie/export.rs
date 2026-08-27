@@ -25,11 +25,13 @@ pub fn export_ntriples(path: &str, triples: &[(&str, &str, &str)]) -> std::io::R
     writer.flush()
 }
 
+#[derive(Debug, Clone)]
 pub struct ParsedTerm {
     pub value: String,
     pub typ: TermType,
 }
 
+#[derive(Debug, Clone)]
 pub struct ParsedTriple {
     pub subject: ParsedTerm,
     pub predicate: ParsedTerm,

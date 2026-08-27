@@ -54,14 +54,15 @@ async fn main() {
     }
 }
 
-/// Loader: read N-Triples, build the index, persist it as an mmap snapshot.
+/// Loader: read the RDF input (.nt or .ttl), build the index, persist it as
+/// an mmap snapshot.
 fn build_snapshot(nt: &str, snapshot: &str) {
     println!("Building index from {} ...", nt);
     let t0 = Instant::now();
     let mut store = TripleStore::new();
     let n = store
-        .ingest_ntriples_file(nt)
-        .expect("Failed to parse .nt file");
+        .ingest_rdf_file(nt)
+        .expect("Failed to parse the RDF input file");
     store
         .save_snapshot(snapshot)
         .expect("Failed to write snapshot");
@@ -104,8 +105,8 @@ fn profile(nt: &str, query_file: &str, runs: usize) {
     let mut store = TripleStore::new();
     let t0 = Instant::now();
     let n = store
-        .ingest_ntriples_file(nt)
-        .expect("Failed to parse .nt file");
+        .ingest_rdf_file(nt)
+        .expect("Failed to parse the RDF input file");
     println!(
         "Loaded (in-RAM): {} triples, {} terms in {} ms\n",
         n,
@@ -119,13 +120,14 @@ fn profile(nt: &str, query_file: &str, runs: usize) {
     profile_query(&store, &engine, &query, runs);
 }
 
-/// Default: parse N-Triples, build the index, serve (without a snapshot).
+/// Default: parse the RDF input (.nt or .ttl), build the index, serve (without
+/// a snapshot).
 async fn parse_and_serve(nt: &str, port: u16) {
-    println!("Loading N-Triples file: {}", nt);
+    println!("Loading RDF file: {}", nt);
     let mut store = TripleStore::new();
     let n_triples = store
-        .ingest_ntriples_file(nt)
-        .expect("Failed to parse .nt file");
+        .ingest_rdf_file(nt)
+        .expect("Failed to parse the RDF input file");
     println!(
         "Ingested {} triples, {} unique terms",
         n_triples,

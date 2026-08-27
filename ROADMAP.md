@@ -33,8 +33,11 @@ open an issue first to agree on the approach (see [CONTRIBUTING.md](CONTRIBUTING
 
 ## Data model & I/O
 
-- Turtle (`.ttl`) input in addition to N-Triples.
-- Quoted/escaped literal coverage beyond the current benchmark needs.
+- Full RFC 3986 reference resolution in the Turtle parser. `@base` plus a
+  protocol-relative `<//host/path>` currently keeps the base authority
+  (`http://example.org//host/path`) instead of replacing it (`http://host/path`).
+  The absolute, empty, fragment, absolute-path and relative-path forms are
+  handled; only the `//authority` one is not.
 
 ## Tooling
 

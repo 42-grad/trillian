@@ -62,6 +62,7 @@ contribution to open, sovereign, and sustainable data infrastructure.
   and `GROUP_CONCAT` is `""`, while `MIN`/`MAX`/`SAMPLE` are unbound.
 - **Property paths**: `/ ^ | * + ?` and negated property sets
 - IRIs, typed/`@lang` literals, blank nodes; `INSERT DATA`/`DELETE DATA`
+- **Input formats**: N-Triples (`.nt`, streaming) and Turtle (`.ttl`)
 
 Not yet supported (but planned): sub-`SELECT`, and `BIND` together with
 `?infer=rdfs`.
@@ -91,8 +92,8 @@ curl -G 'http://localhost:9090/sparql' \
 cargo build --release --bin server     # builds the `server` binary
 cargo test                             # runs the suite
 
-# Build an index from N-Triples, persist it, then serve it:
-./target/release/server build data.nt /tmp/data.bin
+# Build an index from N-Triples or Turtle, persist it, then serve it:
+./target/release/server build data.nt /tmp/data.bin   # or data.ttl
 ./target/release/server load  /tmp/data.bin 9090
 ```
 
