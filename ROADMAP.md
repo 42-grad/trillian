@@ -17,14 +17,10 @@ open an issue first to agree on the approach (see [CONTRIBUTING.md](CONTRIBUTING
 
 ## Storage & performance
 
-- Stop allocating per row when a term becomes a value: `classify()`
-  (`src/sparql.rs`) builds two constant `String`s per call in its
-  `format!("{XSD}string")`/`boolean` guards, and `decode_type`
+- Stop allocating per row when a term becomes a value: `decode_type`
   (`src/hypertrie/dictionary.rs`) allocates the datatype IRI for every
-  `D`-prefixed key — together ~102 ns of the ~139 ns each `term_to_fv` on a
-  typed numeric literal costs, under every `FILTER`, `ORDER BY`, `BIND` and
-  aggregate. Fix the guards with `dt.strip_prefix(XSD)` as `is_numeric_dt`
-  does; `decode_type` needs a borrowed/`Cow` term type.
+  `D`-prefixed key, under every `FILTER`, `ORDER BY`, `BIND` and aggregate.
+  It needs a borrowed/`Cow` term type.
 - Derive `pred_subjects` on demand from the index (the last predicate-keyed list
   still held in owned RAM), or back it by a `BTreeSet` for O(log n) deletes.
 - WAL checkpointing / snapshot rotation.
