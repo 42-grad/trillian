@@ -4,17 +4,19 @@ const supported = [
   "Basic graph patterns, OPTIONAL (left joins), UNION",
   "FILTER — 3-valued logic: comparisons, && / || / !, BOUND, arithmetic, IN, IF",
   "String functions: STR, LANG, DATATYPE, STRLEN, UCASE, LCASE, CONTAINS, STRSTARTS, STRENDS",
+  "REGEX in FILTER, with the i / s / m flags",
   "isIRI / isLiteral / isNumeric / isBlank type checks",
   "ORDER BY (type-aware: numeric before lexical), with LIMIT / DISTINCT",
+  "BIND",
+  "Aggregation: GROUP BY / HAVING with COUNT, SUM, AVG, MIN, MAX, SAMPLE and GROUP_CONCAT",
   "Property paths: / ^ | * + ? and negated property sets",
   "IRIs, typed / @lang literals, blank nodes",
   "INSERT DATA / DELETE DATA via WAL",
 ];
 
 const planned = [
-  "BIND, sub-SELECT, and nested/multiple OPTIONAL patterns",
-  "Aggregation: GROUP BY with COUNT / SUM / MIN / MAX / AVG",
-  "REGEX in FILTER",
+  "Sub-SELECT, and nested/multiple OPTIONAL patterns",
+  "BIND combined with ?infer=rdfs",
   "Turtle (.ttl) input",
   "WAL checkpointing and snapshot rotation",
 ];

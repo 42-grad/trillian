@@ -869,6 +869,7 @@ fn eval_group(
     use rustc_hash::FxHashMap;
     use rustc_hash::FxHashSet;
     use spargebra::algebra::AggregateExpression as AE;
+    use spargebra::algebra::AggregateFunction as AF;
 
     // 1. Evaluate the inner pattern.
     let (rows, vo) = eval_where_mut(inner, store, engine, None)?;
@@ -928,10 +929,89 @@ fn eval_group(
                     };
                     intern_count(store, n)
                 }
-                _ => {
-                    return Err(
-                        "Only COUNT(*) / COUNT(DISTINCT *) are currently supported".to_string()
-                    );
+                AE::FunctionCall {
+                    name,
+                    expr,
+                    distinct,
+                } => {
+                    // SUM/AVG compute a fresh number instead of handing back a
+                    // term from the group, so they take any expression argument
+                    // rather than the bare column the others need.
+                    if matches!(name, AF::Sum | AF::Avg) {
+                        out_row.push(agg_sum_avg(
+                            expr,
+                            &rows,
+                            &vo,
+                            &row_indices,
+                            *distinct,
+                            matches!(name, AF::Avg),
+                            store,
+                        )?);
+                        continue;
+                    }
+                    // Before agg_col, so it reports the right reason.
+                    if let AF::Custom(n) = name {
+                        return Err(format!("Aggregate <{}> is not supported", n.as_str()));
+                    }
+                    let col = agg_col(expr, &vo)?;
+                    let bound = || row_indices.iter().filter(|&&i| rows.row(i)[col] != NULL_ID);
+                    match name {
+                        // COUNT(?x) counts the non-null values of ?x in the group; COUNT(DISTINCT ?x) counts only distinct non-null values.
+                        AF::Count => {
+                            let n = if *distinct {
+                                // Dictionary ids are one-to-one with terms, so
+                                // deduping ids is exactly term-distinctness.
+                                bound()
+                                    .map(|&i| rows.row(i)[col])
+                                    .collect::<FxHashSet<u32>>()
+                                    .len()
+                            } else {
+                                bound().count()
+                            };
+                            intern_count(store, n as i64)
+                        }
+                        // Joins the terms' lexical forms. Always a plain string, and
+                        // "" over an empty group rather than unbound.
+                        AF::GroupConcat { separator } => {
+                            let sep = separator.as_deref().unwrap_or(" ");
+                            let mut ids: Vec<u32> = bound().map(|&i| rows.row(i)[col]).collect();
+                            if *distinct {
+                                let mut seen = FxHashSet::default();
+                                ids.retain(|&id| seen.insert(id));
+                            }
+                            let joined = ids
+                                .iter()
+                                .filter_map(|&id| store.dict.resolve(id))
+                                .collect::<Vec<_>>()
+                                .join(sep);
+                            intern_fv(store, &Fv::Str(joined))
+                        }
+                        // SPARQL lets SAMPLE return any element, so take the first.
+                        AF::Sample => bound().next().map_or(NULL_ID, |&i| rows.row(i)[col]),
+                        AF::Min | AF::Max => {
+                            // By the ORDER BY ordering, not by id: ids follow interning
+                            // order, not value order.
+                            let want_max = matches!(name, AF::Max);
+                            bound()
+                                .map(|&i| {
+                                    (rows.row(i)[col], order_key(expr, rows.row(i), &vo, store))
+                                })
+                                .reduce(|best, cur| {
+                                    let ord = cmp_key(&cur.1, &best.1);
+                                    if ord.is_gt() == want_max && ord.is_ne() {
+                                        cur
+                                    } else {
+                                        best
+                                    }
+                                })
+                                .map_or(NULL_ID, |(id, _)| id)
+                        }
+                        // Unreachable, but listed so a new spargebra aggregate
+                        // is a compile error rather than a silent fallthrough.
+                        AF::Sum | AF::Avg | AF::Custom(_) => {
+                            return Err("Unsupported aggregate".to_string());
+                        }
+                    }
                 }
             };
             out_row.push(id);
@@ -977,6 +1057,80 @@ fn intern_fv(store: &mut TripleStore, fv: &Fv) -> u32 {
         .dict
         .lookup_term(&lex, &typ)
         .unwrap_or_else(|| store.dict.insert_with_type(&lex, typ))
+}
+
+/// Column read by a bare-variable aggregate argument, e.g. the `?v` in MIN(?v).
+///
+/// Every aggregate except SUM/AVG hands back (or splices together) a term taken
+/// straight out of the group, so restricting those to a variable lets them reuse
+/// that row's dictionary id and keep the source datatype, rather than interning
+/// a fresh term — which would coerce numerics to `xsd:double`. `MIN(?v + 1)` is
+/// therefore rejected. SUM/AVG intern a computed value anyway and accept any
+/// expression; they call this only to scope-check a bare variable.
+fn agg_col(expr: &Expression, vo: &[String]) -> Result<usize, String> {
+    match expr {
+        Expression::Variable(v) => vo
+            .iter()
+            .position(|x| x == v.as_str())
+            .ok_or_else(|| format!("aggregate variable ?{} is not in scope", v.as_str())),
+        _ => Err(
+            "COUNT, MIN, MAX, SAMPLE and GROUP_CONCAT take a bare variable argument".to_string(),
+        ),
+    }
+}
+
+/// Folds `SUM`/`AVG` over one group.
+///
+/// Both intern a computed number instead of returning a term from the group, so
+/// the argument may be any expression and the result is always `xsd:double`:
+/// `Fv::Num` is an `f64`, so the input datatypes are gone before the fold sees
+/// a value. A group with no contributors is `0`, as SPARQL 1.1 defines for both
+/// — unlike MIN/MAX/SAMPLE, which are unbound over an empty group.
+fn agg_sum_avg(
+    expr: &Expression,
+    rows: &RowBlock,
+    vo: &[String],
+    row_indices: &[usize],
+    distinct: bool,
+    avg: bool,
+    store: &mut TripleStore,
+) -> Result<u32, String> {
+    use rustc_hash::FxHashSet;
+
+    // A bare variable is still scope-checked, so a typo'd `SUM(?scr)` reports
+    // the same error as `MIN(?scr)` instead of silently summing to zero.
+    if matches!(expr, Expression::Variable(_)) {
+        agg_col(expr, vo)?;
+    }
+
+    let mut vals: Vec<f64> = Vec::with_capacity(row_indices.len());
+    for &i in row_indices {
+        // An unbound argument - or one whose evaluation errors - is simply not
+        // a contributor; a bound non-numeric one is a type error that makes the
+        // whole aggregate unbound.
+        if let Ok(fv) = eval(expr, rows.row(i), vo, store) {
+            match as_num(&fv) {
+                Some(n) => vals.push(n),
+                None => return Ok(NULL_ID),
+            }
+        }
+    }
+    if distinct {
+        // Value-distinct, not term-distinct as the other aggregates are: a
+        // computed argument has no term behind it to compare.
+        let mut seen = FxHashSet::default();
+        vals.retain(|n| seen.insert(n.to_bits()));
+    }
+    if vals.is_empty() {
+        return Ok(intern_count(store, 0));
+    }
+    let total: f64 = vals.iter().sum();
+    let n = if avg {
+        total / vals.len() as f64
+    } else {
+        total
+    };
+    Ok(intern_fv(store, &Fv::Num(n)))
 }
 
 // ---------------------------------------------------------------------------
