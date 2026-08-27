@@ -5,10 +5,15 @@ open an issue first to agree on the approach (see [CONTRIBUTING.md](CONTRIBUTING
 
 ## SPARQL features
 
-- Sub-`SELECT` and nested/multiple `OPTIONAL` patterns.
-- `BIND` combined with `?infer=rdfs` (currently rejected as "unsupported WHERE
-  pattern" — the RDFS rewrite path doesn't route through the write-locked
-  `eval_where_mut` that `BIND` needs).
+- `MINUS` and `VALUES` — both still reach the "unsupported WHERE pattern"
+  error in `eval_where` (`src/sparql.rs`).
+- Nested/multiple `OPTIONAL` patterns.
+- `BIND`, `GROUP BY` and aggregate sub-`SELECT`s combined with `?infer=rdfs`
+  (all currently rejected as "unsupported WHERE pattern"). One root cause: the
+  handlers skip the write path whenever `infer=rdfs` is set, so the RDFS
+  rewrite never routes through the write-locked `eval_where_mut` that interning
+  a computed value needs. Fixing it fixes all three — see the note on
+  `execute_sparql_infer` (`src/sparql.rs`).
 - Property-path edge cases: tighten result-count parity on the remaining
   WDBench paths/C2RPQ deviations (notably blank-node-bearing transitive paths).
 - Pipeline execution across `OPTIONAL`/`LeftJoin` so those classes get the same
@@ -17,14 +22,12 @@ open an issue first to agree on the approach (see [CONTRIBUTING.md](CONTRIBUTING
 
 ## Storage & performance
 
-- Stop allocating per row when a term becomes a value: `classify()`
-  (`src/sparql.rs`) builds two constant `String`s per call in its
-  `format!("{XSD}string")`/`boolean` guards, and `decode_type`
-  (`src/hypertrie/dictionary.rs`) allocates the datatype IRI for every
-  `D`-prefixed key — together ~102 ns of the ~139 ns each `term_to_fv` on a
-  typed numeric literal costs, under every `FILTER`, `ORDER BY`, `BIND` and
-  aggregate. Fix the guards with `dt.strip_prefix(XSD)` as `is_numeric_dt`
-  does; `decode_type` needs a borrowed/`Cow` term type.
+- Stop allocating per row when a term becomes a value: `decode_type`
+  (`src/hypertrie/dictionary.rs`) still allocates the datatype IRI for every
+  `D`-prefixed key and the language tag for every `G`-prefixed one, under every
+  `FILTER`, `ORDER BY`, `BIND` and aggregate. Needs a borrowed/`Cow` term type.
+  (The `classify()`/`lit_key()` half of this was fixed in #49 with
+  `dt.strip_prefix(XSD)`.)
 - Derive `pred_subjects` on demand from the index (the last predicate-keyed list
   still held in owned RAM), or back it by a `BTreeSet` for O(log n) deletes.
 - WAL checkpointing / snapshot rotation.

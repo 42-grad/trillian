@@ -157,6 +157,8 @@ pub async fn sparql_handler(
     let infer = params.infer.as_deref();
     // BIND may intern a newly computed value into the dictionary, so it needs
     // write access; everything else keeps the fully concurrent read lock.
+    // The `infer != rdfs` guard is what makes BIND/GROUP BY unsupported under
+    // inference — see [`execute_sparql_infer`].
     let result = if infer != Some("rdfs") && query_needs_write(&query_str) {
         let mut store = state.store.write().unwrap_or_else(|e| e.into_inner());
         execute_sparql_bind(&mut store, &state.engine, &query_str)
@@ -527,6 +529,13 @@ pub fn execute_sparql_bind(
 ///
 /// When `infer` is passed as a query parameter (e.g. `?infer=rdfs`) the HTTP
 /// handlers call this function automatically.
+///
+/// **Limitation**, tracked in ROADMAP under "SPARQL features": inference only
+/// routes through the read-locked [`eval_where`], so anything that must intern
+/// a computed value fails here with "unsupported WHERE pattern" — `BIND`,
+/// `GROUP BY`, and an aggregate sub-`SELECT` alike. One root cause: the callers
+/// skip the write path whenever `infer=rdfs` is set. Fixing that roadmap item
+/// fixes all three, so widen the tests along with it.
 pub fn execute_sparql_infer(
     store: &TripleStore,
     engine: &HybridEngine,
@@ -620,6 +629,12 @@ struct Modifiers<'a> {
 
 /// Peels Project/Distinct/Reduced/Slice/OrderBy off the algebra and returns the
 /// inner WHERE pattern (Bgp/Filter/LeftJoin/Join/Union) + the modifiers.
+///
+/// One query level nests its modifiers in a fixed order, outermost first:
+/// `Slice > Distinct/Reduced > Project > OrderBy`. Peeling therefore stops as
+/// soon as a node does not sit strictly deeper in that order than the last one
+/// peeled — such a node opens a **sub-`SELECT`**, whose modifiers belong to it
+/// and not to this level. [`eval_where`] evaluates it as its own query.
 fn peel_modifiers(pattern: &spargebra::algebra::GraphPattern) -> Modifiers<'_> {
     use spargebra::algebra::{GraphPattern as GP, OrderExpression};
     let mut projection = None;
@@ -628,7 +643,19 @@ fn peel_modifiers(pattern: &spargebra::algebra::GraphPattern) -> Modifiers<'_> {
     let mut limit = None;
     let mut offset = None;
     let mut cur = pattern;
+    let mut last_rank = -1i8;
     loop {
+        let rank = match cur {
+            GP::Slice { .. } => 0,
+            GP::Distinct { .. } | GP::Reduced { .. } => 1,
+            GP::Project { .. } => 2,
+            GP::OrderBy { .. } => 3,
+            _ => break,
+        };
+        if rank <= last_rank {
+            break; // start of a nested sub-SELECT
+        }
+        last_rank = rank;
         match cur {
             GP::Project { variables, inner } => {
                 projection = Some(variables.iter().map(|v| v.as_str().to_string()).collect());
@@ -713,8 +740,22 @@ fn eval_where(
             path,
             object,
         } => eval_path(store, subject, path, object),
+        // Sub-SELECT: evaluated as its own query, so what it does not project
+        // stays out of scope for the enclosing pattern.
+        GP::Project { .. }
+        | GP::Distinct { .. }
+        | GP::Reduced { .. }
+        | GP::Slice { .. }
+        | GP::OrderBy { .. } => {
+            let sub = peel_modifiers(gp);
+            // `limit` is non-None only for a whole-body sub-SELECT, whose
+            // rows map 1:1 onto the enclosing result -> the cap carries in.
+            let (rows, vo) = eval_where(sub.where_pat, store, engine, pushdown_rows(&sub, limit))?;
+            let r = apply_modifiers(&sub, rows, vo, store)?;
+            Ok((r.rows, r.var_order))
+        }
         _ => Err(
-            "Unsupported WHERE pattern (only BGP/FILTER/OPTIONAL/UNION/Join/Path; use the mutable API for BIND/GROUP BY)".to_string(),
+            "Unsupported WHERE pattern (only BGP/FILTER/OPTIONAL/UNION/Join/Path/sub-SELECT; use the mutable API for BIND/GROUP BY)".to_string(),
         ),
     }
 }
@@ -847,8 +888,22 @@ fn eval_where_mut(
             variables,
             aggregates,
         } => eval_group(inner, variables, aggregates, store, engine),
+        // Sub-SELECT: evaluated as its own query, so what it does not project
+        // stays out of scope for the enclosing pattern.
+        GP::Project { .. }
+        | GP::Distinct { .. }
+        | GP::Reduced { .. }
+        | GP::Slice { .. }
+        | GP::OrderBy { .. } => {
+            let sub = peel_modifiers(gp);
+            // `limit` is non-None only for a whole-body sub-SELECT, whose
+            // rows map 1:1 onto the enclosing result -> the cap carries in.
+            let (rows, vo) = eval_where_mut(sub.where_pat, store, engine, pushdown_rows(&sub, limit))?;
+            let r = apply_modifiers(&sub, rows, vo, store)?;
+            Ok((r.rows, r.var_order))
+        }
         _ => Err(
-            "Unsupported WHERE pattern (only BGP/FILTER/OPTIONAL/UNION/Join/Path/BIND/GROUP BY)"
+            "Unsupported WHERE pattern (only BGP/FILTER/OPTIONAL/UNION/Join/Path/BIND/GROUP BY/sub-SELECT)"
                 .to_string(),
         ),
     }
@@ -1640,21 +1695,37 @@ fn sort_rows(
     *rows = sorted;
 }
 
-fn evaluate_select_with_modifiers(
-    store: &TripleStore,
-    engine: &HybridEngine,
+/// How many rows the inner pattern must produce for `m`'s modifiers, or `None`
+/// if the full result is needed. `cap` is an outer row limit already known to
+/// be result-preserving for this result (see the sub-`SELECT` arm of
+/// [`eval_where`]); `None` means unlimited.
+fn pushdown_rows(m: &Modifiers, cap: Option<usize>) -> Option<usize> {
+    // ORDER BY needs the full sort, DISTINCT may need more raw rows for N
+    // distinct ones, GROUP BY the full groups -> nothing may be cut early.
+    if !m.order_by.is_empty() || m.distinct || contains_group(m.where_pat) {
+        return None;
+    }
+    // Both limits are counted from before OFFSET, so offset+limit rows suffice;
+    // apply_offset_limit trims exactly.
+    let offset = m.offset.unwrap_or(0);
+    let own = m.limit.map(|l| l.saturating_add(offset));
+    let outer = cap.map(|c| c.saturating_add(offset));
+    match (own, outer) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// Applies ORDER BY, projection, DISTINCT and OFFSET/LIMIT to an evaluated
+/// WHERE result. Shared by the top-level query path and by sub-`SELECT`s,
+/// which are the same modifier stack one level down.
+fn apply_modifiers(
     m: &Modifiers,
+    rows: RowBlock,
+    var_order: Vec<String>,
+    store: &TripleStore,
 ) -> Result<SelectResult, String> {
-    // LIMIT pushdown only if result-preserving: no ORDER BY (needs the full
-    // sort), no DISTINCT (may need more raw rows for N distinct ones), and no
-    // GROUP BY (needs the full groups to aggregate and possibly HAVING-filter).
-    // Then offset+limit rows suffice; apply_offset_limit trims exactly.
-    let pushdown = if m.order_by.is_empty() && !m.distinct && !contains_group(m.where_pat) {
-        m.limit.map(|l| l.saturating_add(m.offset.unwrap_or(0)))
-    } else {
-        None
-    };
-    let (mut rows, var_order) = eval_where(m.where_pat, store, engine, pushdown)?;
+    let mut rows = rows;
 
     // ORDER BY (on the full bindings, before projection).
     if !m.order_by.is_empty() {
@@ -1702,61 +1773,24 @@ fn evaluate_select_with_modifiers(
     })
 }
 
+fn evaluate_select_with_modifiers(
+    store: &TripleStore,
+    engine: &HybridEngine,
+    m: &Modifiers,
+) -> Result<SelectResult, String> {
+    let (rows, var_order) = eval_where(m.where_pat, store, engine, pushdown_rows(m, None))?;
+    apply_modifiers(m, rows, var_order, store)
+}
+
 /// Mutable twin of [`evaluate_select_with_modifiers`] for queries containing
-/// `BIND`, routed to [`eval_where_mut`] instead of [`eval_where`].
+/// `BIND` or `GROUP BY`, routed to [`eval_where_mut`] instead of [`eval_where`].
 fn evaluate_select_with_modifiers_mut(
     store: &mut TripleStore,
     engine: &HybridEngine,
     m: &Modifiers,
 ) -> Result<SelectResult, String> {
-    let pushdown = if m.order_by.is_empty() && !m.distinct && !contains_group(m.where_pat) {
-        m.limit.map(|l| l.saturating_add(m.offset.unwrap_or(0)))
-    } else {
-        None
-    };
-    let (mut rows, var_order) = eval_where_mut(m.where_pat, store, engine, pushdown)?;
-
-    if !m.order_by.is_empty() {
-        sort_rows(&mut rows, &var_order, &m.order_by, store);
-    }
-
-    let vars = m.projection.clone().unwrap_or_else(|| {
-        var_order
-            .iter()
-            .filter(|v| !v.starts_with("__bn_"))
-            .cloned()
-            .collect()
-    });
-    let mut var_indices = Vec::with_capacity(vars.len());
-    for var in &vars {
-        match var_order.iter().position(|v| v == var) {
-            Some(pos) => var_indices.push(pos),
-            None => {
-                return Err(format!(
-                    "SELECT variable ?{} does not appear in pattern",
-                    var
-                ));
-            }
-        }
-    }
-
-    let mut rows = rows.project(&var_indices);
-    let var_order = vars.clone();
-
-    if m.distinct {
-        if m.order_by.is_empty() {
-            rows.sort_distinct();
-        } else {
-            rows.dedup_preserving_order();
-        }
-    }
-    rows.apply_offset_limit(m.offset.unwrap_or(0), m.limit);
-
-    Ok(SelectResult {
-        vars,
-        rows,
-        var_order,
-    })
+    let (rows, var_order) = eval_where_mut(m.where_pat, store, engine, pushdown_rows(m, None))?;
+    apply_modifiers(m, rows, var_order, store)
 }
 
 fn variables_in_bgp(bgp: &[spargebra::term::TriplePattern]) -> Vec<String> {
@@ -3870,5 +3904,242 @@ mod tests {
         let rows = result["results"]["bindings"].as_array().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["ref"]["value"], "http://example.org/baseline");
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-SELECT
+    // -----------------------------------------------------------------------
+
+    /// Sub-SELECT store: bob knows three people, alice knows only bob. The
+    /// lopsided fan-out lets a LIMIT inside the sub-SELECT change which
+    /// subjects survive, which is what the scoping tests below turn on.
+    fn subselect_store() -> TripleStore {
+        let mut store = TripleStore::new();
+        store.ingest_str_triples(&[
+            (
+                "http://example.org/bob",
+                "http://example.org/knows",
+                "http://example.org/c1",
+            ),
+            (
+                "http://example.org/bob",
+                "http://example.org/knows",
+                "http://example.org/c2",
+            ),
+            (
+                "http://example.org/bob",
+                "http://example.org/knows",
+                "http://example.org/c3",
+            ),
+            (
+                "http://example.org/alice",
+                "http://example.org/knows",
+                "http://example.org/bob",
+            ),
+            ("http://example.org/bob", "http://example.org/age", "25"),
+        ]);
+        store
+    }
+
+    #[test]
+    fn subselect_projects_and_keeps_duplicates() {
+        let store = subselect_store();
+        let rows = rows_of(
+            &store,
+            "SELECT ?s WHERE { { SELECT ?s WHERE { ?s <http://example.org/knows> ?o } } }",
+        );
+        // No DISTINCT anywhere: bob keeps one row per person he knows.
+        let mut got = values_of(&rows, "s");
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![
+                "http://example.org/alice",
+                "http://example.org/bob",
+                "http://example.org/bob",
+                "http://example.org/bob",
+            ]
+        );
+    }
+
+    /// The outer projection must survive the sub-SELECT's own. Both levels
+    /// carry a `Project` node, so peeling has to stop at the boundary instead
+    /// of overwriting the outer variable list with the inner one.
+    #[test]
+    fn subselect_does_not_override_outer_projection() {
+        let store = subselect_store();
+        let rows = rows_of(
+            &store,
+            "SELECT ?s WHERE { { SELECT * WHERE { ?s <http://example.org/knows> ?o } } }",
+        );
+        assert_eq!(rows.len(), 4);
+        for r in &rows {
+            assert!(r.get("s").is_some());
+            assert!(r.get("o").is_none(), "?o is projected away by SELECT ?s");
+        }
+    }
+
+    /// A variable the sub-SELECT does not project is out of scope outside it,
+    /// so the outer pattern may reuse the name for an unrelated binding.
+    #[test]
+    fn subselect_hides_unprojected_variable() {
+        let store = subselect_store();
+        let rows = rows_of(
+            &store,
+            "SELECT ?s ?o WHERE { \
+             { SELECT ?s WHERE { ?s <http://example.org/knows> ?o } } \
+             ?s <http://example.org/age> ?o }",
+        );
+        // Only bob has an age; he appears three times in the sub-result.
+        assert_eq!(rows.len(), 3);
+        assert_eq!(values_of(&rows, "o"), vec!["25", "25", "25"]);
+    }
+
+    /// The sub-SELECT's LIMIT must be applied to *its* result, before the
+    /// outer DISTINCT — not hoisted to the outer level, where DISTINCT would
+    /// collapse the rows first and change the answer.
+    #[test]
+    fn subselect_limit_applies_before_outer_distinct() {
+        let store = subselect_store();
+        // ORDER BY ?o over {bob, c1, c2, c3} -> first two rows are
+        // (alice, bob) and (bob, c1) -> DISTINCT ?s keeps both subjects.
+        let rows = rows_of(
+            &store,
+            "SELECT DISTINCT ?s WHERE { \
+             { SELECT ?s ?o WHERE { ?s <http://example.org/knows> ?o } ORDER BY ?o LIMIT 2 } }",
+        );
+        let mut got = values_of(&rows, "s");
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec!["http://example.org/alice", "http://example.org/bob"]
+        );
+    }
+
+    #[test]
+    fn subselect_order_by_with_limit_and_offset() {
+        let store = subselect_store();
+        let rows = rows_of(
+            &store,
+            "SELECT ?o WHERE { \
+             { SELECT ?o WHERE { ?s <http://example.org/knows> ?o } ORDER BY ?o LIMIT 2 OFFSET 1 } }",
+        );
+        assert_eq!(
+            values_of(&rows, "o"),
+            vec!["http://example.org/c1", "http://example.org/c2"]
+        );
+    }
+
+    /// An outer LIMIT over a whole-body sub-SELECT is pushed down as a row cap;
+    /// the sub-SELECT's ORDER BY must still see every row.
+    #[test]
+    fn outer_limit_over_subselect_still_orders_fully() {
+        let store = subselect_store();
+        let rows = rows_of(
+            &store,
+            "SELECT ?o WHERE { \
+             { SELECT ?o WHERE { ?s <http://example.org/knows> ?o } ORDER BY ?o } } LIMIT 2 OFFSET 1",
+        );
+        assert_eq!(
+            values_of(&rows, "o"),
+            vec!["http://example.org/c1", "http://example.org/c2"]
+        );
+    }
+
+    #[test]
+    fn subselect_nested_two_levels() {
+        let store = subselect_store();
+        let rows = rows_of(
+            &store,
+            "SELECT ?s WHERE { { SELECT DISTINCT ?s WHERE { \
+             { SELECT ?s WHERE { ?s <http://example.org/knows> ?o } } } ORDER BY ?s } }",
+        );
+        assert_eq!(
+            values_of(&rows, "s"),
+            vec!["http://example.org/alice", "http://example.org/bob"]
+        );
+    }
+
+    #[test]
+    fn subselect_as_union_branch() {
+        let store = subselect_store();
+        let rows = rows_of(
+            &store,
+            "SELECT ?s WHERE { \
+             { SELECT ?s WHERE { ?s <http://example.org/age> ?a } } \
+             UNION { ?s <http://example.org/knows> <http://example.org/bob> } }",
+        );
+        let mut got = values_of(&rows, "s");
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec!["http://example.org/alice", "http://example.org/bob"]
+        );
+    }
+
+    #[test]
+    fn subselect_on_the_right_of_optional() {
+        let store = subselect_store();
+        let rows = rows_of(
+            &store,
+            "SELECT ?s ?o WHERE { \
+             ?s <http://example.org/knows> <http://example.org/bob> \
+             OPTIONAL { { SELECT ?o WHERE { ?x <http://example.org/knows> ?o } ORDER BY ?o LIMIT 1 } } }",
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["s"]["value"], "http://example.org/alice");
+        assert_eq!(rows[0]["o"]["value"], "http://example.org/bob");
+    }
+
+    /// The motivating case for sub-SELECT: aggregate in the inner query, then
+    /// join the aggregate back against the graph — impossible without it.
+    #[test]
+    fn subselect_aggregate_joins_back_against_the_graph() {
+        let mut store = subselect_store();
+        let engine = HybridEngine::new();
+        let query = "SELECT ?s ?c ?age WHERE { \
+                     { SELECT ?s (COUNT(*) AS ?c) WHERE { ?s <http://example.org/knows> ?o } \
+                       GROUP BY ?s } \
+                     ?s <http://example.org/age> ?age }";
+        let result: Value =
+            serde_json::from_str(&execute_sparql_bind(&mut store, &engine, query).unwrap())
+                .unwrap();
+        let rows = result["results"]["bindings"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "only bob has an age");
+        assert_eq!(rows[0]["s"]["value"], "http://example.org/bob");
+        assert_eq!(rows[0]["c"]["value"], "3");
+        assert_eq!(rows[0]["age"]["value"], "25");
+    }
+
+    /// HAVING-style filtering on an aggregate from the enclosing query.
+    #[test]
+    fn subselect_aggregate_filtered_from_outside() {
+        let mut store = subselect_store();
+        let engine = HybridEngine::new();
+        let query = "SELECT ?s WHERE { \
+                     { SELECT ?s (COUNT(*) AS ?c) WHERE { ?s <http://example.org/knows> ?o } \
+                       GROUP BY ?s } \
+                     FILTER(?c > 1) }";
+        let result: Value =
+            serde_json::from_str(&execute_sparql_bind(&mut store, &engine, query).unwrap())
+                .unwrap();
+        let rows = result["results"]["bindings"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["s"]["value"], "http://example.org/bob");
+    }
+
+    /// A sub-SELECT containing BIND/GROUP BY must route the whole query to the
+    /// write-locked path, since the computed values still need interning.
+    #[test]
+    fn query_needs_write_sees_through_subselect() {
+        assert!(query_needs_write(
+            "SELECT ?y WHERE { { SELECT ?y WHERE { ?s ?p ?a BIND(?a + 1 AS ?y) } } }"
+        ));
+        assert!(query_needs_write(
+            "SELECT ?c WHERE { { SELECT (COUNT(*) AS ?c) WHERE { ?s ?p ?o } } }"
+        ));
+        assert!(!query_needs_write(
+            "SELECT ?s WHERE { { SELECT ?s WHERE { ?s ?p ?o } LIMIT 1 } }"
+        ));
     }
 }
