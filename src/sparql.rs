@@ -635,6 +635,9 @@ struct Modifiers<'a> {
 /// soon as a node does not sit strictly deeper in that order than the last one
 /// peeled — such a node opens a **sub-`SELECT`**, whose modifiers belong to it
 /// and not to this level. [`eval_where`] evaluates it as its own query.
+///
+/// This assumes spargebra emits a `Project` for every `SELECT`, `SELECT *`
+/// included, so both sides of a boundary always reach `Project`'s rank.
 fn peel_modifiers(pattern: &spargebra::algebra::GraphPattern) -> Modifiers<'_> {
     use spargebra::algebra::{GraphPattern as GP, OrderExpression};
     let mut projection = None;
@@ -4141,5 +4144,47 @@ mod tests {
         assert!(!query_needs_write(
             "SELECT ?s WHERE { { SELECT ?s WHERE { ?s ?p ?o } LIMIT 1 } }"
         ));
+    }
+
+    /// An outer `SELECT *` resolves against the sub-`SELECT`'s projection, not
+    /// the inner BGP: `?o` is out of scope, so `*` must not pick it up.
+    #[test]
+    fn outer_select_star_resolves_against_subselect_projection() {
+        let store = subselect_store();
+        let rows = rows_of(
+            &store,
+            "SELECT * WHERE { \
+             { SELECT DISTINCT ?s WHERE { ?s <http://example.org/knows> ?o } } }",
+        );
+        let mut got = values_of(&rows, "s");
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec!["http://example.org/alice", "http://example.org/bob"]
+        );
+        for r in &rows {
+            assert!(
+                r.get("o").is_none(),
+                "?o is out of scope outside the sub-SELECT"
+            );
+        }
+    }
+
+    /// Both levels carry a `Slice`, and `SELECT *` gives the outer one nothing
+    /// but its `Project`. The inner LIMIT must not overwrite the outer one.
+    #[test]
+    fn outer_select_star_keeps_its_own_limit_over_subselect() {
+        let store = subselect_store();
+        // Inner: ORDER BY ?o LIMIT 3 -> bob, c1, c2. Outer LIMIT 2 -> bob, c1.
+        let rows = rows_of(
+            &store,
+            "SELECT * WHERE { \
+             { SELECT ?o WHERE { ?s <http://example.org/knows> ?o } ORDER BY ?o LIMIT 3 } \
+             } LIMIT 2",
+        );
+        assert_eq!(
+            values_of(&rows, "o"),
+            vec!["http://example.org/bob", "http://example.org/c1"]
+        );
     }
 }

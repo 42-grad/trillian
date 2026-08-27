@@ -9,13 +9,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 - **Sub-`SELECT`** — a nested `SELECT` inside the `WHERE` clause
   (`src/sparql.rs`), with its own `DISTINCT`, `ORDER BY`, `LIMIT`/`OFFSET` and
-  `GROUP BY`, joined against the enclosing pattern and nestable to any depth.
+  `GROUP BY`, joined against the enclosing pattern and nestable.
   Variables the sub-`SELECT` does not project are out of scope outside it, so
   the enclosing pattern may reuse those names. This closes the gap that made
   aggregates hard to use: an aggregate computed in the inner query can now be
   filtered and joined back against the graph
-  `{ SELECT ?s (COUNT(*) AS ?c) WHERE { ?s :knows ?o } GROUP BY ?s }
-  FILTER(?c > 1) . ?s rdfs:label ?label`). Works under `?infer=rdfs` too.
+  (`{ SELECT ?s (COUNT(*) AS ?c) WHERE { ?s :knows ?o } GROUP BY ?s }
+  FILTER(?c > 1) . ?s rdfs:label ?label`). A plain sub-`SELECT` works under
+  `?infer=rdfs` too; one containing `GROUP BY` does not yet — see ROADMAP.
 - **The remaining `GROUP BY` aggregates** — `COUNT(?x)`, `SUM`, `AVG`, `MIN`,
   `MAX`, `SAMPLE` and `GROUP_CONCAT` (with `SEPARATOR`), each accepting
   `DISTINCT` (`src/sparql.rs`); the "not supported" error from 0.3.0 is gone.

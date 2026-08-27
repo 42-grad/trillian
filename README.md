@@ -77,8 +77,8 @@ contribution to open, sovereign, and sustainable data infrastructure.
   ```
 - IRIs, typed/`@lang` literals, blank nodes; `INSERT DATA`/`DELETE DATA`
 
-Not yet supported (but planned): `MINUS`, `VALUES`, and `BIND` together with
-`?infer=rdfs`.
+Not yet supported (but planned): `MINUS`, `VALUES`, and `BIND`, `GROUP BY` or an
+aggregate sub-`SELECT` together with `?infer=rdfs`.
 
 ### Inference (RDFS backward chaining)
 
