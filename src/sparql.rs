@@ -847,7 +847,6 @@ fn eval_where_mut(
         } => {
             let (lr, lvo) = eval_where_mut(left, store, engine, None)?;
             let (rr, rvo) = eval_where_mut(right, store, engine, None)?;
-            let expression = expression.clone();
             hash_join(lr, &lvo, rr, &rvo, true, expression.as_ref(), store)
         }
         GP::Join { left, right } => {
@@ -1568,24 +1567,53 @@ fn hash_join(
     }
 
     let mut out = RowBlock::new(new_var_order.len());
-    let mut merged: Vec<u32> = Vec::with_capacity(new_var_order.len());
-    // A match that fails `on` does not count, so the left row still falls
-    // through to the unbound-padded branch below.
-    let keeps = |merged: &[u32]| match on {
-        Some(e) => ebv(e, merged, &new_var_order, store) == Ok(true),
-        None => true,
+
+    // Unfiltered fast path: every hit is a match, so no merged row is built.
+    let Some(on) = on else {
+        for row in left.rows() {
+            let key: Vec<u32> = shared.iter().map(|&(lp, _)| row[lp]).collect();
+            match index.get(&key) {
+                Some(&(count, ref flat)) => {
+                    if new_arity == 0 {
+                        // Match with no new columns -> one row per right hit.
+                        for _ in 0..count {
+                            out.push_row_padded(row, NULL_ID);
+                        }
+                    } else {
+                        for chunk in flat.chunks(new_arity) {
+                            out.push_row_concat(row, chunk);
+                        }
+                    }
+                }
+                None => {
+                    if left_outer {
+                        out.push_row_padded(row, NULL_ID);
+                    }
+                }
+            }
+            if out.n_rows() > cap {
+                return Err(op_too_large());
+            }
+        }
+        return Ok((out, new_var_order));
     };
+
+    // Filtered (`OPTIONAL { ... FILTER(...) }`): `on` is evaluated on the merged
+    // row, and a match that fails it does not count — the left row then falls
+    // through to the unbound-padded branch rather than being dropped.
+    let mut merged: Vec<u32> = Vec::with_capacity(new_var_order.len());
+    let keeps = |merged: &[u32]| ebv(on, merged, &new_var_order, store) == Ok(true);
     for row in left.rows() {
         let key: Vec<u32> = shared.iter().map(|&(lp, _)| row[lp]).collect();
         let mut matched = false;
         if let Some(&(count, ref flat)) = index.get(&key) {
             if new_arity == 0 {
-                // Match with no new columns -> one row per right hit.
+                // Every hit merges to the same row -> one `on` check for all.
                 if keeps(row) {
                     for _ in 0..count {
                         out.push_row_padded(row, NULL_ID);
                     }
-                    matched = count > 0;
+                    matched = true;
                 }
             } else {
                 for chunk in flat.chunks(new_arity) {

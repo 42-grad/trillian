@@ -29,6 +29,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   need a bare variable, which is what lets them return the source term.
 
 ### Changed
+- **`hash_join` splits its unfiltered and filtered paths** (`src/sparql.rs`).
+  Applying an `OPTIONAL` filter needs the merged left++right row, and building
+  it in the shared loop would have cost every plain `Join` and every
+  filter-free `OPTIONAL` two extra row copies per output row. The unfiltered
+  case is now its own loop that never builds it. Measured on a 2M-triple
+  synthetic graph (`COUNT(*)`, so serialization is excluded, best-of-5 over 5
+  rounds): a `Join` 197 → 150 ms and an `OPTIONAL` without a filter
+  104 → 80 ms, level with the cost before the filter fix below. Plain
+  multi-pattern BGPs go through the WCOJ engine and never touch `hash_join`.
 - **Turning a term into a value no longer allocates twice per row** —
   `classify()` and `lit_key()` (`src/sparql.rs`) built a constant datatype IRI
   with `format!("{XSD}string")`/`boolean` on every call, just to compare it;
