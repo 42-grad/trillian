@@ -61,11 +61,25 @@ contribution to open, sovereign, and sustainable data infrastructure.
   `COUNT`, `SUM` and `AVG` are `0` (an `xsd:integer`, as SPARQL 1.1 defines)
   and `GROUP_CONCAT` is `""`, while `MIN`/`MAX`/`SAMPLE` are unbound.
 - **Property paths**: `/ ^ | * + ?` and negated property sets
+- **Sub-`SELECT`** — a nested `SELECT` in the `WHERE` clause, with its own
+  `DISTINCT`/`ORDER BY`/`LIMIT`/`OFFSET` and `GROUP BY`, joined against the
+  enclosing pattern. Variables it does not project are out of scope outside it,
+  so the enclosing pattern may reuse those names. This is what lets an
+  aggregate be joined back against the graph — "entities with more than *n*
+  links, plus their labels":
+
+  ```sparql
+  SELECT ?s ?c ?label WHERE {
+    { SELECT ?s (COUNT(*) AS ?c) WHERE { ?s :knows ?o } GROUP BY ?s }
+    FILTER(?c > 1)
+    ?s rdfs:label ?label
+  }
+  ```
 - IRIs, typed/`@lang` literals, blank nodes; `INSERT DATA`/`DELETE DATA`
 - **Input formats**: N-Triples (`.nt`, streaming) and Turtle (`.ttl`)
 
-Not yet supported (but planned): sub-`SELECT`, and `BIND` together with
-`?infer=rdfs`.
+Not yet supported (but planned): `MINUS`, `VALUES`, and `BIND`, `GROUP BY` or an
+aggregate sub-`SELECT` together with `?infer=rdfs`.
 
 ### Inference (RDFS backward chaining)
 

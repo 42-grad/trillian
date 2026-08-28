@@ -7,6 +7,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Sub-`SELECT`** — a nested `SELECT` inside the `WHERE` clause
+  (`src/sparql.rs`), with its own `DISTINCT`, `ORDER BY`, `LIMIT`/`OFFSET` and
+  `GROUP BY`, joined against the enclosing pattern and nestable.
+  Variables the sub-`SELECT` does not project are out of scope outside it, so
+  the enclosing pattern may reuse those names. This closes the gap that made
+  aggregates hard to use: an aggregate computed in the inner query can now be
+  filtered and joined back against the graph
+  (`{ SELECT ?s (COUNT(*) AS ?c) WHERE { ?s :knows ?o } GROUP BY ?s }
+  FILTER(?c > 1) . ?s rdfs:label ?label`). A plain sub-`SELECT` works under
+  `?infer=rdfs` too; one containing `GROUP BY` does not yet — see ROADMAP.
 - **The remaining `GROUP BY` aggregates** — `COUNT(?x)`, `SUM`, `AVG`, `MIN`,
   `MAX`, `SAMPLE` and `GROUP_CONCAT` (with `SEPARATOR`), each accepting
   `DISTINCT` (`src/sparql.rs`); the "not supported" error from 0.3.0 is gone.
@@ -27,15 +37,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   parser from the extension. The `server` binary now takes either format
   wherever it took `.nt`.
 
-### Fixed
-- **Non-ASCII literals were silently corrupted on ingest**
-  (`src/hypertrie/export.rs`). `parse_quoted_string` walked `s.as_bytes()` and
-  did `bytes[i] as char`, reading each UTF-8 byte as a Latin-1 codepoint, so
-  `"café"` loaded as `"cafÃ©"` — no error, and every existing test was ASCII.
-  Parsing now iterates characters, and the escapes the old code missed (`\'`,
-  `\b`, `\f`) are supported; `escape_literal` emits `\b`/`\f` so serialization
-  round-trips.
-
 ### Changed
 - **Turning a term into a value no longer allocates twice per row** —
   `classify()` and `lit_key()` (`src/sparql.rs`) built a constant datatype IRI
@@ -46,6 +47,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   comparisons 591 → 241 ns/row (2.5x), `ORDER BY ?v` 369 → 229 ns/row (1.6x),
   and `BIND(?v + 1)` 570 → 414 ns/row (1.4x). Behaviour is unchanged — both
   forms test the same datatype IRI.
+
+### Fixed
+- **Non-ASCII literals were silently corrupted on ingest**
+  (`src/hypertrie/export.rs`). `parse_quoted_string` walked `s.as_bytes()` and
+  did `bytes[i] as char`, reading each UTF-8 byte as a Latin-1 codepoint, so
+  `"café"` loaded as `"cafÃ©"` — no error, and every existing test was ASCII.
+  Parsing now iterates characters, and the escapes the old code missed (`\'`,
+  `\b`, `\f`) are supported; `escape_literal` emits `\b`/`\f` so serialization
+  round-trips.
+- **A sub-`SELECT`'s modifiers no longer leak to the enclosing query.**
+  `peel_modifiers` walked the whole `Slice`/`Distinct`/`Project`/`OrderBy`
+  chain in one loop, so on a nested modifier stack the inner `SELECT`'s
+  projection overwrote the outer one and its `LIMIT` was attributed to the
+  outer level. It now stops at the sub-`SELECT` boundary, detected by the fixed
+  `Slice > Distinct > Project > OrderBy` nesting order of one query level.
+  Present since before 0.3.0: a sub-`SELECT` forming the whole `WHERE` body
+  already reached evaluation, and answered with the *inner* projection —
+  `SELECT ?s WHERE { { SELECT * WHERE { ?s ?p ?o } } }` returned `?s`, `?p` and
+  `?o`. (A sub-`SELECT` joined with anything else errored out instead, so only
+  the whole-body form returned wrong results silently.)
 
 ## [0.3.0] - 2026-08-01
 
