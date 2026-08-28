@@ -190,6 +190,23 @@ fn optional_inner_filter_over_shared_variable_only() {
 }
 
 #[test]
+fn optional_inner_filter_is_the_join_condition_without_shared_vars() {
+    let store = optional_filter_store();
+    let engine = HybridEngine::new();
+    // No shared variable, so the FILTER *is* the join condition: without it the
+    // left join degenerates into a cross product.
+    let q = format!(
+        "SELECT ?b ?p ?age WHERE {{ <{EX}alice> <{EX}knows> ?b \
+         OPTIONAL {{ ?p <{EX}age> ?age FILTER(?p = ?b) }} }}"
+    );
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
+    assert_eq!(rows.len(), 2, "one row per knows-edge, not 2x2");
+    let got = ages_by_person(&rows);
+    assert_eq!(got["bob"], "25");
+    assert_eq!(got["carol"], "60");
+}
+
+#[test]
 fn optional_inner_filter_rejects_unsupported_expressions() {
     let store = optional_filter_store();
     let engine = HybridEngine::new();

@@ -69,7 +69,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   through and keeps the optional variables **unbound** rather than being
   dropped. A `FILTER` placed *after* the `OPTIONAL` is unaffected — it still
   filters the joined result, and that contrast is now covered by a test.
-
+  Because the expression is evaluated on the merged row, an `OPTIONAL` sharing
+  no variable with its left side now works as a non-equi join — the `FILTER`
+  *is* the join condition — where it previously produced a cross product:
+  `?b OPTIONAL { ?p :age ?age FILTER(?p = ?b) }` yields one row per `?b`.
 - **A `FILTER` inside `OPTIONAL` that Trillian cannot evaluate is now an error**
   (`src/sparql.rs`). `eval` reports an unsupported construct the same way it
   reports a type error — as an expression error — which a left join must read
