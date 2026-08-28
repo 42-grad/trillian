@@ -190,6 +190,35 @@ fn optional_inner_filter_over_shared_variable_only() {
 }
 
 #[test]
+fn optional_inner_filter_rejects_unsupported_expressions() {
+    let store = optional_filter_store();
+    let engine = HybridEngine::new();
+    // `eval` cannot do EXISTS, and a left join reads that error as "no match" —
+    // which would silently unbind every row. It has to be an error instead.
+    let q = format!(
+        "SELECT ?b ?age WHERE {{ <{EX}alice> <{EX}knows> ?b \
+         OPTIONAL {{ ?b <{EX}age> ?age FILTER EXISTS {{ ?b <{EX}age> ?a2 }} }} }}"
+    );
+    let err = execute_sparql(&store, &engine, &q).unwrap_err();
+    assert!(err.contains("EXISTS"), "unexpected error: {err}");
+}
+
+#[test]
+fn optional_inner_filter_accepts_supported_functions() {
+    let store = optional_filter_store();
+    let engine = HybridEngine::new();
+    // The unsupported-expression check must not reject what `eval` does handle.
+    let q = format!(
+        "SELECT ?b ?age WHERE {{ <{EX}alice> <{EX}knows> ?b \
+         OPTIONAL {{ ?b <{EX}age> ?age FILTER(STRLEN(STR(?age)) = 2 && ?age < 30) }} }}"
+    );
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
+    let got = ages_by_person(&rows);
+    assert_eq!(got["bob"], "25");
+    assert_eq!(got["carol"], "UNBOUND");
+}
+
+#[test]
 fn select_filter_numeric() {
     let store = social_store();
     let engine = HybridEngine::new();

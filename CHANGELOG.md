@@ -70,6 +70,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   dropped. A `FILTER` placed *after* the `OPTIONAL` is unaffected — it still
   filters the joined result, and that contrast is now covered by a test.
 
+- **A `FILTER` inside `OPTIONAL` that Trillian cannot evaluate is now an error**
+  (`src/sparql.rs`). `eval` reports an unsupported construct the same way it
+  reports a type error — as an expression error — which a left join must read
+  as "no match". `FILTER EXISTS`, `NOT EXISTS`, `COALESCE` and unimplemented
+  functions such as `ABS` would therefore have rejected every match and
+  returned each left row with the optional variables unbound, which looks like
+  a real answer. The left-join expression is now checked before the join and
+  rejected by name (`Unsupported expression in a FILTER inside OPTIONAL:
+  EXISTS`). The check is static, so a construct that runtime short-circuiting
+  would have skipped is still rejected. A top-level `FILTER` is unchanged —
+  it still drops rows it cannot evaluate.
+
 ## [0.3.0] - 2026-08-01
 
 ### Added

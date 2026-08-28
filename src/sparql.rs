@@ -1533,6 +1533,13 @@ fn hash_join(
     on: Option<&Expression>,
     store: &TripleStore,
 ) -> Result<(RowBlock, Vec<String>), String> {
+    // `eval` reports unsupported constructs as an error, which a left join reads
+    // as "no match" — that would silently unbind instead of failing. Reject up front.
+    if let Some(what) = on.and_then(unsupported_in_expr) {
+        return Err(format!(
+            "Unsupported expression in a FILTER inside OPTIONAL: {what}"
+        ));
+    }
     let cap = max_result_rows();
     let mut shared: Vec<(usize, usize)> = Vec::new(); // (left_pos, right_pos)
     let mut new_positions: Vec<usize> = Vec::new();
@@ -2599,6 +2606,58 @@ fn ebv(expr: &Expression, row: &[u32], vars: &[String], store: &TripleStore) -> 
         Fv::Num(n) => Ok(n != 0.0 && !n.is_nan()),
         Fv::Str(s) => Ok(!s.is_empty()),
         _ => Err(()),
+    }
+}
+
+/// Names the first construct in `expr` that `eval` cannot evaluate, if any.
+/// Conservative: a short-circuited operand still counts as used.
+fn unsupported_in_expr(expr: &Expression) -> Option<String> {
+    let any = |es: &[&Expression]| es.iter().copied().find_map(unsupported_in_expr);
+    match expr {
+        Expression::Exists(_) => Some("EXISTS".to_string()),
+        Expression::Coalesce(_) => Some("COALESCE".to_string()),
+        Expression::FunctionCall(f, args) => {
+            if matches!(
+                f,
+                Function::Str
+                    | Function::Lang
+                    | Function::Datatype
+                    | Function::StrLen
+                    | Function::UCase
+                    | Function::LCase
+                    | Function::Contains
+                    | Function::StrStarts
+                    | Function::StrEnds
+                    | Function::IsIri
+                    | Function::IsBlank
+                    | Function::IsLiteral
+                    | Function::IsNumeric
+                    | Function::Regex
+            ) {
+                any(&args.iter().collect::<Vec<_>>())
+            } else {
+                Some(f.to_string())
+            }
+        }
+        Expression::Or(a, b)
+        | Expression::And(a, b)
+        | Expression::Equal(a, b)
+        | Expression::SameTerm(a, b)
+        | Expression::Greater(a, b)
+        | Expression::GreaterOrEqual(a, b)
+        | Expression::Less(a, b)
+        | Expression::LessOrEqual(a, b)
+        | Expression::Add(a, b)
+        | Expression::Subtract(a, b)
+        | Expression::Multiply(a, b)
+        | Expression::Divide(a, b) => any(&[a, b]),
+        Expression::UnaryPlus(a) | Expression::UnaryMinus(a) | Expression::Not(a) => any(&[a]),
+        Expression::If(c, a, b) => any(&[c, a, b]),
+        Expression::In(e, list) => any(&[e]).or_else(|| any(&list.iter().collect::<Vec<_>>())),
+        Expression::NamedNode(_)
+        | Expression::Literal(_)
+        | Expression::Variable(_)
+        | Expression::Bound(_) => None,
     }
 }
 
