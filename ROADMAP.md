@@ -28,6 +28,17 @@ open an issue first to agree on the approach (see [CONTRIBUTING.md](CONTRIBUTING
   `FILTER`, `ORDER BY`, `BIND` and aggregate. Needs a borrowed/`Cow` term type.
   (The `classify()`/`lit_key()` half of this was fixed in #49 with
   `dt.strip_prefix(XSD)`.)
+- Drop the per-term UTF-8 validation on the read path: `MappedDict::key`
+  (`src/hypertrie/dictionary.rs`) runs `str::from_utf8` for every bound term of
+  every result row, re-proving what `from_mapped` already checks once over the
+  whole keys blob. Validating offset monotonicity and char boundaries at load
+  would let the hot path go back to unchecked. Measured against the pre-`0.2.0`
+  binary on 100k-row results: ~6% of query time, of which the ablation
+  attributes ~3-6% to this check.
+- Parse each query once: `query_needs_write` (`src/sparql.rs`) runs a full
+  spargebra parse before every request just to pick the read or write lock, so
+  every query is parsed twice. Parse once, inspect the algebra, then dispatch.
+  Single-digit µs per request, but on every `/sparql`, `/stream` and `/count`.
 - Derive `pred_subjects` on demand from the index (the last predicate-keyed list
   still held in owned RAM), or back it by a `BTreeSet` for O(log n) deletes.
 - WAL checkpointing / snapshot rotation.
@@ -36,7 +47,6 @@ open an issue first to agree on the approach (see [CONTRIBUTING.md](CONTRIBUTING
 
 ## Data model & I/O
 
-- Turtle (`.ttl`) input in addition to N-Triples.
 - Quoted/escaped literal coverage beyond the current benchmark needs.
 
 ## Tooling
