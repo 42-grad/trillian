@@ -1,7 +1,9 @@
 ---
 const supported = [
   "SELECT and ASK; projection, DISTINCT, LIMIT, OFFSET",
-  "Basic graph patterns, OPTIONAL (left joins), UNION",
+  "Basic graph patterns, OPTIONAL (left joins, with a FILTER inside the group), UNION",
+  "MINUS — subtracts the solutions a right-hand pattern is compatible with",
+  "VALUES — an inline table, as a group element or trailing the WHERE clause",
   "FILTER — 3-valued logic: comparisons, && / || / !, BOUND, arithmetic, IN, IF",
   "String functions: STR, LANG, DATATYPE, STRLEN, UCASE, LCASE, CONTAINS, STRSTARTS, STRENDS",
   "REGEX in FILTER, with the i / s / m flags",
@@ -9,14 +11,16 @@ const supported = [
   "ORDER BY (type-aware: numeric before lexical), with LIMIT / DISTINCT",
   "BIND",
   "Aggregation: GROUP BY / HAVING with COUNT, SUM, AVG, MIN, MAX, SAMPLE and GROUP_CONCAT",
+  "Sub-SELECT, with its own modifiers and GROUP BY, joined against the enclosing pattern",
   "Property paths: / ^ | * + ? and negated property sets",
   "IRIs, typed / @lang literals, blank nodes",
   "INSERT DATA / DELETE DATA via WAL",
 ];
 
 const planned = [
-  "Sub-SELECT, and nested/multiple OPTIONAL patterns",
-  "BIND combined with ?infer=rdfs",
+  "FILTER EXISTS / NOT EXISTS, COALESCE, and the unimplemented functions",
+  "UNDEF in VALUES, and nested/multiple OPTIONAL patterns",
+  "BIND, GROUP BY and VALUES combined with ?infer=rdfs",
   "Turtle (.ttl) input",
   "WAL checkpointing and snapshot rotation",
 ];

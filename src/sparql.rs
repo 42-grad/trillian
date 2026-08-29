@@ -56,6 +56,33 @@ impl AppState {
             cache.clear();
         }
     }
+
+    /// Whether `query_str` has to run under the write lock. Deciding needs the
+    /// dictionary, so the read lock is taken and released before upgrading.
+    fn needs_write(&self, query_str: &str) -> bool {
+        let store = self.store.read().unwrap_or_else(|e| e.into_inner());
+        query_needs_write(query_str, &store)
+    }
+
+    /// Runs `f` under the write lock and logs whatever it interned to the WAL
+    /// (see [`log_interned_since`]).
+    fn write_locked<T>(
+        &self,
+        f: impl FnOnce(&mut TripleStore) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
+        // Same order as `update_handler` takes the two locks.
+        let mut wal = self
+            .wal
+            .as_ref()
+            .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
+        let first_new_id = store.dict.len();
+        let result = f(&mut store);
+        if let Some(w) = wal.as_deref_mut() {
+            log_interned_since(&store, first_new_id, w)?;
+        }
+        result
+    }
 }
 
 /// Either lock guard on [`AppState::store`], for call sites (like
@@ -155,13 +182,11 @@ pub async fn sparql_handler(
     }
 
     let infer = params.infer.as_deref();
-    // BIND may intern a newly computed value into the dictionary, so it needs
-    // write access; everything else keeps the fully concurrent read lock.
-    // The `infer != rdfs` guard is what makes BIND/GROUP BY unsupported under
-    // inference — see [`execute_sparql_infer`].
-    let result = if infer != Some("rdfs") && query_needs_write(&query_str) {
-        let mut store = state.store.write().unwrap_or_else(|e| e.into_inner());
-        execute_sparql_bind(&mut store, &state.engine, &query_str)
+    // A query that can put an unknown term into the result needs write access;
+    // everything else keeps the fully concurrent read lock. The `infer != rdfs`
+    // guard is what makes those unsupported under inference.
+    let result = if infer != Some("rdfs") && state.needs_write(&query_str) {
+        state.write_locked(|store| execute_sparql_bind(store, &state.engine, &query_str))
     } else {
         let store = state.store.read().unwrap_or_else(|e| e.into_inner());
         if infer == Some("rdfs") {
@@ -201,21 +226,37 @@ pub async fn stream_handler(
     let infer = params.infer.clone();
 
     tokio::task::spawn_blocking(move || {
-        // BIND may intern a newly computed value into the dictionary, so it
-        // needs write access; everything else keeps the read lock.
-        let needs_write = infer.as_deref() != Some("rdfs") && query_needs_write(&query_str);
+        // A query that can put an unknown term into the result needs write access.
+        let needs_write = infer.as_deref() != Some("rdfs") && state.needs_write(&query_str);
         let mut guard = if needs_write {
             StoreGuard::Write(state.store.write().unwrap_or_else(|e| e.into_inner()))
         } else {
             StoreGuard::Read(state.store.read().unwrap_or_else(|e| e.into_inner()))
         };
-        let result = match &mut guard {
+        // Same lock order as `update_handler`. The guard has to outlive the
+        // serialization below, so `AppState::write_locked` does not fit here.
+        let mut wal = needs_write
+            .then(|| {
+                state
+                    .wal
+                    .as_ref()
+                    .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()))
+            })
+            .flatten();
+        let first_new_id = guard.as_ref().dict.len();
+        let mut result = match &mut guard {
             StoreGuard::Write(store) => evaluate_select_bind(store, &state.engine, &query_str),
             StoreGuard::Read(store) if infer.as_deref() == Some("rdfs") => {
                 evaluate_select_infer(store, &state.engine, &query_str)
             }
             StoreGuard::Read(store) => evaluate_select(store, &state.engine, &query_str),
         };
+        if let Some(w) = wal.as_deref_mut()
+            && let Err(e) = log_interned_since(guard.as_ref(), first_new_id, w)
+        {
+            result = Err(e);
+        }
+        drop(wal);
         let dict = &guard.as_ref().dict;
         match result {
             Ok(select) => {
@@ -277,9 +318,8 @@ pub async fn count_handler(
     }
 
     let infer = params.infer.as_deref();
-    let result = if infer != Some("rdfs") && query_needs_write(&query_str) {
-        let mut store = state.store.write().unwrap_or_else(|e| e.into_inner());
-        execute_count_bind(&mut store, &state.engine, &query_str)
+    let result = if infer != Some("rdfs") && state.needs_write(&query_str) {
+        state.write_locked(|store| execute_count_bind(store, &state.engine, &query_str))
     } else {
         let store = state.store.read().unwrap_or_else(|e| e.into_inner());
         if infer == Some("rdfs") {
@@ -345,14 +385,21 @@ fn normalize_query(query_param: Option<String>, body: String) -> String {
         .unwrap_or_else(|| body.trim().to_string())
 }
 
-/// Whether executing `query_str` may need write access to the store, i.e. it
-/// contains `BIND` (see [`contains_extend`]). A parse failure is reported by
-/// the normal (read-locked) execution path, so this conservatively returns
-/// `false` here rather than duplicating error handling.
-fn query_needs_write(query_str: &str) -> bool {
+/// Whether executing `query_str` needs write access, i.e. it can put a term
+/// into the result the dictionary does not hold yet: `BIND` and a `GROUP BY`
+/// aggregate always compute one, a `VALUES` table only when it names an unknown
+/// term. A parse failure is reported by the read-locked path, so it is `false`
+/// here rather than duplicating error handling.
+///
+/// Callers hold the read lock across this and release it before upgrading.
+/// Terms are never removed, so the answer stays valid; one added in between
+/// only costs a needless write lock.
+fn query_needs_write(query_str: &str, store: &TripleStore) -> bool {
     match SparqlParser::new().parse_query(query_str) {
         Ok(SparqlQuery::Select { pattern, .. } | SparqlQuery::Ask { pattern, .. }) => {
-            contains_extend(&pattern) || contains_group(&pattern)
+            contains_extend(&pattern)
+                || contains_group(&pattern)
+                || contains_unknown_values_term(&pattern, &store.dict)
         }
         _ => false,
     }
@@ -439,7 +486,7 @@ fn evaluate_select(
     evaluate_select_with_modifiers(store, engine, &m)
 }
 
-/// Mutable twin of [`evaluate_select`] for queries containing `BIND`.
+/// Mutable twin of [`evaluate_select`] for queries that have to intern a term.
 fn evaluate_select_bind(
     store: &mut TripleStore,
     engine: &HybridEngine,
@@ -460,6 +507,11 @@ fn evaluate_select_bind(
 /// Executes a SPARQL `SELECT`/`ASK` query against the store and returns the
 /// SPARQL-results JSON body (the same payload the HTTP `/sparql` endpoint
 /// serves). Lets embedders and tests run queries without standing up the server.
+///
+/// Read-locked, so a `VALUES` term the store does not know has no ID and the
+/// query fails here rather than losing the row (see [`eval_values`]).
+/// [`execute_sparql_bind`] interns it instead, and is what the HTTP endpoints
+/// route such a query to (see [`query_needs_write`]).
 pub fn execute_sparql(
     store: &TripleStore,
     engine: &HybridEngine,
@@ -488,10 +540,13 @@ pub fn execute_sparql(
     }
 }
 
-/// Mutable twin of [`execute_sparql`] for queries that materialize new values
-/// into the dictionary: `BIND` and `GROUP BY` aggregates. These computed values
-/// must be interned, so the caller needs write access to the store (see
-/// [`contains_extend`], [`contains_group`], [`eval_where_mut`]).
+/// Mutable twin of [`execute_sparql`] for queries that put a term into the
+/// result which the dictionary does not hold yet: `BIND` and `GROUP BY`
+/// aggregates compute one, a `VALUES` table may name one. Interning needs write
+/// access to the store (see [`eval_where_mut`]).
+///
+/// A server calling this outside the HTTP handlers must log what it interned to
+/// its write-ahead log — see [`log_interned_since`].
 pub fn execute_sparql_bind(
     store: &mut TripleStore,
     engine: &HybridEngine,
@@ -531,11 +586,12 @@ pub fn execute_sparql_bind(
 /// handlers call this function automatically.
 ///
 /// **Limitation**, tracked in ROADMAP under "SPARQL features": inference only
-/// routes through the read-locked [`eval_where`], so anything that must intern
-/// a computed value fails here with "unsupported WHERE pattern" — `BIND`,
-/// `GROUP BY`, and an aggregate sub-`SELECT` alike. One root cause: the callers
-/// skip the write path whenever `infer=rdfs` is set. Fixing that roadmap item
-/// fixes all three, so widen the tests along with it.
+/// routes through the read-locked [`eval_where`], so anything needing a term
+/// the dictionary does not hold fails here — `BIND`, `GROUP BY` and an
+/// aggregate sub-`SELECT` as "unsupported WHERE pattern", an unknown `VALUES`
+/// term with the error from [`eval_values`]. One root cause: the callers skip
+/// the write path whenever `infer=rdfs` is set. Fixing that fixes all four, so
+/// widen the tests along with it.
 pub fn execute_sparql_infer(
     store: &TripleStore,
     engine: &HybridEngine,
@@ -714,6 +770,7 @@ fn eval_where(
     match gp {
         GP::Bgp { patterns } => eval_bgp(patterns, store, engine, limit),
         GP::Filter { expr, inner } => {
+            check_expr(expr)?;
             let (rows, vo) = eval_where(inner, store, engine, None)?;
             let mut kept = RowBlock::new(rows.n_vars());
             for row in rows.rows() {
@@ -747,6 +804,17 @@ fn eval_where(
             path,
             object,
         } => eval_path(store, subject, path, object),
+        GP::Minus { left, right } => {
+            let (lr, lvo) = eval_where(left, store, engine, None)?;
+            let (rr, rvo) = eval_where(right, store, engine, None)?;
+            Ok(minus_rows(lr, &lvo, rr, &rvo))
+        }
+        GP::Values {
+            variables,
+            bindings,
+        } => eval_values(variables, bindings, |t| {
+            store.dict.lookup_term(&t.value, &t.typ)
+        }),
         // Sub-SELECT: evaluated as its own query, so what it does not project
         // stays out of scope for the enclosing pattern.
         GP::Project { .. }
@@ -762,48 +830,28 @@ fn eval_where(
             Ok((r.rows, r.var_order))
         }
         _ => Err(
-            "Unsupported WHERE pattern (only BGP/FILTER/OPTIONAL/UNION/Join/Path/sub-SELECT; use the mutable API for BIND/GROUP BY)".to_string(),
+            "Unsupported WHERE pattern (only BGP/FILTER/OPTIONAL/UNION/Join/Path/MINUS/VALUES/sub-SELECT; use the mutable API for BIND/GROUP BY)".to_string(),
         ),
     }
 }
 
-/// Whether `gp` contains a `BIND` (`Extend`) node anywhere in the tree. BIND
-/// is the only WHERE-pattern node that can materialize a value not yet in the
-/// dictionary, so queries containing it need write access to the store (see
-/// [`eval_where_mut`]) instead of the usual read lock.
-fn contains_extend(gp: &spargebra::algebra::GraphPattern) -> bool {
+/// Whether any node in `gp` satisfies `pred`. Every variant with children is
+/// spelled out, so a new one in the algebra is a compile error here rather than
+/// a silently unvisited subtree.
+fn contains_node(
+    gp: &spargebra::algebra::GraphPattern,
+    pred: &impl Fn(&spargebra::algebra::GraphPattern) -> bool,
+) -> bool {
     use spargebra::algebra::GraphPattern as GP;
-    match gp {
-        GP::Extend { .. } => true,
-        GP::Bgp { .. } | GP::Path { .. } | GP::Values { .. } => false,
-        GP::Join { left, right }
-        | GP::LeftJoin { left, right, .. }
-        | GP::Union { left, right }
-        | GP::Minus { left, right } => contains_extend(left) || contains_extend(right),
-        GP::Filter { inner, .. }
-        | GP::Graph { inner, .. }
-        | GP::OrderBy { inner, .. }
-        | GP::Project { inner, .. }
-        | GP::Distinct { inner }
-        | GP::Reduced { inner }
-        | GP::Slice { inner, .. }
-        | GP::Group { inner, .. }
-        | GP::Service { inner, .. } => contains_extend(inner),
+    if pred(gp) {
+        return true;
     }
-}
-
-/// Whether `gp` contains a `GROUP BY` (`Group`) node anywhere in the tree.
-/// Aggregate results are computed values that must be interned into the
-/// dictionary, so such queries also need write access to the store.
-fn contains_group(gp: &spargebra::algebra::GraphPattern) -> bool {
-    use spargebra::algebra::GraphPattern as GP;
     match gp {
-        GP::Group { .. } => true,
         GP::Bgp { .. } | GP::Path { .. } | GP::Values { .. } => false,
         GP::Join { left, right }
         | GP::LeftJoin { left, right, .. }
         | GP::Union { left, right }
-        | GP::Minus { left, right } => contains_group(left) || contains_group(right),
+        | GP::Minus { left, right } => contains_node(left, pred) || contains_node(right, pred),
         GP::Filter { inner, .. }
         | GP::Extend { inner, .. }
         | GP::Graph { inner, .. }
@@ -812,8 +860,45 @@ fn contains_group(gp: &spargebra::algebra::GraphPattern) -> bool {
         | GP::Distinct { inner }
         | GP::Reduced { inner }
         | GP::Slice { inner, .. }
-        | GP::Service { inner, .. } => contains_group(inner),
+        | GP::Group { inner, .. }
+        | GP::Service { inner, .. } => contains_node(inner, pred),
     }
+}
+
+/// Whether `gp` contains a `BIND` (`Extend`) node anywhere in the tree. BIND
+/// materializes a value not yet in the dictionary, so queries containing it
+/// need write access to the store (see [`eval_where_mut`]) instead of the
+/// usual read lock.
+fn contains_extend(gp: &spargebra::algebra::GraphPattern) -> bool {
+    contains_node(gp, &|g| {
+        matches!(g, spargebra::algebra::GraphPattern::Extend { .. })
+    })
+}
+
+/// Whether `gp` contains a `GROUP BY` (`Group`) node anywhere in the tree.
+/// Aggregate results are computed values that must be interned into the
+/// dictionary, so such queries also need write access to the store.
+fn contains_group(gp: &spargebra::algebra::GraphPattern) -> bool {
+    contains_node(gp, &|g| {
+        matches!(g, spargebra::algebra::GraphPattern::Group { .. })
+    })
+}
+
+/// Whether `gp` contains a `VALUES` table naming a term `dict` does not hold —
+/// the only case where the table forces the query off the read lock (see
+/// [`eval_values`]). `UNDEF` is rejected on either path, so it does not count.
+fn contains_unknown_values_term(gp: &spargebra::algebra::GraphPattern, dict: &Dictionary) -> bool {
+    contains_node(gp, &|g| match g {
+        spargebra::algebra::GraphPattern::Values { bindings, .. } => {
+            bindings.iter().flatten().any(|cell| {
+                cell.as_ref().is_some_and(|term| {
+                    ground_term_to_parsed(term)
+                        .is_ok_and(|t| dict.lookup_term(&t.value, &t.typ).is_none())
+                })
+            })
+        }
+        _ => false,
+    })
 }
 
 /// Mutable twin of [`eval_where`] for queries that need to intern computed
@@ -831,6 +916,7 @@ fn eval_where_mut(
     match gp {
         GP::Bgp { patterns } => eval_bgp(patterns, store, engine, limit),
         GP::Filter { expr, inner } => {
+            check_expr(expr)?;
             let (rows, vo) = eval_where_mut(inner, store, engine, None)?;
             let mut kept = RowBlock::new(rows.n_vars());
             for row in rows.rows() {
@@ -869,6 +955,7 @@ fn eval_where_mut(
             variable,
             expression,
         } => {
+            check_expr(expression)?;
             let (rows, mut vo) = eval_where_mut(inner, store, engine, None)?;
             let mut extended = RowBlock::new(rows.n_vars() + 1);
             for row in rows.rows() {
@@ -899,6 +986,19 @@ fn eval_where_mut(
             variables,
             aggregates,
         } => eval_group(inner, variables, aggregates, store, engine),
+        GP::Minus { left, right } => {
+            let (lr, lvo) = eval_where_mut(left, store, engine, None)?;
+            let (rr, rvo) = eval_where_mut(right, store, engine, None)?;
+            Ok(minus_rows(lr, &lvo, rr, &rvo))
+        }
+        // Under the write lock an inline value the store has never seen can be
+        // interned, so a standalone VALUES hands the term back verbatim.
+        GP::Values {
+            variables,
+            bindings,
+        } => eval_values(variables, bindings, |t| {
+            Some(store.dict.insert_with_type(&t.value, t.typ.clone()))
+        }),
         // Sub-SELECT: evaluated as its own query, so what it does not project
         // stays out of scope for the enclosing pattern.
         GP::Project { .. }
@@ -914,7 +1014,7 @@ fn eval_where_mut(
             Ok((r.rows, r.var_order))
         }
         _ => Err(
-            "Unsupported WHERE pattern (only BGP/FILTER/OPTIONAL/UNION/Join/Path/BIND/GROUP BY/sub-SELECT)"
+            "Unsupported WHERE pattern (only BGP/FILTER/OPTIONAL/UNION/Join/Path/BIND/GROUP BY/MINUS/VALUES/sub-SELECT)"
                 .to_string(),
         ),
     }
@@ -1685,6 +1785,127 @@ fn union_rows(
     Ok((out, vo))
 }
 
+/// SPARQL `MINUS`: drops every left row that a right row is *compatible* with.
+///
+/// Compatible means the two agree on all variables both of them bind **and**
+/// bind at least one variable in common — a right row with a disjoint domain
+/// cancels nothing. That second condition is what separates `MINUS` from
+/// `FILTER NOT EXISTS`: a `MINUS` whose pattern shares no variable with the
+/// left side removes nothing at all. Only the left variables survive; the right
+/// side is a test, not a source of bindings.
+///
+/// An unbound column is not in the row's domain, so it is compatible with *any*
+/// value — which a hash over the shared columns cannot express. Rows with an
+/// unbound column fall back to a scan and only they pay for it.
+fn minus_rows(
+    left: RowBlock,
+    lvo: &[String],
+    right: RowBlock,
+    rvo: &[String],
+) -> (RowBlock, Vec<String>) {
+    let shared: Vec<(usize, usize)> = rvo
+        .iter()
+        .enumerate()
+        .filter_map(|(rp, v)| lvo.iter().position(|x| x == v).map(|lp| (lp, rp)))
+        .collect();
+    if shared.is_empty() || right.is_empty() {
+        return (left, lvo.to_vec());
+    }
+
+    // A partially bound right row can cancel rows with differing values, so it
+    // cannot go in the hash. Usually there are none.
+    let mut index: rustc_hash::FxHashSet<Vec<u32>> = rustc_hash::FxHashSet::default();
+    let mut partial: Vec<&[u32]> = Vec::new();
+    for rrow in right.rows() {
+        let key: Vec<u32> = shared.iter().map(|&(_, rp)| rrow[rp]).collect();
+        if key.contains(&NULL_ID) {
+            partial.push(rrow);
+        } else {
+            index.insert(key);
+        }
+    }
+
+    let mut out = RowBlock::new(lvo.len());
+    let mut key: Vec<u32> = Vec::with_capacity(shared.len());
+    for row in left.rows() {
+        key.clear();
+        key.extend(shared.iter().map(|&(lp, _)| row[lp]));
+        let cancelled = if key.contains(&NULL_ID) {
+            // An unbound left column matches any value, so every right row is
+            // a candidate.
+            right.rows().any(|rrow| cancels(row, rrow, &shared))
+        } else {
+            index.contains(&key) || partial.iter().any(|rrow| cancels(row, rrow, &shared))
+        };
+        if !cancelled {
+            out.push_row(row);
+        }
+    }
+    (out, lvo.to_vec())
+}
+
+/// Whether `right` cancels `left` under [`minus_rows`]: they agree wherever both
+/// bind a shared variable, and at least one is bound on both sides. Shared
+/// variables are the only ones the domains can share, so that is the
+/// disjointness test.
+fn cancels(left: &[u32], right: &[u32], shared: &[(usize, usize)]) -> bool {
+    let mut overlap = false;
+    for &(lp, rp) in shared {
+        let (l, r) = (left[lp], right[rp]);
+        if l == NULL_ID || r == NULL_ID {
+            continue;
+        }
+        if l != r {
+            return false;
+        }
+        overlap = true;
+    }
+    overlap
+}
+
+/// Evaluates a `VALUES` inline table into a row block.
+///
+/// Rows carry dictionary IDs, so a term the store has never seen has none to
+/// carry. Dropping the row would be exact only under a plain join — not under
+/// `OPTIONAL`, in a `UNION` branch, or standing alone — so `resolve` returning
+/// `None` is an error, not a silent skip. [`query_needs_write`] routes such a
+/// query to the write path, whose resolver interns instead; that leaves
+/// `?infer=rdfs`, read-only by construction, as the one caller that sees it.
+///
+/// `UNDEF` is rejected because [`hash_join`] matches an unbound column as a
+/// value, not as the wildcard SPARQL compatibility makes it — see ROADMAP.
+fn eval_values(
+    variables: &[Variable],
+    bindings: &[Vec<Option<GroundTerm>>],
+    mut resolve: impl FnMut(&ParsedTermRdf) -> Option<u32>,
+) -> Result<(RowBlock, Vec<String>), String> {
+    let vo: Vec<String> = variables.iter().map(|v| v.as_str().to_string()).collect();
+    let mut rows = RowBlock::new(vo.len());
+    let mut buf = vec![NULL_ID; vo.len()];
+    for binding in bindings {
+        buf.fill(NULL_ID);
+        for (slot, cell) in buf.iter_mut().zip(binding) {
+            let Some(term) = cell else {
+                return Err(
+                    "UNDEF in VALUES is not supported yet (an unbound join key is matched as a value, not as a wildcard)"
+                        .to_string(),
+                );
+            };
+            let parsed = ground_term_to_parsed(term)?;
+            *slot = resolve(&parsed).ok_or_else(|| {
+                format!(
+                    "VALUES names \"{}\", which the store does not contain; \
+                     only the write path can mint an ID for it, and `?infer=rdfs` \
+                     never takes it",
+                    parsed.value
+                )
+            })?;
+        }
+        rows.push_row(&buf);
+    }
+    Ok((rows, vo))
+}
+
 /// Sort key for ORDER BY (SPARQL-like total ordering).
 #[derive(PartialEq)]
 enum OrderKey {
@@ -2098,6 +2319,32 @@ fn execute_update(
     }
 
     store.apply_updates(&inserts, &deletes);
+    Ok(())
+}
+
+/// Logs every term interned since `first_new_id` to the WAL, in ID order, so a
+/// replay assigns them the same IDs.
+///
+/// The log records operations by ID but reconstructs IDs from the order of its
+/// term records (see [`crate::wal`]), so an unlogged intern shifts every later
+/// one and the replay rebuilds the wrong triples. Queries intern too: `BIND`
+/// and `GROUP BY` a computed value, `VALUES` a term its table names. No `sync`
+/// — these records share the log's buffer with the operations that reference
+/// them, so the next update's sync flushes both, in order.
+fn log_interned_since(
+    store: &TripleStore,
+    first_new_id: usize,
+    wal: &mut Wal,
+) -> Result<(), String> {
+    for id in first_new_id..store.dict.len() {
+        let id = id as u32;
+        let (Some(value), Some(typ)) = (store.dict.resolve(id), store.dict.resolve_type(id)) else {
+            return Err(format!(
+                "dictionary term {id} disappeared before it was logged"
+            ));
+        };
+        wal.log_term(&value, &typ).map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -2666,6 +2913,18 @@ fn row_passes(filters: &[&Expression], row: &[u32], vars: &[String], store: &Tri
     filters.iter().all(|f| ebv(f, row, vars, store) == Ok(true))
 }
 
+/// Rejects a `FILTER`/`BIND` expression [`eval`] cannot evaluate, before any row
+/// sees it. `eval` reports an unimplemented construct exactly like a type error,
+/// and `FILTER` reads an error as "row does not pass", so `FILTER NOT EXISTS`
+/// would answer every query with zero rows and `BIND` leave the variable
+/// unbound. [`hash_join`] does the same for the expression inside an `OPTIONAL`.
+fn check_expr(expr: &Expression) -> Result<(), String> {
+    match unsupported_in_expr(expr) {
+        None => Ok(()),
+        Some(what) => Err(format!("Unsupported expression in a FILTER/BIND: {what}")),
+    }
+}
+
 fn translate_bgp(
     bgp: &[spargebra::term::TriplePattern],
     dict: &Dictionary,
@@ -2810,6 +3069,14 @@ mod tests {
         let engine = HybridEngine::new();
         let result: Value =
             serde_json::from_str(&execute_sparql(store, &engine, query).unwrap()).unwrap();
+        result["results"]["bindings"].as_array().unwrap().clone()
+    }
+
+    /// [`rows_of`] on the write-locked path, for what needs to intern a term.
+    fn rows_of_mut(store: &mut TripleStore, query: &str) -> Vec<Value> {
+        let engine = HybridEngine::new();
+        let result: Value =
+            serde_json::from_str(&execute_sparql_bind(store, &engine, query).unwrap()).unwrap();
         result["results"]["bindings"].as_array().unwrap().clone()
     }
 
@@ -4246,14 +4513,18 @@ mod tests {
     /// write-locked path, since the computed values still need interning.
     #[test]
     fn query_needs_write_sees_through_subselect() {
+        let store = test_store();
         assert!(query_needs_write(
-            "SELECT ?y WHERE { { SELECT ?y WHERE { ?s ?p ?a BIND(?a + 1 AS ?y) } } }"
+            "SELECT ?y WHERE { { SELECT ?y WHERE { ?s ?p ?a BIND(?a + 1 AS ?y) } } }",
+            &store
         ));
         assert!(query_needs_write(
-            "SELECT ?c WHERE { { SELECT (COUNT(*) AS ?c) WHERE { ?s ?p ?o } } }"
+            "SELECT ?c WHERE { { SELECT (COUNT(*) AS ?c) WHERE { ?s ?p ?o } } }",
+            &store
         ));
         assert!(!query_needs_write(
-            "SELECT ?s WHERE { { SELECT ?s WHERE { ?s ?p ?o } LIMIT 1 } }"
+            "SELECT ?s WHERE { { SELECT ?s WHERE { ?s ?p ?o } LIMIT 1 } }",
+            &store
         ));
     }
 
@@ -4297,5 +4568,534 @@ mod tests {
             values_of(&rows, "o"),
             vec!["http://example.org/bob", "http://example.org/c1"]
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // MINUS
+    // -----------------------------------------------------------------------
+
+    /// `test_store()`: alice -> bob -> charlie -> alice (knows); only bob has
+    /// an age. So MINUS on the age pattern takes bob out of the knows result.
+    #[test]
+    fn minus_removes_rows_matching_the_right_pattern() {
+        let store = test_store();
+        let rows = rows_of(
+            &store,
+            "SELECT ?s WHERE { ?s <http://example.org/knows> ?o \
+             MINUS { ?s <http://example.org/age> ?a } }",
+        );
+        let mut got = values_of(&rows, "s");
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec!["http://example.org/alice", "http://example.org/charlie"]
+        );
+    }
+
+    /// The difference between `MINUS` and `FILTER NOT EXISTS`: a right pattern
+    /// sharing no variable with the left side has a disjoint domain, so it is
+    /// compatible with nothing and removes nothing — even though it matches.
+    #[test]
+    fn minus_with_disjoint_variables_removes_nothing() {
+        let store = test_store();
+        let rows = rows_of(
+            &store,
+            "SELECT ?s WHERE { ?s <http://example.org/knows> ?o \
+             MINUS { ?x <http://example.org/age> ?a } }",
+        );
+        assert_eq!(rows.len(), 3, "disjoint MINUS is a no-op");
+    }
+
+    /// A right pattern that matches nothing leaves the left side untouched.
+    #[test]
+    fn minus_over_an_empty_right_side_keeps_everything() {
+        let store = test_store();
+        let rows = rows_of(
+            &store,
+            "SELECT ?s WHERE { ?s <http://example.org/knows> ?o \
+             MINUS { ?s <http://example.org/height> ?h } }",
+        );
+        assert_eq!(rows.len(), 3);
+    }
+
+    /// MINUS is a test, not a source of bindings: its variables stay out of
+    /// scope, so projecting one is the usual "not in pattern" error.
+    #[test]
+    fn minus_right_side_variables_stay_out_of_scope() {
+        let store = test_store();
+        let engine = HybridEngine::new();
+        let err = execute_sparql(
+            &store,
+            &engine,
+            "SELECT ?a WHERE { ?s <http://example.org/knows> ?o \
+             MINUS { ?s <http://example.org/age> ?a } }",
+        )
+        .unwrap_err();
+        assert!(err.contains("?a"), "unexpected error: {err}");
+    }
+
+    /// With two shared variables a row only cancels when both agree: bob is
+    /// removed as a subject of `knows`, but only on the (bob, charlie) edge.
+    #[test]
+    fn minus_matches_on_all_shared_variables() {
+        let mut store = test_store();
+        // Incremental, since a second `ingest_str_triples` would rebuild the
+        // index from scratch and drop what `test_store` put in.
+        let bob = store
+            .dict
+            .insert_with_type("http://example.org/bob", TermType::Iri);
+        let blocked = store
+            .dict
+            .insert_with_type("http://example.org/blocked", TermType::Iri);
+        let charlie = store
+            .dict
+            .insert_with_type("http://example.org/charlie", TermType::Iri);
+        store.insert_triple(bob, blocked, charlie);
+        let rows = rows_of(
+            &store,
+            "SELECT ?s ?o WHERE { ?s <http://example.org/knows> ?o \
+             MINUS { ?s <http://example.org/blocked> ?o } }",
+        );
+        let mut got = values_of(&rows, "s");
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec!["http://example.org/alice", "http://example.org/charlie"]
+        );
+    }
+
+    /// An unbound column is not in the row's domain: bob has no nickname, and a
+    /// `MINUS` on `?a` still cancels him because the sides agree on `?s`.
+    #[test]
+    fn minus_treats_an_unbound_left_column_as_compatible() {
+        let mut store = test_store();
+        // alice gets a nickname, bob only an age (from `test_store`).
+        let alice = store
+            .dict
+            .insert_with_type("http://example.org/alice", TermType::Iri);
+        let nick = store
+            .dict
+            .insert_with_type("http://example.org/nick", TermType::Iri);
+        let al = store.dict.insert_with_type("Al", TermType::literal_plain());
+        store.insert_triple(alice, nick, al);
+
+        let rows = rows_of(
+            &store,
+            "SELECT ?s WHERE { ?s <http://example.org/knows> ?o \
+             OPTIONAL { ?s <http://example.org/nick> ?a } \
+             MINUS { ?s <http://example.org/age> ?a } }",
+        );
+        let mut got = values_of(&rows, "s");
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec!["http://example.org/alice", "http://example.org/charlie"],
+            "bob is cancelled even though ?a is unbound on the left"
+        );
+    }
+
+    /// The same on the right: an unbound `?o` contradicts nothing, so the row
+    /// still cancels on the shared `?s`.
+    #[test]
+    fn minus_treats_an_unbound_right_column_as_compatible() {
+        let mut store = test_store();
+        let alice = store
+            .dict
+            .insert_with_type("http://example.org/alice", TermType::Iri);
+        let flag = store
+            .dict
+            .insert_with_type("http://example.org/flag", TermType::Iri);
+        store.insert_triple(alice, flag, alice);
+
+        let rows = rows_of(
+            &store,
+            "SELECT ?s ?o WHERE { ?s <http://example.org/knows> ?o \
+             MINUS { ?s <http://example.org/flag> ?f \
+                     OPTIONAL { ?s <http://example.org/nothing> ?o } } }",
+        );
+        let mut got = values_of(&rows, "s");
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec!["http://example.org/bob", "http://example.org/charlie"],
+            "alice is cancelled even though ?o is unbound on the right"
+        );
+    }
+
+    /// MINUS binds nothing new, so it stays on the read-locked path.
+    #[test]
+    fn minus_does_not_need_the_write_path() {
+        assert!(!query_needs_write(
+            "SELECT ?s WHERE { ?s ?p ?o MINUS { ?s <http://example.org/age> ?a } }",
+            &test_store()
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // VALUES
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn values_restricts_a_variable_to_the_listed_terms() {
+        let store = test_store();
+        let rows = rows_of(
+            &store,
+            "SELECT ?o WHERE { \
+             VALUES ?s { <http://example.org/alice> <http://example.org/charlie> } \
+             ?s <http://example.org/knows> ?o }",
+        );
+        let mut got = values_of(&rows, "o");
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec!["http://example.org/alice", "http://example.org/bob"]
+        );
+    }
+
+    /// A multi-column table constrains the tuple, not each variable on its own:
+    /// (charlie, bob) is not an edge, so only the alice row survives.
+    #[test]
+    fn values_multi_variable_rows_constrain_the_tuple() {
+        let store = test_store();
+        let rows = rows_of(
+            &store,
+            "SELECT ?s ?o WHERE { \
+             VALUES (?s ?o) { (<http://example.org/alice> <http://example.org/bob>) \
+                              (<http://example.org/charlie> <http://example.org/bob>) } \
+             ?s <http://example.org/knows> ?o }",
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["s"]["value"], "http://example.org/alice");
+        assert_eq!(rows[0]["o"]["value"], "http://example.org/bob");
+    }
+
+    /// `VALUES` trailing the `WHERE` clause is the same inline table, joined in
+    /// by the parser — it must reach evaluation just like the inline form.
+    #[test]
+    fn values_clause_after_the_where_block() {
+        let store = test_store();
+        let rows = rows_of(
+            &store,
+            "SELECT ?o WHERE { ?s <http://example.org/knows> ?o } \
+             VALUES ?s { <http://example.org/alice> }",
+        );
+        assert_eq!(values_of(&rows, "o"), vec!["http://example.org/bob"]);
+    }
+
+    /// A typed literal in `VALUES` must match on the datatype, not just the
+    /// lexical form — `"25"` alone is an xsd:string and matches nothing.
+    #[test]
+    fn values_literal_respects_the_datatype() {
+        let mut store = test_store();
+        // The store has to hold the plain literal, or the read path rejects the
+        // table before it ever gets to the join.
+        store.dict.insert_with_type("25", TermType::literal_plain());
+        let rows = rows_of(
+            &store,
+            "SELECT ?s WHERE { VALUES ?a { \"25\" } ?s <http://example.org/age> ?a }",
+        );
+        assert_eq!(rows.len(), 0, "plain \"25\" is an xsd:string");
+
+        // The store's ages come from `ingest_str_triples`, so give it a typed one.
+        let s = store
+            .dict
+            .insert_with_type("http://example.org/dave", TermType::Iri);
+        let p = store
+            .dict
+            .insert_with_type("http://example.org/age", TermType::Iri);
+        let o = store
+            .dict
+            .insert_with_type("25", TermType::literal_datatype(XSD_INT));
+        store.insert_triple(s, p, o);
+        let rows = rows_of(
+            &store,
+            "SELECT ?s WHERE { VALUES ?a { \"25\"^^<http://www.w3.org/2001/XMLSchema#integer> } \
+             ?s <http://example.org/age> ?a }",
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["s"]["value"], "http://example.org/dave");
+    }
+
+    /// A term the store has never seen has no ID, so the read path says so
+    /// rather than dropping the row. The write path answers it.
+    #[test]
+    fn values_rejects_a_term_the_store_does_not_know_on_the_read_path() {
+        let mut store = test_store();
+        let engine = HybridEngine::new();
+        let query = "SELECT ?o WHERE { \
+             VALUES ?s { <http://example.org/alice> <http://example.org/nobody> } \
+             ?s <http://example.org/knows> ?o }";
+        let err = execute_sparql(&store, &engine, query).unwrap_err();
+        assert!(err.contains("nobody"), "unexpected error: {err}");
+
+        let rows = rows_of_mut(&mut store, query);
+        assert_eq!(values_of(&rows, "o"), vec!["http://example.org/bob"]);
+    }
+
+    /// Dropping the row is harmless only for a plain join; these three shapes
+    /// are the ones it answered wrongly.
+    #[test]
+    fn an_unknown_values_term_is_kept_where_a_join_would_not_have_dropped_it() {
+        let mut store = test_store();
+        let unknown = "<http://example.org/nobody>";
+        for query in [
+            format!(
+                "SELECT ?s ?o WHERE {{ VALUES ?s {{ {unknown} }} OPTIONAL {{ ?s <http://example.org/knows> ?o }} }}"
+            ),
+            format!(
+                "SELECT ?s WHERE {{ {{ VALUES ?s {{ {unknown} }} }} UNION {{ ?s <http://example.org/knows> ?o }} }}"
+            ),
+            format!("SELECT ?s WHERE {{ VALUES ?s {{ {unknown} }} FILTER(isIRI(?s)) }}"),
+        ] {
+            let rows = rows_of_mut(&mut store, &query);
+            assert!(
+                values_of(&rows, "s").contains(&"http://example.org/nobody"),
+                "lost the unknown term in: {query}"
+            );
+        }
+    }
+
+    /// A standalone `VALUES` is the table itself, so an unknown term has to come
+    /// back verbatim — which needs an ID, hence the write-locked path.
+    #[test]
+    fn standalone_values_returns_unknown_terms_via_the_write_path() {
+        let mut store = test_store();
+        let engine = HybridEngine::new();
+        let query = "SELECT ?s WHERE { VALUES ?s { <http://example.org/nobody> } }";
+        let result: Value =
+            serde_json::from_str(&execute_sparql_bind(&mut store, &engine, query).unwrap())
+                .unwrap();
+        let rows = result["results"]["bindings"].as_array().unwrap();
+        assert_eq!(values_of(rows, "s"), vec!["http://example.org/nobody"]);
+    }
+
+    /// ... which is why an unknown term routes `VALUES` to the write path; a
+    /// table of known terms stays on the read lock.
+    #[test]
+    fn query_needs_write_only_for_an_unknown_values_term() {
+        let store = test_store();
+        assert!(query_needs_write(
+            "SELECT ?s WHERE { VALUES ?s { <http://example.org/nobody> } }",
+            &store
+        ));
+        assert!(query_needs_write(
+            "SELECT ?s WHERE { ?s ?p ?o } VALUES ?s { <http://example.org/nobody> }",
+            &store
+        ));
+        assert!(!query_needs_write(
+            "SELECT ?s WHERE { VALUES ?s { <http://example.org/alice> } }",
+            &store
+        ));
+        assert!(!query_needs_write(
+            "SELECT ?s WHERE { ?s ?p ?o } VALUES ?s { <http://example.org/alice> }",
+            &store
+        ));
+    }
+
+    /// UNDEF is refused instead of silently answering with an empty result:
+    /// the join matches an unbound column as a value, not as a wildcard.
+    #[test]
+    fn values_undef_is_rejected() {
+        let store = test_store();
+        let engine = HybridEngine::new();
+        let err = execute_sparql(
+            &store,
+            &engine,
+            "SELECT ?s ?o WHERE { \
+             VALUES (?s ?o) { (<http://example.org/alice> UNDEF) } \
+             ?s <http://example.org/knows> ?o }",
+        )
+        .unwrap_err();
+        assert!(err.contains("UNDEF"), "unexpected error: {err}");
+    }
+
+    /// `VALUES` inside a sub-`SELECT` is scoped to it like any other pattern.
+    #[test]
+    fn values_inside_a_subselect() {
+        let store = test_store();
+        let rows = rows_of(
+            &store,
+            "SELECT ?o WHERE { { SELECT ?o WHERE { \
+             VALUES ?s { <http://example.org/bob> } ?s <http://example.org/knows> ?o } } }",
+        );
+        assert_eq!(values_of(&rows, "o"), vec!["http://example.org/charlie"]);
+    }
+
+    /// Both work under `?infer=rdfs`: the rewrite recurses into either side of
+    /// a `MINUS` and leaves a `VALUES` table alone, and neither needs to intern
+    /// a computed value, so the read-locked inference path carries them.
+    #[test]
+    fn minus_and_values_under_inference() {
+        let mut store = TripleStore::new();
+        store.ingest_str_triples(&[
+            (
+                "http://example.org/Dog",
+                "http://www.w3.org/2000/01/rdf-schema#subClassOf",
+                "http://example.org/Animal",
+            ),
+            (
+                "http://example.org/fido",
+                "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                "http://example.org/Dog",
+            ),
+            (
+                "http://example.org/rex",
+                "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                "http://example.org/Dog",
+            ),
+            (
+                "http://example.org/rex",
+                "http://example.org/tagged",
+                "http://example.org/yes",
+            ),
+        ]);
+        let engine = HybridEngine::new();
+        let infer_rows = |q: &str| -> Vec<Value> {
+            let v: Value =
+                serde_json::from_str(&execute_sparql_infer(&store, &engine, q).unwrap()).unwrap();
+            v["results"]["bindings"].as_array().unwrap().clone()
+        };
+
+        // Both dogs are inferred Animals; MINUS takes the tagged one out.
+        let rows = infer_rows(
+            "SELECT ?s WHERE { \
+             ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Animal> \
+             MINUS { ?s <http://example.org/tagged> ?t } }",
+        );
+        assert_eq!(values_of(&rows, "s"), vec!["http://example.org/fido"]);
+
+        let rows = infer_rows(
+            "SELECT ?s WHERE { VALUES ?s { <http://example.org/rex> } \
+             ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Animal> }",
+        );
+        assert_eq!(values_of(&rows, "s"), vec!["http://example.org/rex"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Unsupported expressions
+    // -----------------------------------------------------------------------
+
+    /// Read as an error, an unimplemented expression makes `FILTER` drop every
+    /// row — indistinguishable from a real "no solutions".
+    #[test]
+    fn unsupported_expressions_are_refused_rather_than_answered() {
+        let store = test_store();
+        let engine = HybridEngine::new();
+        for (query, expected) in [
+            (
+                "SELECT ?s WHERE { ?s <http://example.org/knows> ?o \
+                 FILTER NOT EXISTS { ?s <http://example.org/age> ?a } }",
+                "EXISTS",
+            ),
+            (
+                "SELECT ?s WHERE { ?s <http://example.org/knows> ?o \
+                 FILTER EXISTS { ?s <http://example.org/age> ?a } }",
+                "EXISTS",
+            ),
+            (
+                "SELECT ?s WHERE { ?s <http://example.org/knows> ?o \
+                 FILTER(SUBSTR(STR(?s), 1, 4) = \"http\") }",
+                "SUBSTR",
+            ),
+            (
+                "SELECT ?s WHERE { ?s <http://example.org/knows> ?o \
+                 FILTER(COALESCE(?z, \"x\") = \"x\") }",
+                "COALESCE",
+            ),
+        ] {
+            let err = execute_sparql(&store, &engine, query).unwrap_err();
+            assert!(err.contains(expected), "unexpected error: {err}");
+        }
+    }
+
+    /// Same for `BIND`, which shares the evaluator.
+    #[test]
+    fn bind_with_an_unsupported_function_is_refused() {
+        let mut store = test_store();
+        let engine = HybridEngine::new();
+        let err = execute_sparql_bind(
+            &mut store,
+            &engine,
+            "SELECT ?x WHERE { ?s <http://example.org/knows> ?o BIND(ABS(-3) AS ?x) }",
+        )
+        .unwrap_err();
+        assert!(err.contains("ABS"), "unexpected error: {err}");
+    }
+
+    /// The supported ones still evaluate, i.e. the check is not over-eager.
+    #[test]
+    fn supported_expressions_still_pass_the_check() {
+        let store = test_store();
+        let rows = rows_of(
+            &store,
+            "SELECT ?s WHERE { ?s <http://example.org/knows> ?o \
+             FILTER(isIRI(?s) && CONTAINS(STR(?o), \"example\") && !(STRLEN(STR(?s)) = 0)) }",
+        );
+        assert_eq!(rows.len(), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // WAL alignment
+    // -----------------------------------------------------------------------
+
+    /// An intern the log never saw shifts every later ID, so the replay rebuilds
+    /// the wrong triples. Queries intern too, so they have to log as well.
+    #[test]
+    fn a_term_interned_by_a_query_is_logged_so_the_replay_stays_aligned() {
+        let path = std::env::temp_dir().join(format!(
+            "trillian_wal_align_{}_{:p}.wal",
+            std::process::id(),
+            &0u8
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut wal = Wal::open_append(path.to_str().unwrap()).unwrap();
+        let mut store = test_store();
+        let engine = HybridEngine::new();
+
+        // A query that mints an ID, exactly as `AppState::write_locked` runs it.
+        let first_new_id = store.dict.len();
+        execute_sparql_bind(
+            &mut store,
+            &engine,
+            "SELECT ?s WHERE { VALUES ?s { <http://example.org/ghost> } }",
+        )
+        .unwrap();
+        assert!(
+            store.dict.len() > first_new_id,
+            "the query interned nothing"
+        );
+        log_interned_since(&store, first_new_id, &mut wal).unwrap();
+
+        // Then a logged update, whose IDs follow the ones the query took.
+        execute_update(
+            &mut store,
+            "INSERT DATA { <http://example.org/x> <http://example.org/p> <http://example.org/y> }",
+            Some(&mut wal),
+        )
+        .unwrap();
+        wal.sync().unwrap();
+
+        let mut restored = test_store();
+        Wal::replay(path.to_str().unwrap(), &mut restored).unwrap();
+        let rows = rows_of(
+            &restored,
+            "SELECT ?o WHERE { <http://example.org/x> <http://example.org/p> ?o }",
+        );
+        assert_eq!(values_of(&rows, "o"), vec!["http://example.org/y"]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The two combined: restrict with `VALUES`, then subtract with `MINUS`.
+    #[test]
+    fn values_and_minus_combined() {
+        let store = test_store();
+        let rows = rows_of(
+            &store,
+            "SELECT ?s WHERE { \
+             VALUES ?s { <http://example.org/alice> <http://example.org/bob> } \
+             ?s <http://example.org/knows> ?o \
+             MINUS { ?s <http://example.org/age> ?a } }",
+        );
+        assert_eq!(values_of(&rows, "s"), vec!["http://example.org/alice"]);
     }
 }
