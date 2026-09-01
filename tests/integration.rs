@@ -167,6 +167,157 @@ fn select_optional_keeps_unmatched_rows() {
     assert_eq!(with_age, 1);
 }
 
+/// Two people with an age, so an inner FILTER can accept one and reject the
+/// other. The rejected row must survive with ?age unbound.
+fn optional_filter_store() -> TripleStore {
+    let nt = format!(
+        "<{EX}alice> <{EX}knows> <{EX}bob> .\n\
+         <{EX}alice> <{EX}knows> <{EX}carol> .\n\
+         <{EX}bob> <{EX}age> \"25\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n\
+         <{EX}carol> <{EX}age> \"60\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n"
+    );
+    let path = unique_path("optfilter.nt");
+    std::fs::write(&path, nt).unwrap();
+    let mut store = TripleStore::new();
+    store.ingest_ntriples_file(path.to_str().unwrap()).unwrap();
+    let _ = std::fs::remove_file(&path);
+    store
+}
+
+/// `?b` -> the value of `?age`, or "UNBOUND".
+fn ages_by_person(rows: &[Value]) -> std::collections::BTreeMap<String, String> {
+    rows.iter()
+        .map(|r| {
+            let b = r["b"]["value"]
+                .as_str()
+                .unwrap()
+                .rsplit('/')
+                .next()
+                .unwrap();
+            let age = r["age"]["value"].as_str().unwrap_or("UNBOUND");
+            (b.to_string(), age.to_string())
+        })
+        .collect()
+}
+
+#[test]
+fn optional_inner_filter_unbinds_rather_than_drops() {
+    let store = optional_filter_store();
+    let engine = HybridEngine::new();
+    // A FILTER inside OPTIONAL is part of the left join, not a filter on the
+    // result: carol fails it, so her row stays with ?age unbound.
+    let q = format!(
+        "SELECT ?b ?age WHERE {{ <{EX}alice> <{EX}knows> ?b \
+         OPTIONAL {{ ?b <{EX}age> ?age FILTER(?age < 30) }} }}"
+    );
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
+    assert_eq!(rows.len(), 2, "both knows-edges survive the left join");
+    let got = ages_by_person(&rows);
+    assert_eq!(got["bob"], "25", "bob passes the inner FILTER");
+    assert_eq!(
+        got["carol"], "UNBOUND",
+        "carol fails it, so ?age is unbound"
+    );
+}
+
+#[test]
+fn optional_inner_filter_rejecting_every_match_keeps_all_rows() {
+    let store = optional_filter_store();
+    let engine = HybridEngine::new();
+    let q = format!(
+        "SELECT ?b ?age WHERE {{ <{EX}alice> <{EX}knows> ?b \
+         OPTIONAL {{ ?b <{EX}age> ?age FILTER(?age > 100) }} }}"
+    );
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
+    assert_eq!(rows.len(), 2);
+    let got = ages_by_person(&rows);
+    assert_eq!(got["bob"], "UNBOUND");
+    assert_eq!(got["carol"], "UNBOUND");
+}
+
+#[test]
+fn optional_outer_filter_still_drops_rows() {
+    let store = optional_filter_store();
+    let engine = HybridEngine::new();
+    // The contrast with the inner form: a FILTER *after* the OPTIONAL applies
+    // to the joined result, so carol's unbound ?age makes it error -> false and
+    // her row is dropped entirely.
+    let q = format!(
+        "SELECT ?b ?age WHERE {{ <{EX}alice> <{EX}knows> ?b \
+         OPTIONAL {{ ?b <{EX}age> ?age }} FILTER(?age < 30) }}"
+    );
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
+    assert_eq!(rows.len(), 1, "only bob survives an outer FILTER");
+    assert_eq!(rows[0]["age"]["value"], "25");
+}
+
+#[test]
+fn optional_inner_filter_over_shared_variable_only() {
+    let store = optional_filter_store();
+    let engine = HybridEngine::new();
+    // ?age is bound on the left too, so the right side contributes no new
+    // column - the join key covers all of it. The filter must still apply.
+    let q = format!(
+        "SELECT ?b ?age WHERE {{ ?b <{EX}age> ?age \
+         OPTIONAL {{ ?b <{EX}age> ?age FILTER(?age < 30) }} }}"
+    );
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
+    assert_eq!(
+        rows.len(),
+        2,
+        "both ages stay; the OPTIONAL cannot drop rows"
+    );
+    let got = ages_by_person(&rows);
+    assert_eq!(got["bob"], "25");
+    assert_eq!(got["carol"], "60");
+}
+
+#[test]
+fn optional_inner_filter_is_the_join_condition_without_shared_vars() {
+    let store = optional_filter_store();
+    let engine = HybridEngine::new();
+    // No shared variable, so the FILTER *is* the join condition: without it the
+    // left join degenerates into a cross product.
+    let q = format!(
+        "SELECT ?b ?p ?age WHERE {{ <{EX}alice> <{EX}knows> ?b \
+         OPTIONAL {{ ?p <{EX}age> ?age FILTER(?p = ?b) }} }}"
+    );
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
+    assert_eq!(rows.len(), 2, "one row per knows-edge, not 2x2");
+    let got = ages_by_person(&rows);
+    assert_eq!(got["bob"], "25");
+    assert_eq!(got["carol"], "60");
+}
+
+#[test]
+fn optional_inner_filter_rejects_unsupported_expressions() {
+    let store = optional_filter_store();
+    let engine = HybridEngine::new();
+    // `eval` cannot do EXISTS, and a left join reads that error as "no match" —
+    // which would silently unbind every row. It has to be an error instead.
+    let q = format!(
+        "SELECT ?b ?age WHERE {{ <{EX}alice> <{EX}knows> ?b \
+         OPTIONAL {{ ?b <{EX}age> ?age FILTER EXISTS {{ ?b <{EX}age> ?a2 }} }} }}"
+    );
+    let err = execute_sparql(&store, &engine, &q).unwrap_err();
+    assert!(err.contains("EXISTS"), "unexpected error: {err}");
+}
+
+#[test]
+fn optional_inner_filter_accepts_supported_functions() {
+    let store = optional_filter_store();
+    let engine = HybridEngine::new();
+    // The unsupported-expression check must not reject what `eval` does handle.
+    let q = format!(
+        "SELECT ?b ?age WHERE {{ <{EX}alice> <{EX}knows> ?b \
+         OPTIONAL {{ ?b <{EX}age> ?age FILTER(STRLEN(STR(?age)) = 2 && ?age < 30) }} }}"
+    );
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
+    let got = ages_by_person(&rows);
+    assert_eq!(got["bob"], "25");
+    assert_eq!(got["carol"], "UNBOUND");
+}
+
 #[test]
 fn select_filter_numeric() {
     let store = social_store();

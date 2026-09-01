@@ -38,6 +38,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   wherever it took `.nt`.
 
 ### Changed
+- **`hash_join` splits its unfiltered and filtered paths** (`src/sparql.rs`).
+  Applying an `OPTIONAL` filter needs the merged left++right row, and building
+  it in the shared loop would have cost every plain `Join` and every
+  filter-free `OPTIONAL` two extra row copies per output row. The unfiltered
+  case is now its own loop that never builds it. Measured on a 2M-triple
+  synthetic graph (`COUNT(*)`, so serialization is excluded, best-of-5 over 5
+  rounds): a `Join` 197 → 150 ms and an `OPTIONAL` without a filter
+  104 → 80 ms, level with the cost before the filter fix below. Plain
+  multi-pattern BGPs go through the WCOJ engine and never touch `hash_join`.
 - **Turning a term into a value no longer allocates twice per row** —
   `classify()` and `lit_key()` (`src/sparql.rs`) built a constant datatype IRI
   with `format!("{XSD}string")`/`boolean` on every call, just to compare it;
@@ -67,6 +76,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `SELECT ?s WHERE { { SELECT * WHERE { ?s ?p ?o } } }` returned `?s`, `?p` and
   `?o`. (A sub-`SELECT` joined with anything else errored out instead, so only
   the whole-body form returned wrong results silently.)
+- **A `FILTER` inside `OPTIONAL` was silently ignored** (`src/sparql.rs`). The
+  `LeftJoin` arm destructured the algebra node as `{ left, right, .. }`, and the
+  `..` dropped the left-join expression, so
+  `OPTIONAL { ?b :age ?age FILTER(?age < 30) }` returned every match regardless
+  of the filter. It is now applied during the join, with SPARQL 1.1 semantics:
+  a match that fails the expression does not count, so the left row falls
+  through and keeps the optional variables **unbound** rather than being
+  dropped. A `FILTER` placed *after* the `OPTIONAL` is unaffected — it still
+  filters the joined result, and that contrast is now covered by a test.
+  Because the expression is evaluated on the merged row, an `OPTIONAL` sharing
+  no variable with its left side now works as a non-equi join — the `FILTER`
+  *is* the join condition — where it previously produced a cross product:
+  `?b OPTIONAL { ?p :age ?age FILTER(?p = ?b) }` yields one row per `?b`.
+- **A `FILTER` inside `OPTIONAL` that Trillian cannot evaluate is now an error**
+  (`src/sparql.rs`). `eval` reports an unsupported construct the same way it
+  reports a type error — as an expression error — which a left join must read
+  as "no match". `FILTER EXISTS`, `NOT EXISTS`, `COALESCE` and unimplemented
+  functions such as `ABS` would therefore have rejected every match and
+  returned each left row with the optional variables unbound, which looks like
+  a real answer. The left-join expression is now checked before the join and
+  rejected by name (`Unsupported expression in a FILTER inside OPTIONAL:
+  EXISTS`). The check is static, so a construct that runtime short-circuiting
+  would have skipped is still rejected. A top-level `FILTER` is unchanged —
+  it still drops rows it cannot evaluate.
 
 ## [0.3.0] - 2026-08-01
 

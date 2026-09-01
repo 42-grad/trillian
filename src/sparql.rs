@@ -723,15 +723,19 @@ fn eval_where(
             }
             Ok((kept, vo))
         }
-        GP::LeftJoin { left, right, .. } => {
+        GP::LeftJoin {
+            left,
+            right,
+            expression,
+        } => {
             let (lr, lvo) = eval_where(left, store, engine, None)?;
             let (rr, rvo) = eval_where(right, store, engine, None)?;
-            hash_join(lr, &lvo, rr, &rvo, true)
+            hash_join(lr, &lvo, rr, &rvo, true, expression.as_ref(), store)
         }
         GP::Join { left, right } => {
             let (lr, lvo) = eval_where(left, store, engine, None)?;
             let (rr, rvo) = eval_where(right, store, engine, None)?;
-            hash_join(lr, &lvo, rr, &rvo, false)
+            hash_join(lr, &lvo, rr, &rvo, false, None, store)
         }
         GP::Union { left, right } => {
             let (lr, lvo) = eval_where(left, store, engine, None)?;
@@ -836,15 +840,19 @@ fn eval_where_mut(
             }
             Ok((kept, vo))
         }
-        GP::LeftJoin { left, right, .. } => {
+        GP::LeftJoin {
+            left,
+            right,
+            expression,
+        } => {
             let (lr, lvo) = eval_where_mut(left, store, engine, None)?;
             let (rr, rvo) = eval_where_mut(right, store, engine, None)?;
-            hash_join(lr, &lvo, rr, &rvo, true)
+            hash_join(lr, &lvo, rr, &rvo, true, expression.as_ref(), store)
         }
         GP::Join { left, right } => {
             let (lr, lvo) = eval_where_mut(left, store, engine, None)?;
             let (rr, rvo) = eval_where_mut(right, store, engine, None)?;
-            hash_join(lr, &lvo, rr, &rvo, false)
+            hash_join(lr, &lvo, rr, &rvo, false, None, store)
         }
         GP::Union { left, right } => {
             let (lr, lvo) = eval_where_mut(left, store, engine, None)?;
@@ -1522,7 +1530,16 @@ fn hash_join(
     right: RowBlock,
     rvo: &[String],
     left_outer: bool,
+    on: Option<&Expression>,
+    store: &TripleStore,
 ) -> Result<(RowBlock, Vec<String>), String> {
+    // `eval` reports unsupported constructs as an error, which a left join reads
+    // as "no match" — that would silently unbind instead of failing. Reject up front.
+    if let Some(what) = on.and_then(unsupported_in_expr) {
+        return Err(format!(
+            "Unsupported expression in a FILTER inside OPTIONAL: {what}"
+        ));
+    }
     let cap = max_result_rows();
     let mut shared: Vec<(usize, usize)> = Vec::new(); // (left_pos, right_pos)
     let mut new_positions: Vec<usize> = Vec::new();
@@ -1557,26 +1574,68 @@ fn hash_join(
     }
 
     let mut out = RowBlock::new(new_var_order.len());
+
+    // Unfiltered fast path: every hit is a match, so no merged row is built.
+    let Some(on) = on else {
+        for row in left.rows() {
+            let key: Vec<u32> = shared.iter().map(|&(lp, _)| row[lp]).collect();
+            match index.get(&key) {
+                Some(&(count, ref flat)) => {
+                    if new_arity == 0 {
+                        // Match with no new columns -> one row per right hit.
+                        for _ in 0..count {
+                            out.push_row_padded(row, NULL_ID);
+                        }
+                    } else {
+                        for chunk in flat.chunks(new_arity) {
+                            out.push_row_concat(row, chunk);
+                        }
+                    }
+                }
+                None => {
+                    if left_outer {
+                        out.push_row_padded(row, NULL_ID);
+                    }
+                }
+            }
+            if out.n_rows() > cap {
+                return Err(op_too_large());
+            }
+        }
+        return Ok((out, new_var_order));
+    };
+
+    // Filtered (`OPTIONAL { ... FILTER(...) }`): `on` is evaluated on the merged
+    // row, and a match that fails it does not count — the left row then falls
+    // through to the unbound-padded branch rather than being dropped.
+    let mut merged: Vec<u32> = Vec::with_capacity(new_var_order.len());
+    let keeps = |merged: &[u32]| ebv(on, merged, &new_var_order, store) == Ok(true);
     for row in left.rows() {
         let key: Vec<u32> = shared.iter().map(|&(lp, _)| row[lp]).collect();
-        match index.get(&key) {
-            Some(&(count, ref flat)) => {
-                if new_arity == 0 {
-                    // Match with no new columns -> one row per right hit.
+        let mut matched = false;
+        if let Some(&(count, ref flat)) = index.get(&key) {
+            if new_arity == 0 {
+                // Every hit merges to the same row -> one `on` check for all.
+                if keeps(row) {
                     for _ in 0..count {
                         out.push_row_padded(row, NULL_ID);
                     }
-                } else {
-                    for chunk in flat.chunks(new_arity) {
+                    matched = true;
+                }
+            } else {
+                for chunk in flat.chunks(new_arity) {
+                    merged.clear();
+                    merged.extend_from_slice(row);
+                    merged.extend_from_slice(chunk);
+                    if keeps(&merged) {
                         out.push_row_concat(row, chunk);
+                        matched = true;
                     }
                 }
             }
-            None => {
-                if left_outer {
-                    out.push_row_padded(row, NULL_ID);
-                }
-            }
+        }
+        if !matched && left_outer {
+            out.push_row_padded(row, NULL_ID);
         }
         if out.n_rows() > cap {
             return Err(op_too_large());
@@ -2547,6 +2606,58 @@ fn ebv(expr: &Expression, row: &[u32], vars: &[String], store: &TripleStore) -> 
         Fv::Num(n) => Ok(n != 0.0 && !n.is_nan()),
         Fv::Str(s) => Ok(!s.is_empty()),
         _ => Err(()),
+    }
+}
+
+/// Names the first construct in `expr` that `eval` cannot evaluate, if any.
+/// Conservative: a short-circuited operand still counts as used.
+fn unsupported_in_expr(expr: &Expression) -> Option<String> {
+    let any = |es: &[&Expression]| es.iter().copied().find_map(unsupported_in_expr);
+    match expr {
+        Expression::Exists(_) => Some("EXISTS".to_string()),
+        Expression::Coalesce(_) => Some("COALESCE".to_string()),
+        Expression::FunctionCall(f, args) => {
+            if matches!(
+                f,
+                Function::Str
+                    | Function::Lang
+                    | Function::Datatype
+                    | Function::StrLen
+                    | Function::UCase
+                    | Function::LCase
+                    | Function::Contains
+                    | Function::StrStarts
+                    | Function::StrEnds
+                    | Function::IsIri
+                    | Function::IsBlank
+                    | Function::IsLiteral
+                    | Function::IsNumeric
+                    | Function::Regex
+            ) {
+                any(&args.iter().collect::<Vec<_>>())
+            } else {
+                Some(f.to_string())
+            }
+        }
+        Expression::Or(a, b)
+        | Expression::And(a, b)
+        | Expression::Equal(a, b)
+        | Expression::SameTerm(a, b)
+        | Expression::Greater(a, b)
+        | Expression::GreaterOrEqual(a, b)
+        | Expression::Less(a, b)
+        | Expression::LessOrEqual(a, b)
+        | Expression::Add(a, b)
+        | Expression::Subtract(a, b)
+        | Expression::Multiply(a, b)
+        | Expression::Divide(a, b) => any(&[a, b]),
+        Expression::UnaryPlus(a) | Expression::UnaryMinus(a) | Expression::Not(a) => any(&[a]),
+        Expression::If(c, a, b) => any(&[c, a, b]),
+        Expression::In(e, list) => any(&[e]).or_else(|| any(&list.iter().collect::<Vec<_>>())),
+        Expression::NamedNode(_)
+        | Expression::Literal(_)
+        | Expression::Variable(_)
+        | Expression::Bound(_) => None,
     }
 }
 
