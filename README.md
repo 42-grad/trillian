@@ -76,6 +76,7 @@ contribution to open, sovereign, and sustainable data infrastructure.
   }
   ```
 - IRIs, typed/`@lang` literals, blank nodes; `INSERT DATA`/`DELETE DATA`
+- **Input formats**: N-Triples (`.nt`, streaming) and Turtle (`.ttl`)
 
 Not yet supported (but planned): `MINUS`, `VALUES`, and `BIND`, `GROUP BY` or an
 aggregate sub-`SELECT` together with `?infer=rdfs`.
@@ -105,8 +106,8 @@ curl -G 'http://localhost:9090/sparql' \
 cargo build --release --bin server     # builds the `server` binary
 cargo test                             # runs the suite
 
-# Build an index from N-Triples, persist it, then serve it:
-./target/release/server build data.nt /tmp/data.bin
+# Build an index from N-Triples or Turtle, persist it, then serve it:
+./target/release/server build data.nt /tmp/data.bin   # or data.ttl
 ./target/release/server load  /tmp/data.bin 9090
 ```
 

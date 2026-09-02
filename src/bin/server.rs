@@ -16,18 +16,18 @@ async fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     // Modes (separate loader/server stages):
-    //   server build <file.nt> <snapshot.bin>   -> build index + persist
+    //   server build <file.nt|.ttl> <snapshot.bin>   -> build index + persist
     //   server load  <snapshot.bin> [port]      -> load snapshot via mmap + serve
-    //   server <file.nt> [port]                 -> parse + build + serve (default)
+    //   server <file.nt|.ttl> [port]                 -> parse + build + serve (default)
     match args.get(1).map(|s| s.as_str()) {
         Some("build") => {
-            let nt = args
+            let input = args
                 .get(2)
-                .expect("usage: server build <file.nt> <snapshot.bin>");
+                .expect("usage: server build <file.nt|.ttl> <snapshot.bin>");
             let snap = args
                 .get(3)
-                .expect("usage: server build <file.nt> <snapshot.bin>");
-            build_snapshot(nt, snap);
+                .expect("usage: server build <file.nt|.ttl> <snapshot.bin>");
+            build_snapshot(input, snap);
         }
         Some("load") => {
             let snap = args
@@ -37,31 +37,32 @@ async fn main() {
             load_and_serve(snap, port).await;
         }
         Some("profile") => {
-            let nt = args
+            let input = args
                 .get(2)
-                .expect("usage: server profile <file.nt> <query.rq> [runs]");
+                .expect("usage: server profile <file.nt|.ttl> <query.rq> [runs]");
             let qf = args
                 .get(3)
-                .expect("usage: server profile <file.nt> <query.rq> [runs]");
+                .expect("usage: server profile <file.nt|.ttl> <query.rq> [runs]");
             let runs = args.get(4).and_then(|r| r.parse().ok()).unwrap_or(50);
-            profile(nt, qf, runs);
+            profile(input, qf, runs);
         }
         _ => {
-            let nt = args.get(1).map(|s| s.as_str()).unwrap_or("synthetic_1m.nt");
+            let input = args.get(1).map(|s| s.as_str()).unwrap_or("synthetic_1m.nt");
             let port = args.get(2).and_then(|p| p.parse().ok()).unwrap_or(9080);
-            parse_and_serve(nt, port).await;
+            parse_and_serve(input, port).await;
         }
     }
 }
 
-/// Loader: read N-Triples, build the index, persist it as an mmap snapshot.
-fn build_snapshot(nt: &str, snapshot: &str) {
-    println!("Building index from {} ...", nt);
+/// Loader: read the RDF input (.nt or .ttl), build the index, persist it as
+/// an mmap snapshot.
+fn build_snapshot(input: &str, snapshot: &str) {
+    println!("Building index from {} ...", input);
     let t0 = Instant::now();
     let mut store = TripleStore::new();
     let n = store
-        .ingest_ntriples_file(nt)
-        .expect("Failed to parse .nt file");
+        .ingest_rdf_file(input)
+        .expect("Failed to parse the RDF input file");
     store
         .save_snapshot(snapshot)
         .expect("Failed to write snapshot");
@@ -100,12 +101,12 @@ async fn load_and_serve(snapshot: &str, port: u16) {
 
 /// Profiling: build the index in RAM (heap, visible to dhat), print a memory
 /// report, and measure a query with phase timing (parse/eval/serialize).
-fn profile(nt: &str, query_file: &str, runs: usize) {
+fn profile(input: &str, query_file: &str, runs: usize) {
     let mut store = TripleStore::new();
     let t0 = Instant::now();
     let n = store
-        .ingest_ntriples_file(nt)
-        .expect("Failed to parse .nt file");
+        .ingest_rdf_file(input)
+        .expect("Failed to parse the RDF input file");
     println!(
         "Loaded (in-RAM): {} triples, {} terms in {} ms\n",
         n,
@@ -119,13 +120,14 @@ fn profile(nt: &str, query_file: &str, runs: usize) {
     profile_query(&store, &engine, &query, runs);
 }
 
-/// Default: parse N-Triples, build the index, serve (without a snapshot).
-async fn parse_and_serve(nt: &str, port: u16) {
-    println!("Loading N-Triples file: {}", nt);
+/// Default: parse the RDF input (.nt or .ttl), build the index, serve (without
+/// a snapshot).
+async fn parse_and_serve(input: &str, port: u16) {
+    println!("Loading RDF file: {}", input);
     let mut store = TripleStore::new();
     let n_triples = store
-        .ingest_ntriples_file(nt)
-        .expect("Failed to parse .nt file");
+        .ingest_rdf_file(input)
+        .expect("Failed to parse the RDF input file");
     println!(
         "Ingested {} triples, {} unique terms",
         n_triples,

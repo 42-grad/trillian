@@ -144,6 +144,44 @@ impl TripleStore {
         Ok(n)
     }
 
+    /// Loads a Turtle (`.ttl`) file. Unlike [`TripleStore::ingest_ntriples_file`]
+    /// this is not streaming — a Turtle statement may span any number of lines,
+    /// so the document is parsed whole before the triples are interned.
+    /// Returns the number of triples loaded.
+    pub fn ingest_turtle_file(&mut self, path: &str) -> std::io::Result<usize> {
+        let triples = super::turtle::parse_turtle(path)?;
+        let mut id_triples: Vec<(u32, u32, u32)> = Vec::with_capacity(triples.len());
+        for t in &triples {
+            let sid = self
+                .dict
+                .insert_with_type(&t.subject.value, t.subject.typ.clone());
+            let pid = self
+                .dict
+                .insert_with_type(&t.predicate.value, t.predicate.typ.clone());
+            let oid = self
+                .dict
+                .insert_with_type(&t.object.value, t.object.typ.clone());
+            id_triples.push((sid, pid, oid));
+        }
+        drop(triples);
+        let n = id_triples.len();
+        self.build_indexes(id_triples);
+        Ok(n)
+    }
+
+    /// Loads an RDF file, picking the parser from the extension: `.ttl` is
+    /// Turtle, anything else N-Triples.
+    pub fn ingest_rdf_file(&mut self, path: &str) -> std::io::Result<usize> {
+        if std::path::Path::new(path)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("ttl"))
+        {
+            self.ingest_turtle_file(path)
+        } else {
+            self.ingest_ntriples_file(path)
+        }
+    }
+
     /// Ingest from string triples (backward compatibility; everything as IRI).
     pub fn ingest_str_triples(&mut self, triples: &[(&str, &str, &str)]) {
         let parsed: Vec<ParsedTriple> = triples
