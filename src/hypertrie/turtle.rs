@@ -815,6 +815,16 @@ mod tests {
         assert!(e.contains("illegal prefix label"), "got {e}");
     }
 
+    /// `PN_LOCAL` allows a bare `:`, so `ex:a:b` is one name, not a nested prefix.
+    #[test]
+    fn a_local_name_may_contain_a_colon() {
+        let got = parse("@prefix ex: <http://example.org/> .\nex:a:b ex:p ex:o .");
+        assert_eq!(
+            got,
+            ["http://example.org/a:b|http://example.org/p|http://example.org/o"]
+        );
+    }
+
     #[test]
     fn predicate_object_and_object_lists() {
         // `;` repeats the subject, `,` repeats subject and predicate.
