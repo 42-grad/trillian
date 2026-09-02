@@ -642,6 +642,7 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `n` is only ever 4 or 8, so `code` tops out at `u32::MAX` and cannot overflow.
     fn hex(&mut self, n: usize) -> Result<char, String> {
         let mut code: u32 = 0;
         for _ in 0..n {
