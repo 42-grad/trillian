@@ -45,6 +45,81 @@ fn score_store() -> TripleStore {
     ))
 }
 
+/// Ingests a Turtle document and returns the store.
+fn turtle_store(ttl: &str) -> (TripleStore, usize) {
+    let path = unique_path_ext("graph", "ttl");
+    std::fs::write(&path, ttl).unwrap();
+    let mut store = TripleStore::new();
+    // Goes through ingest_rdf_file so the .ttl extension dispatch is covered too.
+    let n = store.ingest_rdf_file(path.to_str().unwrap()).unwrap();
+    let _ = std::fs::remove_file(&path);
+    (store, n)
+}
+
+#[test]
+fn turtle_file_loads_and_queries() {
+    let ttl = format!(
+        "@prefix ex: <{EX}> .\n\
+         @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n\
+         \n\
+         ex:alice a ex:Person ;\n\
+             ex:name \"Alice\" ;\n\
+             ex:age 30 ;\n\
+             ex:knows ex:bob, ex:carol .\n\
+         \n\
+         ex:bob a ex:Person ; ex:name \"Bob\" ; ex:age 25 .\n\
+         ex:carol a ex:Person ; ex:name \"Grüße\"@de ; ex:age 41 .\n"
+    );
+    let (store, n) = turtle_store(&ttl);
+    assert_eq!(n, 11, "3 types + 3 names + 3 ages + 2 knows");
+
+    let engine = HybridEngine::new();
+
+    // `a` became rdf:type.
+    let q = format!(
+        "SELECT ?s WHERE {{ ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{EX}Person> }}"
+    );
+    assert_eq!(
+        bindings(&execute_sparql(&store, &engine, &q).unwrap()).len(),
+        3
+    );
+
+    // The bare `30` became a typed integer, so a numeric FILTER sees it.
+    let q = format!("SELECT ?s WHERE {{ ?s <{EX}age> ?age FILTER(?age > 28) }}");
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
+    assert_eq!(rows.len(), 2, "alice (30) and carol (41)");
+
+    // A non-ASCII literal with a language tag survives ingest intact.
+    let q = format!("SELECT ?n WHERE {{ <{EX}carol> <{EX}name> ?n }}");
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
+    assert_eq!(rows[0]["n"]["value"], "Grüße");
+    assert_eq!(rows[0]["n"]["xml:lang"], "de");
+}
+
+#[test]
+fn turtle_collections_and_blank_nodes_query() {
+    let ttl = format!(
+        "@prefix ex: <{EX}> .\n\
+         ex:cart ex:items ( ex:apple ex:pear ) ; ex:buyer [ ex:name \"Anon\" ] .\n"
+    );
+    let (store, _) = turtle_store(&ttl);
+    let engine = HybridEngine::new();
+
+    // The collection is reachable as an rdf:first/rest chain.
+    let q = format!(
+        "SELECT ?item WHERE {{ <{EX}cart> <{EX}items> ?l . \
+         ?l <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest>* ?cell . \
+         ?cell <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> ?item }}"
+    );
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
+    assert_eq!(rows.len(), 2, "both collection members");
+
+    // The `[ ... ]` bnode carries its nested statement.
+    let q = format!("SELECT ?n WHERE {{ <{EX}cart> <{EX}buyer> ?b . ?b <{EX}name> ?n }}");
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
+    assert_eq!(rows[0]["n"]["value"], "Anon");
+}
+
 /// Parse a SPARQL-results JSON body and return the `bindings` array.
 fn bindings(json: &str) -> Vec<Value> {
     let v: Value = serde_json::from_str(json).expect("valid SPARQL-results JSON");
@@ -55,9 +130,17 @@ fn bindings(json: &str) -> Vec<Value> {
 }
 
 fn unique_path(tag: &str) -> std::path::PathBuf {
+    unique_path_ext(tag, "bin")
+}
+
+/// The extension matters for `ingest_rdf_file`, which picks its parser from it.
+fn unique_path_ext(tag: &str, ext: &str) -> std::path::PathBuf {
     static N: AtomicU32 = AtomicU32::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("trillian_it_{}_{tag}_{n}.bin", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "trillian_it_{}_{tag}_{n}.{ext}",
+        std::process::id()
+    ))
 }
 
 #[test]
