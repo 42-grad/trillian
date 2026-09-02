@@ -1,5 +1,9 @@
 <p align="center">
-  <img src="logo.png" alt="Trillian" width="480">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="assets/logo-light.png">
+    <img src="assets/logo-light.png" alt="Trillian" width="320">
+  </picture>
 </p>
 
 # Trillian
