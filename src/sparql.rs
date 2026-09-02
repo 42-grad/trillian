@@ -5040,6 +5040,10 @@ mod tests {
 
     /// An intern the log never saw shifts every later ID, so the replay rebuilds
     /// the wrong triples. Queries intern too, so they have to log as well.
+    ///
+    /// Routed through [`AppState::needs_write`]/[`AppState::write_locked`], the
+    /// wiring the handlers use and where the bug sat — repeating their body here
+    /// would test a copy of it instead.
     #[test]
     fn a_term_interned_by_a_query_is_logged_so_the_replay_stays_aligned() {
         let path = std::env::temp_dir().join(format!(
@@ -5048,32 +5052,36 @@ mod tests {
             &0u8
         ));
         let _ = std::fs::remove_file(&path);
-        let mut wal = Wal::open_append(path.to_str().unwrap()).unwrap();
-        let mut store = test_store();
-        let engine = HybridEngine::new();
-
-        // A query that mints an ID, exactly as `AppState::write_locked` runs it.
-        let first_new_id = store.dict.len();
-        execute_sparql_bind(
-            &mut store,
-            &engine,
-            "SELECT ?s WHERE { VALUES ?s { <http://example.org/ghost> } }",
-        )
-        .unwrap();
-        assert!(
-            store.dict.len() > first_new_id,
-            "the query interned nothing"
+        let state = AppState::with_wal(
+            test_store(),
+            Some(Wal::open_append(path.to_str().unwrap()).unwrap()),
         );
-        log_interned_since(&store, first_new_id, &mut wal).unwrap();
+        let dict_len = || state.store.read().unwrap().dict.len();
+
+        // A query that mints an ID, taking the same route the handlers take.
+        let query = "SELECT ?s WHERE { VALUES ?s { <http://example.org/ghost> } }";
+        assert!(
+            state.needs_write(query),
+            "the query should take the write lock"
+        );
+        let first_new_id = dict_len();
+        state
+            .write_locked(|store| execute_sparql_bind(store, &state.engine, query))
+            .unwrap();
+        assert!(dict_len() > first_new_id, "the query interned nothing");
 
         // Then a logged update, whose IDs follow the ones the query took.
-        execute_update(
-            &mut store,
-            "INSERT DATA { <http://example.org/x> <http://example.org/p> <http://example.org/y> }",
-            Some(&mut wal),
-        )
-        .unwrap();
-        wal.sync().unwrap();
+        {
+            let mut store = state.store.write().unwrap();
+            let mut wal = state.wal.as_ref().unwrap().lock().unwrap();
+            execute_update(
+                &mut store,
+                "INSERT DATA { <http://example.org/x> <http://example.org/p> <http://example.org/y> }",
+                Some(&mut wal),
+            )
+            .unwrap();
+            wal.sync().unwrap();
+        }
 
         let mut restored = test_store();
         Wal::replay(path.to_str().unwrap(), &mut restored).unwrap();

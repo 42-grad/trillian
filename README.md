@@ -85,11 +85,12 @@ contribution to open, sovereign, and sustainable data infrastructure.
   ```
 - IRIs, typed/`@lang` literals, blank nodes; `INSERT DATA`/`DELETE DATA`
 
-Not yet supported (but planned): `FILTER EXISTS`/`NOT EXISTS`, `COALESCE`,
-`UNDEF` in `VALUES`, and anything that has to intern a term (`BIND`, `GROUP BY`,
-an aggregate sub-`SELECT`, an unknown `VALUES` term) together with `?infer=rdfs`.
-All are rejected with an error rather than silently answered — see
-[ROADMAP](ROADMAP.md).
+Not yet supported (but planned): `FILTER EXISTS`/`NOT EXISTS`, `COALESCE`, the
+functions outside the list above (`SUBSTR`, `ABS`, `CONCAT`, `REPLACE`, the date
+and hash functions, …), `UNDEF` in `VALUES`, and anything that has to intern a
+term (`BIND`, `GROUP BY`, an aggregate sub-`SELECT`, an unknown `VALUES` term)
+together with `?infer=rdfs`. All are rejected with an error rather than silently
+answered — see [ROADMAP](ROADMAP.md).
 
 ### Inference (RDFS backward chaining)
 
