@@ -79,7 +79,7 @@ impl AppState {
         let first_new_id = store.dict.len();
         let result = f(&mut store);
         if let Some(w) = wal.as_deref_mut() {
-            log_interned_since(&store, first_new_id, w)?;
+            log_interned_and_sync(&store, first_new_id, w)?;
         }
         result
     }
@@ -252,7 +252,7 @@ pub async fn stream_handler(
             StoreGuard::Read(store) => evaluate_select(store, &state.engine, &query_str),
         };
         if let Some(w) = wal.as_deref_mut()
-            && let Err(e) = log_interned_since(guard.as_ref(), first_new_id, w)
+            && let Err(e) = log_interned_and_sync(guard.as_ref(), first_new_id, w)
         {
             result = Err(e);
         }
@@ -2335,7 +2335,7 @@ fn log_interned_since(
     store: &TripleStore,
     first_new_id: usize,
     wal: &mut Wal,
-) -> Result<(), String> {
+) -> Result<usize, String> {
     for id in first_new_id..store.dict.len() {
         let id = id as u32;
         let (Some(value), Some(typ)) = (store.dict.resolve(id), store.dict.resolve_type(id)) else {
@@ -2344,6 +2344,19 @@ fn log_interned_since(
             ));
         };
         wal.log_term(&value, &typ).map_err(|e| e.to_string())?;
+    }
+    Ok(store.dict.len() - first_new_id)
+}
+
+/// Logs what a query interned and forces it to disk. Unsynced term records sit
+/// in the writer's buffer, so a crash tears the log mid-record.
+fn log_interned_and_sync(
+    store: &TripleStore,
+    first_new_id: usize,
+    wal: &mut Wal,
+) -> Result<(), String> {
+    if log_interned_since(store, first_new_id, wal)? > 0 {
+        wal.sync().map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -5090,6 +5103,40 @@ mod tests {
             "SELECT ?o WHERE { <http://example.org/x> <http://example.org/p> ?o }",
         );
         assert_eq!(values_of(&rows, "o"), vec!["http://example.org/y"]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A query's interned terms have to reach disk, not sit in the writer's
+    /// buffer: an unsynced tail is what tears the log when the process dies,
+    /// and a torn record costs every update appended after it.
+    #[test]
+    fn a_term_interned_by_a_query_is_synced_not_left_buffered() {
+        let path = std::env::temp_dir().join(format!(
+            "trillian_wal_sync_{}_{:p}.wal",
+            std::process::id(),
+            &0u8
+        ));
+        let _ = std::fs::remove_file(&path);
+        let state = AppState::with_wal(
+            test_store(),
+            Some(Wal::open_append(path.to_str().unwrap()).unwrap()),
+        );
+
+        let query = "SELECT ?s WHERE { VALUES ?s { <http://example.org/ghost> } }";
+        state
+            .write_locked(|store| execute_sparql_bind(store, &state.engine, query))
+            .unwrap();
+
+        // Nothing here synced, so the term is on disk only if the query path did.
+        let mut restored = test_store();
+        Wal::replay(path.to_str().unwrap(), &mut restored).unwrap();
+        assert!(
+            restored
+                .dict
+                .lookup_iri("http://example.org/ghost")
+                .is_some(),
+            "the query's term never reached disk"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

@@ -55,32 +55,38 @@ impl Wal {
         self.writer.get_ref().sync_data()
     }
 
-    /// Replays the log onto a (freshly loaded) store. Returns the number of
-    /// operations applied. A torn last record (crash mid-write) is ignored.
-    pub fn replay(path: &str, store: &mut TripleStore) -> std::io::Result<usize> {
+    /// Replays the log onto a (freshly loaded) store, then drops an unreadable
+    /// tail so that whatever is appended next is still reachable on the next
+    /// replay. A torn last record (crash mid-write) is what produces one.
+    pub fn replay(path: &str, store: &mut TripleStore) -> std::io::Result<Replay> {
         let file = match File::open(path) {
             Ok(f) => f,
-            Err(_) => return Ok(0), // no log -> nothing to do
+            Err(_) => return Ok(Replay::default()), // no log -> nothing to do
         };
         let mut buf = Vec::new();
         BufReader::new(file).read_to_end(&mut buf)?;
 
         let mut p = 0usize;
         let mut applied = 0usize;
-        while p < buf.len() {
+        // Offset just past the last fully readable record.
+        let valid = loop {
+            if p >= buf.len() {
+                break p;
+            }
+            let start = p;
             let tag = buf[p];
             p += 1;
             match tag {
                 0x02 => {
                     let Some((value, typ, np)) = read_term(&buf, p) else {
-                        break;
+                        break start;
                     };
                     store.dict.insert_with_type(&value, typ);
                     p = np;
                 }
                 0x00 | 0x01 => {
                     if p + 12 > buf.len() {
-                        break;
+                        break start;
                     }
                     let s = rd_u32(&buf, p);
                     let pr = rd_u32(&buf, p + 4);
@@ -93,11 +99,29 @@ impl Wal {
                     }
                     applied += 1;
                 }
-                _ => break,
+                _ => break start,
             }
+        };
+
+        // Without this, `open_append` writes past the bad record and every
+        // later operation is silently lost on the next replay.
+        let discarded = (buf.len() - valid) as u64;
+        if discarded > 0 {
+            OpenOptions::new()
+                .write(true)
+                .open(path)?
+                .set_len(valid as u64)?;
         }
-        Ok(applied)
+        Ok(Replay { applied, discarded })
     }
+}
+
+/// Outcome of a replay: operations applied, and bytes dropped from an
+/// unreadable tail.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Replay {
+    pub applied: usize,
+    pub discarded: u64,
 }
 
 fn rd_u32(b: &[u8], p: usize) -> u32 {
@@ -177,10 +201,13 @@ mod tests {
     fn temp_path(tag: &str) -> String {
         static N: AtomicU32 = AtomicU32::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir()
+        let path = std::env::temp_dir()
             .join(format!("trillian_wal_{tag}_{n}.log"))
             .to_string_lossy()
-            .into_owned()
+            .into_owned();
+        // The counter restarts per process, so a failed run leaves this behind.
+        let _ = std::fs::remove_file(&path);
+        path
     }
 
     /// Writes three IRI terms (IDs 0,1,2) + one insert and checks that the
@@ -198,7 +225,7 @@ mod tests {
         }
 
         let mut store = TripleStore::new();
-        let applied = Wal::replay(&path, &mut store).unwrap();
+        let applied = Wal::replay(&path, &mut store).unwrap().applied;
         assert_eq!(applied, 1);
         assert_eq!(store.triple_count(), 1);
         assert_eq!(store.dict.lookup_iri("http://ex/s"), Some(0));
@@ -222,7 +249,7 @@ mod tests {
         }
 
         let mut store = TripleStore::new();
-        let applied = Wal::replay(&path, &mut store).unwrap();
+        let applied = Wal::replay(&path, &mut store).unwrap().applied;
         assert_eq!(applied, 2); // one insert + one delete applied
         assert_eq!(store.triple_count(), 0);
 
@@ -277,8 +304,49 @@ mod tests {
         }
 
         let mut store = TripleStore::new();
-        let applied = Wal::replay(&path, &mut store).unwrap();
+        let applied = Wal::replay(&path, &mut store).unwrap().applied;
         assert_eq!(applied, 1); // only the complete operation
+        assert_eq!(store.triple_count(), 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The replay drops the torn tail, so an operation appended afterwards is
+    /// still reachable. Without the truncation the replay stops at the bad
+    /// record and every later update is silently lost.
+    #[test]
+    fn an_op_appended_after_a_torn_record_survives() {
+        use std::io::Write;
+        let path = temp_path("torn_then_append");
+        {
+            let mut wal = Wal::open_append(&path).unwrap();
+            wal.log_term("a", &TermType::Iri).unwrap();
+            wal.log_term("b", &TermType::Iri).unwrap();
+            wal.log_term("c", &TermType::Iri).unwrap();
+            wal.sync().unwrap();
+        }
+        // Crash mid-record: a term tag with only part of its header.
+        {
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(&[0x02, 0x03, 0x00]).unwrap();
+            f.sync_data().unwrap();
+        }
+
+        // Restart: replay repairs the tail, then the server appends to it.
+        let mut store = TripleStore::new();
+        let first = Wal::replay(&path, &mut store).unwrap();
+        assert_eq!(first.discarded, 3, "the torn record should be dropped");
+        {
+            let mut wal = Wal::open_append(&path).unwrap();
+            wal.log_op(true, 0, 1, 2).unwrap();
+            wal.sync().unwrap();
+        }
+
+        // Next restart: the appended operation must still be applied.
+        let mut store = TripleStore::new();
+        let second = Wal::replay(&path, &mut store).unwrap();
+        assert_eq!(second.applied, 1, "the op after the torn record was lost");
+        assert_eq!(second.discarded, 0);
         assert_eq!(store.triple_count(), 1);
 
         let _ = std::fs::remove_file(&path);
