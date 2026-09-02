@@ -14,6 +14,7 @@ const supported = [
   "Sub-SELECT, with its own modifiers and GROUP BY, joined against the enclosing pattern",
   "Property paths: / ^ | * + ? and negated property sets",
   "IRIs, typed / @lang literals, blank nodes",
+  "N-Triples (.nt) and Turtle (.ttl) input",
   "INSERT DATA / DELETE DATA via WAL",
 ];
 
@@ -21,7 +22,6 @@ const planned = [
   "FILTER EXISTS / NOT EXISTS, COALESCE, and the unimplemented functions",
   "UNDEF in VALUES, and nested/multiple OPTIONAL patterns",
   "BIND, GROUP BY and VALUES combined with ?infer=rdfs",
-  "Turtle (.ttl) input",
   "WAL checkpointing and snapshot rotation",
 ];
 ---
