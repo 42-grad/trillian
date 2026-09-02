@@ -40,6 +40,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `MIN`/`MAX`/`SAMPLE` are unbound.
 - **Expression arguments for `SUM`/`AVG`** — `SUM(?v + 1)`. The others still
   need a bare variable, which is what lets them return the source term.
+- **Turtle (`.ttl`) input** (`src/hypertrie/turtle.rs`) — RDF 1.1 Turtle minus
+  RDF-star: prefixes and `@base` (both the `@` and SPARQL-style forms), `a`,
+  `;`/`,` lists, blank-node property lists, collections (expanded to an
+  `rdf:first`/`rdf:rest` chain), all four quote forms, and comments. The
+  numeric and boolean shorthands are typed by their shape, so a bare `30`
+  filters numerically. Parse errors carry a line number.
+- `TripleStore::ingest_turtle_file`, plus `ingest_rdf_file`, which picks the
+  parser from the extension. The `server` binary now takes either format
+  wherever it took `.nt`.
 
 ### Changed
 - **`hash_join` splits its unfiltered and filtered paths** (`src/sparql.rs`).
@@ -77,6 +86,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and unimplemented functions (`SUBSTR`, `ABS`, …) answered *every* query with
   zero rows, and `BIND` left the variable unbound. `check_expr`
   (`src/sparql.rs`) runs the same `unsupported_in_expr` walk before the rows.
+- **Non-ASCII literals were silently corrupted on ingest**
+  (`src/hypertrie/export.rs`). `parse_quoted_string` walked `s.as_bytes()` and
+  did `bytes[i] as char`, reading each UTF-8 byte as a Latin-1 codepoint, so
+  `"café"` loaded as `"cafÃ©"` — no error, and every existing test was ASCII.
+  Parsing now iterates characters, and the escapes the old code missed (`\'`,
+  `\b`, `\f`) are supported; `escape_literal` emits `\b`/`\f` so serialization
+  round-trips.
 - **A sub-`SELECT`'s modifiers no longer leak to the enclosing query.**
   `peel_modifiers` walked the whole `Slice`/`Distinct`/`Project`/`OrderBy`
   chain in one loop, so on a nested modifier stack the inner `SELECT`'s
