@@ -61,7 +61,8 @@ contribution to open, sovereign, and sustainable data infrastructure.
 - `VALUES` — an inline table of solutions, one or several variables wide,
   either as a group element or trailing the `WHERE` clause. A term the graph
   lacks is interned on demand so a standalone table hands it back verbatim;
-  only that case takes the write lock. `UNDEF` is not supported yet.
+  only that case takes the write lock. `UNDEF` leaves a cell unbound, which the
+  join matches as a wildcard.
 - `GROUP BY` with `HAVING` and the `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`,
   `SAMPLE` and `GROUP_CONCAT` aggregates, each accepting `DISTINCT`.
   `MIN`/`MAX`/`SAMPLE` hand back the stored term, so the result keeps its
@@ -92,7 +93,7 @@ contribution to open, sovereign, and sustainable data infrastructure.
 
 Not yet supported (but planned): `FILTER EXISTS`/`NOT EXISTS`, `COALESCE`, the
 functions outside the list above (`SUBSTR`, `ABS`, `CONCAT`, `REPLACE`, the date
-and hash functions, …), `UNDEF` in `VALUES`, and anything that has to intern a
+and hash functions, …), and anything that has to intern a
 term (`BIND`, `GROUP BY`, an aggregate sub-`SELECT`, an unknown `VALUES` term)
 together with `?infer=rdfs`. All are rejected with an error rather than silently
 answered — see [ROADMAP](ROADMAP.md).

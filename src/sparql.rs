@@ -886,7 +886,7 @@ fn contains_group(gp: &spargebra::algebra::GraphPattern) -> bool {
 
 /// Whether `gp` contains a `VALUES` table naming a term `dict` does not hold —
 /// the only case where the table forces the query off the read lock (see
-/// [`eval_values`]). `UNDEF` is rejected on either path, so it does not count.
+/// [`eval_values`]). An `UNDEF` cell names no term, so it does not count.
 fn contains_unknown_values_term(gp: &spargebra::algebra::GraphPattern, dict: &Dictionary) -> bool {
     contains_node(gp, &|g| match g {
         spargebra::algebra::GraphPattern::Values { bindings, .. } => {
@@ -1662,10 +1662,20 @@ fn hash_join(
     // impossible to distinguish "key missing" from "key hits, but 0 new
     // columns" – which previously swallowed all such joins (e.g. c2rpq paths
     // with a bound object -> join over the blank-node node).
+    // A right row unbound on a join key is compatible with any value there, so
+    // it cannot go in the hash. Usually there are none — and a left row unbound
+    // on one falls back to a scan of the right for the same reason. With a
+    // single join variable that scan is output-bound (every right row matches);
+    // only a multi-variable key that is unbound in part both scans and filters.
     let mut index: rustc_hash::FxHashMap<Vec<u32>, (usize, Vec<u32>)> =
         rustc_hash::FxHashMap::default();
+    let mut partial: Vec<&[u32]> = Vec::new();
     for rrow in right.rows() {
         let key: Vec<u32> = shared.iter().map(|&(_, rp)| rrow[rp]).collect();
+        if key.contains(&NULL_ID) {
+            partial.push(rrow);
+            continue;
+        }
         let bucket = index.entry(key).or_insert((0, Vec::new()));
         bucket.0 += 1;
         for &p in &new_positions {
@@ -1675,12 +1685,25 @@ fn hash_join(
 
     let mut out = RowBlock::new(new_var_order.len());
 
-    // Unfiltered fast path: every hit is a match, so no merged row is built.
+    // Unfiltered fast path: every hit is a match, so no merged row is built —
+    // only an unbound join key, on either side, falls back to a scan.
     let Some(on) = on else {
+        let mut merged: Vec<u32> = Vec::new();
         for row in left.rows() {
             let key: Vec<u32> = shared.iter().map(|&(lp, _)| row[lp]).collect();
-            match index.get(&key) {
-                Some(&(count, ref flat)) => {
+            let mut matched = false;
+            if key.contains(&NULL_ID) {
+                // An unbound key matches any value, so the hash rules nothing out.
+                for rrow in right.rows() {
+                    if compatible(row, rrow, &shared) {
+                        merge_compatible(row, rrow, &shared, &new_positions, &mut merged);
+                        out.push_row(&merged);
+                        matched = true;
+                    }
+                }
+            } else {
+                if let Some(&(count, ref flat)) = index.get(&key) {
+                    matched = true;
                     if new_arity == 0 {
                         // Match with no new columns -> one row per right hit.
                         for _ in 0..count {
@@ -1692,11 +1715,16 @@ fn hash_join(
                         }
                     }
                 }
-                None => {
-                    if left_outer {
-                        out.push_row_padded(row, NULL_ID);
+                for rrow in &partial {
+                    if compatible(row, rrow, &shared) {
+                        merge_compatible(row, rrow, &shared, &new_positions, &mut merged);
+                        out.push_row(&merged);
+                        matched = true;
                     }
                 }
+            }
+            if !matched && left_outer {
+                out.push_row_padded(row, NULL_ID);
             }
             if out.n_rows() > cap {
                 return Err(op_too_large());
@@ -1713,22 +1741,44 @@ fn hash_join(
     for row in left.rows() {
         let key: Vec<u32> = shared.iter().map(|&(lp, _)| row[lp]).collect();
         let mut matched = false;
-        if let Some(&(count, ref flat)) = index.get(&key) {
-            if new_arity == 0 {
-                // Every hit merges to the same row -> one `on` check for all.
-                if keeps(row) {
-                    for _ in 0..count {
-                        out.push_row_padded(row, NULL_ID);
-                    }
-                    matched = true;
-                }
-            } else {
-                for chunk in flat.chunks(new_arity) {
-                    merged.clear();
-                    merged.extend_from_slice(row);
-                    merged.extend_from_slice(chunk);
+        if key.contains(&NULL_ID) {
+            // An unbound key matches any value, so the hash rules nothing out.
+            for rrow in right.rows() {
+                if compatible(row, rrow, &shared) {
+                    merge_compatible(row, rrow, &shared, &new_positions, &mut merged);
                     if keeps(&merged) {
-                        out.push_row_concat(row, chunk);
+                        out.push_row(&merged);
+                        matched = true;
+                    }
+                }
+            }
+        } else {
+            if let Some(&(count, ref flat)) = index.get(&key) {
+                if new_arity == 0 {
+                    // Every hit merges to the same row -> one `on` check for all.
+                    if keeps(row) {
+                        for _ in 0..count {
+                            out.push_row_padded(row, NULL_ID);
+                        }
+                        matched = true;
+                    }
+                } else {
+                    for chunk in flat.chunks(new_arity) {
+                        merged.clear();
+                        merged.extend_from_slice(row);
+                        merged.extend_from_slice(chunk);
+                        if keeps(&merged) {
+                            out.push_row_concat(row, chunk);
+                            matched = true;
+                        }
+                    }
+                }
+            }
+            for rrow in &partial {
+                if compatible(row, rrow, &shared) {
+                    merge_compatible(row, rrow, &shared, &new_positions, &mut merged);
+                    if keeps(&merged) {
+                        out.push_row(&merged);
                         matched = true;
                     }
                 }
@@ -1844,23 +1894,41 @@ fn minus_rows(
     (out, lvo.to_vec())
 }
 
-/// Whether `right` cancels `left` under [`minus_rows`]: they agree wherever both
-/// bind a shared variable, and at least one is bound on both sides. Shared
-/// variables are the only ones the domains can share, so that is the
-/// disjointness test.
+/// Whether `right` cancels `left` under [`minus_rows`]: compatible, and binding
+/// at least one variable in common. Shared variables are the only ones the
+/// domains can share, so that is the disjointness test.
 fn cancels(left: &[u32], right: &[u32], shared: &[(usize, usize)]) -> bool {
-    let mut overlap = false;
+    compatible(left, right, shared)
+        && shared
+            .iter()
+            .any(|&(lp, rp)| left[lp] != NULL_ID && right[rp] != NULL_ID)
+}
+
+/// SPARQL compatibility: two solutions agree wherever both bind a shared
+/// variable. An unbound column is a wildcard, not a value of its own.
+fn compatible(left: &[u32], right: &[u32], shared: &[(usize, usize)]) -> bool {
+    shared
+        .iter()
+        .all(|&(lp, rp)| left[lp] == NULL_ID || right[rp] == NULL_ID || left[lp] == right[rp])
+}
+
+/// The joined row for a compatible pair: the left row, with every shared column
+/// it leaves unbound taken from the right, then the right's new columns.
+fn merge_compatible(
+    left: &[u32],
+    right: &[u32],
+    shared: &[(usize, usize)],
+    new_positions: &[usize],
+    out: &mut Vec<u32>,
+) {
+    out.clear();
+    out.extend_from_slice(left);
     for &(lp, rp) in shared {
-        let (l, r) = (left[lp], right[rp]);
-        if l == NULL_ID || r == NULL_ID {
-            continue;
+        if out[lp] == NULL_ID {
+            out[lp] = right[rp];
         }
-        if l != r {
-            return false;
-        }
-        overlap = true;
     }
-    overlap
+    out.extend(new_positions.iter().map(|&p| right[p]));
 }
 
 /// Evaluates a `VALUES` inline table into a row block.
@@ -1872,8 +1940,8 @@ fn cancels(left: &[u32], right: &[u32], shared: &[(usize, usize)]) -> bool {
 /// query to the write path, whose resolver interns instead; that leaves
 /// `?infer=rdfs`, read-only by construction, as the one caller that sees it.
 ///
-/// `UNDEF` is rejected because [`hash_join`] matches an unbound column as a
-/// value, not as the wildcard SPARQL compatibility makes it — see ROADMAP.
+/// An `UNDEF` cell binds nothing, and [`hash_join`] reads the unbound column as
+/// the wildcard SPARQL compatibility makes it.
 fn eval_values(
     variables: &[Variable],
     bindings: &[Vec<Option<GroundTerm>>],
@@ -1885,12 +1953,8 @@ fn eval_values(
     for binding in bindings {
         buf.fill(NULL_ID);
         for (slot, cell) in buf.iter_mut().zip(binding) {
-            let Some(term) = cell else {
-                return Err(
-                    "UNDEF in VALUES is not supported yet (an unbound join key is matched as a value, not as a wildcard)"
-                        .to_string(),
-                );
-            };
+            // UNDEF: leave the slot at NULL_ID, which the join treats as a wildcard.
+            let Some(term) = cell else { continue };
             let parsed = ground_term_to_parsed(term)?;
             *slot = resolve(&parsed).ok_or_else(|| {
                 format!(
@@ -3722,24 +3786,33 @@ mod tests {
         let result: Value =
             serde_json::from_str(&execute_sparql(&store, &engine, &q).unwrap()).unwrap();
         let rows = result["results"]["bindings"].as_array().unwrap();
-        // Correct SPARQL semantics (left-deep):
-        //   s1×{m1,m2} -> 2 rows with x5=c1/c2; s2 -> 1 fully NULL row = 3.
-        // NO cross product: the noise triple (noise P625 nc) must NOT appear.
-        assert_eq!(rows.len(), 3, "left-deep OPTIONAL chain, no cross product");
-        let x5: Vec<Option<&str>> = rows
+        // Left-deep, with SPARQL compatibility for the unbound ?x3:
+        //   s1×{m1,m2} -> 2 rows with x5=c1/c2, and s2 (?x3 unbound, so its
+        //   domain is disjoint from the right's) joins all three P625 triples.
+        // This OPTIONAL chain is not well-designed — ?x3 comes from an earlier
+        // OPTIONAL — so the noise triple genuinely belongs in the answer.
+        // Cross-checked against rdflib 7.6.0, which returns the same 5 rows.
+        assert_eq!(rows.len(), 5, "left-deep OPTIONAL chain");
+        let pairs: Vec<(Option<&str>, Option<&str>)> = rows
             .iter()
             .map(|r| {
-                r.get("x5")
-                    .and_then(|v| v.get("value"))
-                    .and_then(|v| v.as_str())
+                let get = |k| r.get(k).and_then(|v: &Value| v.get("value")?.as_str());
+                (get("x1"), get("x5"))
             })
             .collect();
-        assert!(x5.contains(&Some("http://ex/c1")));
-        assert!(x5.contains(&Some("http://ex/c2")));
-        assert!(x5.contains(&None)); // s2 row: x3=NULL -> x5=NULL
+        for expect in [
+            (Some("http://ex/s1"), Some("http://ex/c1")),
+            (Some("http://ex/s1"), Some("http://ex/c2")),
+            (Some("http://ex/s2"), Some("http://ex/c1")),
+            (Some("http://ex/s2"), Some("http://ex/c2")),
+            (Some("http://ex/s2"), Some("http://ex/nc")),
+        ] {
+            assert!(pairs.contains(&expect), "missing {expect:?} in {pairs:?}");
+        }
+        // ?x3 is bound for s1, so the noise triple stays out of its rows.
         assert!(
-            !x5.contains(&Some("http://ex/nc")),
-            "no noise triple (cross product)"
+            !pairs.contains(&(Some("http://ex/s1"), Some("http://ex/nc"))),
+            "{pairs:?}"
         );
     }
 
@@ -4905,21 +4978,71 @@ mod tests {
         ));
     }
 
-    /// UNDEF is refused instead of silently answering with an empty result:
-    /// the join matches an unbound column as a value, not as a wildcard.
+    /// An UNDEF column is a wildcard: it joins with any value, while the bound
+    /// column of the same row still constrains the match.
     #[test]
-    fn values_undef_is_rejected() {
+    fn values_undef_joins_as_a_wildcard() {
         let store = test_store();
-        let engine = HybridEngine::new();
-        let err = execute_sparql(
+        let rows = rows_of(
             &store,
-            &engine,
             "SELECT ?s ?o WHERE { \
              VALUES (?s ?o) { (<http://example.org/alice> UNDEF) } \
              ?s <http://example.org/knows> ?o }",
-        )
-        .unwrap_err();
-        assert!(err.contains("UNDEF"), "unexpected error: {err}");
+        );
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["s"]["value"], "http://example.org/alice");
+        assert_eq!(rows[0]["o"]["value"], "http://example.org/bob");
+    }
+
+    /// The merged row takes each column from whichever side binds it.
+    #[test]
+    fn undef_on_both_sides_merges_the_bound_halves() {
+        let store = test_store();
+        let rows = rows_of(
+            &store,
+            "SELECT ?s ?o WHERE { \
+             VALUES (?s ?o) { (<http://example.org/alice> UNDEF) } \
+             VALUES (?s ?o) { (UNDEF <http://example.org/bob>) } }",
+        );
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["s"]["value"], "http://example.org/alice");
+        assert_eq!(rows[0]["o"]["value"], "http://example.org/bob");
+    }
+
+    /// A right row unbound on the join key stays out of the hash and still
+    /// matches every left row.
+    #[test]
+    fn an_unbound_right_join_key_matches_every_left_row() {
+        let store = test_store();
+        let rows = rows_of(
+            &store,
+            "SELECT ?s ?o ?x WHERE { \
+             ?s <http://example.org/knows> ?o . \
+             VALUES (?o ?x) { (UNDEF <http://example.org/alice>) } }",
+        );
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert!(
+            rows.iter()
+                .all(|r| r["x"]["value"] == "http://example.org/alice")
+        );
+    }
+
+    /// The wildcard is per column: a right row unbound on one join key still has
+    /// to agree on the other, so this OPTIONAL pads every row instead.
+    #[test]
+    fn an_unbound_column_does_not_widen_the_rest_of_the_key() {
+        let store = test_store();
+        let rows = rows_of(
+            &store,
+            "SELECT ?s ?o WHERE { \
+             ?s <http://example.org/knows> ?o . \
+             OPTIONAL { VALUES (?s ?o) { (<http://example.org/age> UNDEF) } } }",
+        );
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert!(
+            rows.iter().all(|r| r["o"].get("value").is_some()),
+            "{rows:?}"
+        );
     }
 
     /// `VALUES` inside a sub-`SELECT` is scoped to it like any other pattern.

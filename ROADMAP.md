@@ -5,12 +5,6 @@ open an issue first to agree on the approach (see [CONTRIBUTING.md](CONTRIBUTING
 
 ## SPARQL features
 
-- Compatibility semantics for an unbound join key: `hash_join`
-  (`src/sparql.rs`) matches an unbound column as a value rather than as the
-  wildcard SPARQL defines, so a solution left unbound by `OPTIONAL`/`UNION`
-  does not join with a bound one. This is why `UNDEF` in `VALUES` is rejected.
-  `minus_rows` no longer shares the limitation, so the fix is contained to the
-  join.
 - `FILTER EXISTS`/`NOT EXISTS`, `COALESCE`, and the unimplemented functions
   (`SUBSTR`, `ABS`, `CONCAT`, `REPLACE`, the date and hash functions, …), all
   named by `unsupported_in_expr` and rejected today, in a top-level `FILTER`

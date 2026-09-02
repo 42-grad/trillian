@@ -18,8 +18,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   carry dictionary IDs, so a term the graph lacks is interned on demand and a
   standalone table hands it back verbatim. Only that case takes the write lock:
   `query_needs_write` resolves the table first, so the common
-  `VALUES ?s { … } ?s ?p ?o` stays concurrent. `UNDEF` is rejected rather than
-  silently answered — see ROADMAP.
+  `VALUES ?s { … } ?s ?p ?o` stays concurrent. `UNDEF` leaves a cell unbound,
+  which the join now reads as a wildcard — see below.
 - **Sub-`SELECT`** — a nested `SELECT` inside the `WHERE` clause
   (`src/sparql.rs`), with its own `DISTINCT`, `ORDER BY`, `LIMIT`/`OFFSET` and
   `GROUP BY`, joined against the enclosing pattern and nestable.
@@ -74,6 +74,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   forms test the same datatype IRI.
 
 ### Fixed
+- **An unbound join key is a wildcard, not a value.** `hash_join`
+  (`src/sparql.rs`) matched an unbound column as a value, where SPARQL calls
+  two solutions compatible when they agree on the variables both bind. Lifts
+  the `UNDEF` restriction on `VALUES`; a non-well-designed `OPTIONAL` chain
+  now returns the extra solutions the standard calls for.
 - **A query no longer corrupts the write-ahead log.** The log records
   operations by ID but reconstructs IDs from the order of its term records, so
   an unlogged intern shifts every later one and the replay rebuilds the wrong
