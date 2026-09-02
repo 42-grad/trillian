@@ -190,6 +190,12 @@ impl<'a> Parser<'a> {
             return self.err("prefix declaration without ':'");
         };
         let name = self.rest()[..colon].to_string();
+        // Reject here rather than at the use site, where the error is confusing.
+        let legal = name.is_empty()
+            || (name.starts_with(is_name_start_char) && name.chars().all(is_name_char));
+        if !legal {
+            return self.err("illegal prefix label");
+        }
         self.i += colon + 1;
         self.ws();
         let Some(target) = self.iri_ref()? else {
@@ -464,6 +470,11 @@ impl<'a> Parser<'a> {
         let start = self.i;
         let mut prefix = self.take_while(is_name_char);
         self.give_back_trailing_dots(&mut prefix);
+        // The empty prefix is legal; a non-empty one must start with PN_CHARS_BASE.
+        if !prefix.is_empty() && !prefix.starts_with(is_name_start_char) {
+            self.i = start;
+            return self.err("prefix label starts with an illegal character");
+        }
         if !self.eat(":") {
             self.i = start;
             return self.err("expected a term");
@@ -711,6 +722,12 @@ fn is_name_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '-' || c == '.' || !c.is_ascii()
 }
 
+/// Turtle's `PN_CHARS_BASE`: what a prefix label may start with. Narrower than
+/// [`is_name_char`], which also has to cover blank-node labels (`_:1`).
+fn is_name_start_char(c: char) -> bool {
+    c.is_alphabetic() || !c.is_ascii()
+}
+
 /// Characters allowed unescaped in the local part of a prefixed name.
 fn is_local_char(c: char) -> bool {
     c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '%' | ':') || !c.is_ascii()
@@ -789,6 +806,13 @@ mod tests {
             got,
             ["http://example.org/a|http://example.org/b|http://example.org/c"]
         );
+    }
+
+    #[test]
+    fn a_prefix_label_must_start_with_a_letter() {
+        let e = parse_turtle_str("@prefix _x: <http://example.org/> .\n_x:a _x:b _x:c .")
+            .expect_err("'_' is not PN_CHARS_BASE");
+        assert!(e.contains("illegal prefix label"), "got {e}");
     }
 
     #[test]
