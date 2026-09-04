@@ -7,6 +7,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **`MINUS`** — subtracts from the left solutions every one a right-hand
+  pattern is compatible with (`src/sparql.rs`): agreeing on every variable both
+  sides bind, *and* binding at least one in common. That second half is what
+  separates it from `FILTER NOT EXISTS` — a right side sharing no variable with
+  the left removes nothing, however well it matches. Binds nothing itself, so it
+  stays on the read-locked path and works under `?infer=rdfs`.
+- **`VALUES`** — an inline table of solutions, one or several variables wide,
+  as a group element or trailing the `WHERE` clause (`src/sparql.rs`). Rows
+  carry dictionary IDs, so a term the graph lacks is interned on demand and a
+  standalone table hands it back verbatim. Only that case takes the write lock:
+  `query_needs_write` resolves the table first, so the common
+  `VALUES ?s { … } ?s ?p ?o` stays concurrent. `UNDEF` leaves a cell unbound,
+  which the join now reads as a wildcard — see below.
 - **Sub-`SELECT`** — a nested `SELECT` inside the `WHERE` clause
   (`src/sparql.rs`), with its own `DISTINCT`, `ORDER BY`, `LIMIT`/`OFFSET` and
   `GROUP BY`, joined against the enclosing pattern and nestable.
@@ -47,6 +60,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   rounds): a `Join` 197 → 150 ms and an `OPTIONAL` without a filter
   104 → 80 ms, level with the cost before the filter fix below. Plain
   multi-pattern BGPs go through the WCOJ engine and never touch `hash_join`.
+- **The `contains_extend`/`contains_group` algebra walks are one function** —
+  `contains_node` takes the predicate, so adding `contains_unknown_values_term`
+  did not mean a third copy of the same 20-line `match` (`src/sparql.rs`).
 - **Turning a term into a value no longer allocates twice per row** —
   `classify()` and `lit_key()` (`src/sparql.rs`) built a constant datatype IRI
   with `format!("{XSD}string")`/`boolean` on every call, just to compare it;
@@ -58,6 +74,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   forms test the same datatype IRI.
 
 ### Fixed
+- **An unbound join key is a wildcard, not a value.** `hash_join`
+  (`src/sparql.rs`) matched an unbound column as a value, where SPARQL calls
+  two solutions compatible when they agree on the variables both bind. Lifts
+  the `UNDEF` restriction on `VALUES`; a non-well-designed `OPTIONAL` chain
+  now returns the extra solutions the standard calls for.
+- **A query no longer corrupts the write-ahead log.** The log records
+  operations by ID but reconstructs IDs from the order of its term records, so
+  an unlogged intern shifts every later one and the replay rebuilds the wrong
+  triples. Queries reach the write path too (`BIND`, `GROUP BY`, a `VALUES` term
+  the graph lacks) and did not log; the handlers now do, via
+  `log_interned_since` (`src/sparql.rs`).
+- **A top-level `FILTER`/`BIND` Trillian cannot evaluate is now an error too.**
+  Same cause as the `OPTIONAL` case below, different symptom: `FILTER` reads an
+  expression error as "row does not pass", so `EXISTS`/`NOT EXISTS`, `COALESCE`
+  and unimplemented functions (`SUBSTR`, `ABS`, …) answered *every* query with
+  zero rows, and `BIND` left the variable unbound. `check_expr`
+  (`src/sparql.rs`) runs the same `unsupported_in_expr` walk before the rows.
 - **Non-ASCII literals were silently corrupted on ingest**
   (`src/hypertrie/export.rs`). `parse_quoted_string` walked `s.as_bytes()` and
   did `bytes[i] as char`, reading each UTF-8 byte as a Latin-1 codepoint, so
@@ -98,8 +131,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a real answer. The left-join expression is now checked before the join and
   rejected by name (`Unsupported expression in a FILTER inside OPTIONAL:
   EXISTS`). The check is static, so a construct that runtime short-circuiting
-  would have skipped is still rejected. A top-level `FILTER` is unchanged —
-  it still drops rows it cannot evaluate.
+  would have skipped is still rejected. A top-level `FILTER` now uses the same
+  walk — see above.
 
 ## [0.3.0] - 2026-08-01
 

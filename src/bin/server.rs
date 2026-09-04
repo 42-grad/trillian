@@ -86,14 +86,20 @@ async fn load_and_serve(snapshot: &str, port: u16) {
 
     // Replay the WAL after the snapshot (restore durable updates).
     let wal_path = format!("{}.wal", snapshot);
-    let replayed = Wal::replay(&wal_path, &mut store).expect("Failed to replay WAL");
+    let replay = Wal::replay(&wal_path, &mut store).expect("Failed to replay WAL");
+    if replay.discarded > 0 {
+        eprintln!(
+            "WAL: dropped {} unreadable trailing bytes (torn record from an earlier crash)",
+            replay.discarded
+        );
+    }
     let wal = Wal::open_append(&wal_path).expect("Failed to open WAL");
 
     println!(
         "Loaded {} triples, {} unique terms ({} WAL ops replayed) in {} ms",
         store.triple_count(),
         store.dict.len(),
-        replayed,
+        replay.applied,
         t0.elapsed().as_millis()
     );
     serve_durable(store, port, Some(wal)).await;

@@ -950,3 +950,113 @@ fn having_filters_on_sum() {
     assert_eq!(rows[0]["s"]["value"], format!("{EX}alice"));
     assert_double(&rows[0]["total"], 26.0);
 }
+
+// ---------------------------------------------------------------------------
+// MINUS / VALUES
+// ---------------------------------------------------------------------------
+
+#[test]
+fn minus_subtracts_the_matching_solutions() {
+    let store = social_store();
+    let engine = HybridEngine::new();
+    // Everyone who knows somebody, except those with a recorded age (bob).
+    let q = format!("SELECT ?s WHERE {{ ?s <{EX}knows> ?o MINUS {{ ?s <{EX}age> ?a }} }}");
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
+    let mut got: Vec<&str> = rows
+        .iter()
+        .map(|r| r["s"]["value"].as_str().unwrap())
+        .collect();
+    got.sort_unstable();
+    assert_eq!(got, vec![format!("{EX}alice"), format!("{EX}charlie")]);
+}
+
+/// `MINUS` is not `FILTER NOT EXISTS`: with no shared variable the two sides
+/// have disjoint domains, so nothing is compatible and nothing is removed.
+#[test]
+fn minus_without_a_shared_variable_removes_nothing() {
+    let store = social_store();
+    let engine = HybridEngine::new();
+    let q = format!("SELECT ?s WHERE {{ ?s <{EX}knows> ?o MINUS {{ ?x <{EX}age> ?a }} }}");
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
+    assert_eq!(rows.len(), 3);
+}
+
+#[test]
+fn values_restricts_the_solutions_to_the_inline_table() {
+    let store = social_store();
+    let engine = HybridEngine::new();
+    let q = format!(
+        "SELECT ?o WHERE {{ VALUES ?s {{ <{EX}alice> <{EX}charlie> }} ?s <{EX}knows> ?o }}"
+    );
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
+    let mut got: Vec<&str> = rows
+        .iter()
+        .map(|r| r["o"]["value"].as_str().unwrap())
+        .collect();
+    got.sort_unstable();
+    assert_eq!(got, vec![format!("{EX}alice"), format!("{EX}bob")]);
+}
+
+/// A `VALUES` term the graph does not contain still has to come back from a
+/// standalone table, which needs an ID for it — hence the write-locked path.
+#[test]
+fn standalone_values_returns_a_term_the_graph_lacks() {
+    let mut store = social_store();
+    let engine = HybridEngine::new();
+    let q = format!("SELECT ?s WHERE {{ VALUES ?s {{ <{EX}nobody> }} }}");
+    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["s"]["value"], format!("{EX}nobody"));
+}
+
+/// The read-locked path has no ID for such a term and says so instead of
+/// dropping the row, which is wrong outside a plain join.
+#[test]
+fn values_naming_an_unknown_term_needs_the_write_path() {
+    let mut store = social_store();
+    let engine = HybridEngine::new();
+    let q = format!(
+        "SELECT ?s ?o WHERE {{ VALUES ?s {{ <{EX}nobody> }} OPTIONAL {{ ?s <{EX}knows> ?o }} }}"
+    );
+    let err = execute_sparql(&store, &engine, &q).unwrap_err();
+    assert!(err.contains("nobody"), "unexpected error: {err}");
+
+    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["s"]["value"], format!("{EX}nobody"));
+}
+
+/// An unbound column is not in the row's domain, so it contradicts nothing:
+/// bob has no nickname and is still removed by a `MINUS` over `?a`.
+#[test]
+fn minus_treats_an_unbound_column_as_compatible() {
+    let store = store_from_nt(&format!(
+        "<{EX}alice> <{EX}knows> <{EX}bob> .\n\
+         <{EX}bob> <{EX}knows> <{EX}charlie> .\n\
+         <{EX}bob> <{EX}age> \"25\"^^<{XSD_INT}> .\n\
+         <{EX}alice> <{EX}nick> \"Al\" .\n"
+    ));
+    let engine = HybridEngine::new();
+    let q = format!(
+        "SELECT ?s WHERE {{ ?s <{EX}knows> ?o OPTIONAL {{ ?s <{EX}nick> ?a }} \
+         MINUS {{ ?s <{EX}age> ?a }} }}"
+    );
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
+    let got: Vec<&str> = rows
+        .iter()
+        .map(|r| r["s"]["value"].as_str().unwrap())
+        .collect();
+    assert_eq!(got, vec![format!("{EX}alice")]);
+}
+
+/// An unimplemented expression is refused; treated as an error it would drop
+/// every row, which reads exactly like "no solutions".
+#[test]
+fn unsupported_filter_expressions_are_refused() {
+    let store = social_store();
+    let engine = HybridEngine::new();
+    let q =
+        format!("SELECT ?s WHERE {{ ?s <{EX}knows> ?o FILTER NOT EXISTS {{ ?s <{EX}age> ?a }} }}");
+    let err = execute_sparql(&store, &engine, &q).unwrap_err();
+    assert!(err.contains("EXISTS"), "unexpected error: {err}");
+}
