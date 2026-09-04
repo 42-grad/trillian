@@ -47,13 +47,22 @@ contribution to open, sovereign, and sustainable data infrastructure.
 ## Supported SPARQL
 
 - `SELECT` and `ASK`; projection, `DISTINCT`, `LIMIT`, `OFFSET`
-- Basic graph patterns, `OPTIONAL` (left joins), `UNION`
+- Basic graph patterns, `OPTIONAL` (left joins, including a `FILTER` inside the
+  group, which acts as the join condition), `UNION`
+- `MINUS` — subtracts the solutions a right-hand pattern is compatible with.
+  A right side sharing no variable with the left has a disjoint domain and
+  removes nothing, however well it matches.
 - `FILTER` — 3-valued logic: comparisons, `&&`/`||`/`!`, `BOUND`, arithmetic,
   `IN`, `IF`, and `STR`/`LANG`/`DATATYPE`/`STRLEN`/`U`-`LCASE`/`CONTAINS`/
   `STRSTARTS`/`STRENDS`/`isIRI`/`isLiteral`/`isNumeric`/`isBlank`
 - `REGEX` in `FILTER`, with the `i`, `s`, and `m` flags
 - `ORDER BY` (type-aware: numeric before lexical), with `LIMIT`/`DISTINCT`
 - `BIND`
+- `VALUES` — an inline table of solutions, one or several variables wide,
+  either as a group element or trailing the `WHERE` clause. A term the graph
+  lacks is interned on demand so a standalone table hands it back verbatim;
+  only that case takes the write lock. `UNDEF` leaves a cell unbound, which the
+  join matches as a wildcard.
 - `GROUP BY` with `HAVING` and the `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`,
   `SAMPLE` and `GROUP_CONCAT` aggregates, each accepting `DISTINCT`.
   `MIN`/`MAX`/`SAMPLE` hand back the stored term, so the result keeps its
@@ -82,8 +91,12 @@ contribution to open, sovereign, and sustainable data infrastructure.
 - IRIs, typed/`@lang` literals, blank nodes; `INSERT DATA`/`DELETE DATA`
 - **Input formats**: N-Triples (`.nt`, streaming) and Turtle (`.ttl`)
 
-Not yet supported (but planned): `MINUS`, `VALUES`, and `BIND`, `GROUP BY` or an
-aggregate sub-`SELECT` together with `?infer=rdfs`.
+Not yet supported (but planned): `FILTER EXISTS`/`NOT EXISTS`, `COALESCE`, the
+functions outside the list above (`SUBSTR`, `ABS`, `CONCAT`, `REPLACE`, the date
+and hash functions, …), and anything that has to intern a
+term (`BIND`, `GROUP BY`, an aggregate sub-`SELECT`, an unknown `VALUES` term)
+together with `?infer=rdfs`. All are rejected with an error rather than silently
+answered — see [ROADMAP](ROADMAP.md).
 
 ### Inference (RDFS backward chaining)
 
