@@ -74,6 +74,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   forms test the same datatype IRI.
 
 ### Fixed
+- **The response cache no longer mixes up inferred and plain results.**
+  `sparql_handler` (`src/sparql.rs`) keyed the cache on the query string alone,
+  but `infer` arrives as a separate parameter and never appears in it, so
+  `?infer=rdfs` and the plain query shared an entry and whichever ran first
+  decided both answers. The key now carries `infer` as well.
 - **An unbound join key is a wildcard, not a value.** `hash_join`
   (`src/sparql.rs`) matched an unbound column as a value, where SPARQL calls
   two solutions compatible when they agree on the variables both bind. Lifts
