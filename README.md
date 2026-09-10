@@ -106,10 +106,15 @@ reachable through RDFS rules:
 
 | Rule | Effect |
 |------|--------|
-| `rdfs:subClassOf` | `?x a :C` also matches `?x a :D` when `:D subClassOf :C` |
-| `rdfs:subPropertyOf` | `?x :p ?y` also matches `?x :q ?y` when `:q subPropertyOf :p` |
-| `rdfs:domain` | `?x a :C` triggers `?x :p ?y` where `:p domain :C` |
-| `rdfs:range` | `?x a :C` triggers `?y :p ?x` where `:p range :C` |
+| `rdfs:subClassOf` | `?x a :C` also matches `?x a :D` when `:D` is a subclass of `:C` |
+| `rdfs:subPropertyOf` | `?x :p ?y` also matches `?x :q ?y` when `:q` is a sub-property of `:p` |
+| `rdfs:domain` | `?x a :C` also matches `?x :p ?y` when `:p`, or a super-property of it, has `:C` or a subclass of it as its domain |
+| `rdfs:range` | `?x a :C` also matches `?y :p ?x` when `:p`, or a super-property of it, has `:C` or a subclass of it as its range |
+
+Both hierarchies are followed transitively, and one entailed triple is one row
+however many rules derive it. Not covered: a property path in the query is not
+rewritten, and a predicate that is a sub-property of `rdf:type` does not fire
+the type rules.
 
 ```bash
 curl -G 'http://localhost:9090/sparql' \

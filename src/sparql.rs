@@ -800,6 +800,9 @@ fn eval_where(
         }
         GP::Join { left, right } => {
             let (lr, lvo) = eval_where(left, store, engine, None)?;
+            if let Some(empty) = skip_empty_join(&lr, &lvo, right) {
+                return Ok(empty);
+            }
             let (rr, rvo) = eval_where(right, store, engine, None)?;
             hash_join(lr, &lvo, rr, &rvo, false, None, store)
         }
@@ -946,6 +949,9 @@ fn eval_where_mut(
         }
         GP::Join { left, right } => {
             let (lr, lvo) = eval_where_mut(left, store, engine, None)?;
+            if let Some(empty) = skip_empty_join(&lr, &lvo, right) {
+                return Ok(empty);
+            }
             let (rr, rvo) = eval_where_mut(right, store, engine, None)?;
             hash_join(lr, &lvo, rr, &rvo, false, None, store)
         }
@@ -1468,6 +1474,59 @@ fn closure(
     result
 }
 
+/// Column name a path endpoint contributes (blank node as `__bn_`, as in
+/// [`translate_term_pattern`]); `None` for a ground term.
+fn path_end_variable(tp: &spargebra::term::TermPattern) -> Option<String> {
+    match tp {
+        spargebra::term::TermPattern::Variable(v) => Some(v.as_str().to_string()),
+        spargebra::term::TermPattern::BlankNode(bn) => Some(format!("__bn_{}", bn.as_str())),
+        _ => None,
+    }
+}
+
+/// The columns a pattern binds, without evaluating it — known for the two leaf
+/// patterns, `None` for anything whose columns only the evaluation produces.
+fn static_variables(gp: &spargebra::algebra::GraphPattern) -> Option<Vec<String>> {
+    use spargebra::algebra::GraphPattern as GP;
+    match gp {
+        GP::Bgp { patterns } => Some(variables_in_bgp(patterns)),
+        GP::Path {
+            subject, object, ..
+        } => {
+            let mut vo = Vec::new();
+            for end in [subject, object] {
+                if let Some(v) = path_end_variable(end)
+                    && !vo.contains(&v)
+                {
+                    vo.push(v);
+                }
+            }
+            Some(vo)
+        }
+        _ => None,
+    }
+}
+
+/// An inner join with an empty side is empty, and needs only the other side's
+/// column names. Skipping that side is what keeps an inference branch whose
+/// schema path finds nothing from reading the data (see [`crate::inference`]).
+fn skip_empty_join(
+    left: &RowBlock,
+    lvo: &[String],
+    right: &spargebra::algebra::GraphPattern,
+) -> Option<(RowBlock, Vec<String>)> {
+    if left.n_rows() > 0 {
+        return None;
+    }
+    let mut vo = lvo.to_vec();
+    for v in static_variables(right)? {
+        if !vo.contains(&v) {
+            vo.push(v);
+        }
+    }
+    Some((RowBlock::new(vo.len()), vo))
+}
+
 fn eval_path(
     store: &TripleStore,
     subject: &spargebra::term::TermPattern,
@@ -1477,16 +1536,8 @@ fn eval_path(
     let s_end = resolve_path_end(subject, &store.dict);
     let o_end = resolve_path_end(object, &store.dict);
 
-    // Variable name (incl. blank node as __bn_) for result columns/join.
-    let var_name = |tp: &spargebra::term::TermPattern| -> Option<String> {
-        match tp {
-            spargebra::term::TermPattern::Variable(v) => Some(v.as_str().to_string()),
-            spargebra::term::TermPattern::BlankNode(bn) => Some(format!("__bn_{}", bn.as_str())),
-            _ => None,
-        }
-    };
-    let s_var = var_name(subject);
-    let o_var = var_name(object);
+    let s_var = path_end_variable(subject);
+    let o_var = path_end_variable(object);
 
     // Unknown constant on one side -> empty solution (with variable columns).
     if (s_var.is_none() && s_end.is_none()) || (o_var.is_none() && o_end.is_none()) {
@@ -2149,6 +2200,9 @@ fn evaluate_select_with_modifiers_mut(
     apply_modifiers(m, rows, var_order, store)
 }
 
+/// The columns a BGP binds, in the order [`GraphPattern::variable_order`] binds
+/// them, for the case where an unknown constant makes the BGP unmatchable and
+/// there is no translated pattern to ask.
 fn variables_in_bgp(bgp: &[spargebra::term::TriplePattern]) -> Vec<String> {
     let mut vars = Vec::new();
     let mut seen = rustc_hash::FxHashSet::default();
@@ -2179,9 +2233,12 @@ fn named_node_pattern_variables(np: &spargebra::term::NamedNodePattern) -> Vec<S
     }
 }
 
+/// Blank nodes count: they bind like non-distinguished variables, under the
+/// same `__bn_` name [`translate_term_pattern`] gives them.
 fn term_pattern_variables(tp: &spargebra::term::TermPattern) -> Vec<String> {
     match tp {
         spargebra::term::TermPattern::Variable(v) => vec![v.as_str().to_string()],
+        spargebra::term::TermPattern::BlankNode(bn) => vec![format!("__bn_{}", bn.as_str())],
         _ => Vec::new(),
     }
 }
@@ -3638,6 +3695,24 @@ mod tests {
         vals
     }
 
+    /// A `Join` whose left side is empty short-circuits, and must still report
+    /// the right side's columns — the rows are gone, the variables are not.
+    #[test]
+    fn empty_path_side_short_circuits_the_join() {
+        let store = path_store();
+        let engine = HybridEngine::new();
+        let q = "SELECT ?mid ?o WHERE { <http://example.org/alice> \
+                 <http://example.org/missing>+ ?mid . \
+                 ?mid <http://example.org/knows> ?o }";
+        let result: Value =
+            serde_json::from_str(&execute_sparql(&store, &engine, q).unwrap()).unwrap();
+        assert_eq!(
+            result["head"]["vars"].as_array().unwrap(),
+            &vec![json!("mid"), json!("o")]
+        );
+        assert!(result["results"]["bindings"].as_array().unwrap().is_empty());
+    }
+
     #[test]
     fn path_one_or_more() {
         // alice knows+ ?o -> bob, carol, dave (transitive closure, without alice).
@@ -4203,6 +4278,201 @@ mod tests {
         .unwrap();
         let rows = with_infer["results"]["bindings"].as_array().unwrap();
         assert_eq!(rows.len(), 1, "inference should find Alice hasAnimal Fido");
+    }
+
+    /// Schema + data helper for the RDFS rule tests: `(s, p, o)` triples with
+    /// the `http://example.org/` prefix left off, `rdf:type`/RDFS shorthands
+    /// spelled out.
+    fn rdfs_store(triples: &[(&str, &str, &str)]) -> TripleStore {
+        let expand = |t: &str| match t {
+            "type" => "http://www.w3.org/1999/02/22-rdf-syntax-ns#type".to_string(),
+            "subClassOf" => "http://www.w3.org/2000/01/rdf-schema#subClassOf".to_string(),
+            "subPropertyOf" => "http://www.w3.org/2000/01/rdf-schema#subPropertyOf".to_string(),
+            "domain" => "http://www.w3.org/2000/01/rdf-schema#domain".to_string(),
+            "range" => "http://www.w3.org/2000/01/rdf-schema#range".to_string(),
+            other => format!("http://example.org/{other}"),
+        };
+        let owned: Vec<(String, String, String)> = triples
+            .iter()
+            .map(|(s, p, o)| (expand(s), expand(p), expand(o)))
+            .collect();
+        let borrowed: Vec<(&str, &str, &str)> = owned
+            .iter()
+            .map(|(s, p, o)| (s.as_str(), p.as_str(), o.as_str()))
+            .collect();
+        let mut store = TripleStore::new();
+        store.ingest_str_triples(&borrowed);
+        store
+    }
+
+    fn infer_rows_of(store: &TripleStore, query: &str) -> Vec<Value> {
+        let engine = HybridEngine::new();
+        let v: Value =
+            serde_json::from_str(&execute_sparql_infer(store, &engine, query).unwrap()).unwrap();
+        v["results"]["bindings"].as_array().unwrap().clone()
+    }
+
+    const TYPE_OF_ANIMAL: &str = "SELECT ?s WHERE { ?s \
+         <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Animal> }";
+
+    /// `rdfs:subClassOf` is transitive (rdfs11), so a chain longer than one hop
+    /// still entails the type. The rewrite uses a `+` path, not a fixpoint.
+    #[test]
+    fn inference_follows_a_subclass_chain() {
+        let store = rdfs_store(&[
+            ("Dog", "subClassOf", "Mammal"),
+            ("Mammal", "subClassOf", "Animal"),
+            ("Fido", "type", "Dog"),
+        ]);
+        let rows = infer_rows_of(&store, TYPE_OF_ANIMAL);
+        assert_eq!(values_of(&rows, "s"), vec!["http://example.org/Fido"]);
+    }
+
+    /// The same for `rdfs:subPropertyOf` (rdfs5).
+    #[test]
+    fn inference_follows_a_subproperty_chain() {
+        let store = rdfs_store(&[
+            ("hasDog", "subPropertyOf", "hasPet"),
+            ("hasPet", "subPropertyOf", "hasAnimal"),
+            ("Alice", "hasDog", "Fido"),
+        ]);
+        let rows = infer_rows_of(
+            &store,
+            "SELECT ?o WHERE { <http://example.org/Alice> <http://example.org/hasAnimal> ?o }",
+        );
+        assert_eq!(values_of(&rows, "o"), vec!["http://example.org/Fido"]);
+    }
+
+    /// `rdfs:range` types the **object** of the data triple (rdfs3).
+    #[test]
+    fn inference_range_types_the_object() {
+        let store = rdfs_store(&[("hasPet", "range", "Animal"), ("Alice", "hasPet", "Fido")]);
+        let rows = infer_rows_of(&store, TYPE_OF_ANIMAL);
+        assert_eq!(values_of(&rows, "s"), vec!["http://example.org/Fido"]);
+    }
+
+    /// `rdfs:domain` types the subject (rdfs2), and the class it yields is
+    /// itself generalized along `rdfs:subClassOf`.
+    #[test]
+    fn inference_domain_composes_with_subclass() {
+        let store = rdfs_store(&[
+            ("hasPet", "domain", "Owner"),
+            ("Owner", "subClassOf", "Agent"),
+            ("Alice", "hasPet", "Fido"),
+        ]);
+        let rows = infer_rows_of(
+            &store,
+            "SELECT ?s WHERE { ?s \
+             <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Agent> }",
+        );
+        assert_eq!(values_of(&rows, "s"), vec!["http://example.org/Alice"]);
+    }
+
+    /// A `rdfs:domain` declared on a super-property applies to the sub-property
+    /// too — rdfs7 feeding rdfs2.
+    #[test]
+    fn inference_domain_composes_with_subproperty() {
+        let store = rdfs_store(&[
+            ("hasDog", "subPropertyOf", "hasPet"),
+            ("hasPet", "domain", "Owner"),
+            ("Alice", "hasDog", "Fido"),
+        ]);
+        let rows = infer_rows_of(
+            &store,
+            "SELECT ?s WHERE { ?s \
+             <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Owner> }",
+        );
+        assert_eq!(values_of(&rows, "s"), vec!["http://example.org/Alice"]);
+    }
+
+    /// Several rules deriving the same triple is one row, not one per rule, and
+    /// an explicit triple does not double an inferred one.
+    #[test]
+    fn inference_deduplicates_the_derivations() {
+        let store = rdfs_store(&[
+            ("Dog", "subClassOf", "Animal"),
+            ("hasPet", "range", "Animal"),
+            ("Fido", "type", "Dog"),
+            ("Fido", "type", "Animal"),
+            ("Alice", "hasPet", "Fido"),
+        ]);
+        let rows = infer_rows_of(&store, TYPE_OF_ANIMAL);
+        assert_eq!(values_of(&rows, "s"), vec!["http://example.org/Fido"]);
+    }
+
+    /// The helper variables the rewrite introduces stay inside the rewritten
+    /// BGP: `SELECT *` sees only the query's own variables.
+    #[test]
+    fn inference_hides_its_helper_variables() {
+        let store = rdfs_store(&[("Dog", "subClassOf", "Animal"), ("Fido", "type", "Dog")]);
+        let engine = HybridEngine::new();
+        let v: Value = serde_json::from_str(
+            &execute_sparql_infer(
+                &store,
+                &engine,
+                "SELECT * WHERE { ?s \
+                 <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Animal> }",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v["head"]["vars"].as_array().unwrap().len(), 1);
+        assert_eq!(v["head"]["vars"][0], "s");
+    }
+
+    /// An unbound class enumerates the whole superclass chain, one row each.
+    #[test]
+    fn inference_with_an_unbound_class_lists_every_superclass() {
+        let store = rdfs_store(&[
+            ("Dog", "subClassOf", "Mammal"),
+            ("Mammal", "subClassOf", "Animal"),
+            ("Fido", "type", "Dog"),
+        ]);
+        let rows = infer_rows_of(
+            &store,
+            "SELECT ?c WHERE { <http://example.org/Fido> \
+             <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?c } ORDER BY ?c",
+        );
+        assert_eq!(
+            values_of(&rows, "c"),
+            vec![
+                "http://example.org/Animal",
+                "http://example.org/Dog",
+                "http://example.org/Mammal",
+            ]
+        );
+    }
+
+    /// A rewritten pattern still joins against the rest of the BGP.
+    #[test]
+    fn inference_joins_across_patterns() {
+        let store = rdfs_store(&[
+            ("Dog", "subClassOf", "Animal"),
+            ("Fido", "type", "Dog"),
+            ("Fido", "name", "FidoName"),
+            ("Whiskers", "name", "WhiskersName"),
+        ]);
+        let rows = infer_rows_of(
+            &store,
+            "SELECT ?n WHERE { ?s \
+             <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Animal> . \
+             ?s <http://example.org/name> ?n }",
+        );
+        assert_eq!(values_of(&rows, "n"), vec!["http://example.org/FidoName"]);
+    }
+
+    /// A blank node in the pattern is a column like any other, so the rewrite's
+    /// projection must keep it — including when an unknown constant makes the
+    /// BGP unmatchable and the column list comes from the parsed patterns.
+    #[test]
+    fn inference_keeps_blank_node_columns() {
+        let store = rdfs_store(&[("a", "p", "b")]);
+        let rows = infer_rows_of(
+            &store,
+            "SELECT ?s WHERE { ?s <http://example.org/p> \
+             [ <http://example.org/q> <http://example.org/missing> ] }",
+        );
+        assert!(rows.is_empty());
     }
 
     // -------------------------------------------------------------------

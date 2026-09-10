@@ -51,6 +51,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   wherever it took `.nt`.
 
 ### Changed
+- **RDFS inference follows the whole schema** (`src/inference.rs`).
+  `?infer=rdfs` looked one hop deep, so a `rdfs:subClassOf` or
+  `rdfs:subPropertyOf` chain entailed nothing past the first link. Each rule's
+  schema lookup is now a single property path — `rdfs:subClassOf+`,
+  `rdfs:subPropertyOf+`, and
+  `rdfs:subPropertyOf*/rdfs:domain|rdfs:range/rdfs:subClassOf*` — so the
+  transitive rules are closed by the path evaluator instead of a fixpoint
+  iteration, and the four rules compose (a `rdfs:domain` on a super-property
+  yields a class that `rdfs:subClassOf` then generalizes) in three branches per
+  `rdf:type` pattern rather than one per rule combination.
+  The path is the left side of each branch's join, so a rule that cannot fire
+  costs one closure walk from a bound term, not a scan of the data. Measured on
+  a 1.2M-triple synthetic graph with a three-level class tree (release build):
+  `?s a <leaf class>` 0 ms, one subclass hop 10 ms/20k rows, two hops
+  45 ms/200k rows, a `rdfs:domain` reached through a `rdfs:subPropertyOf` chain
+  56 ms/200k rows, 1M rows entailed through `rdfs:subPropertyOf` 68 ms.
+- **A `Join` with an empty left side no longer evaluates the right one**
+  (`src/sparql.rs`). An inner join with an empty side is empty and needs only
+  the other side's column names, which `static_variables` reads off a BGP or a
+  path without evaluating it. This is what keeps an inference branch whose
+  schema path finds nothing from reading the data.
+- **`variables_in_bgp` counts blank nodes** (`src/sparql.rs`), under the same
+  `__bn_` name `translate_term_pattern` gives them, so an unmatchable BGP
+  reports the same columns as one that matched.
 - **`hash_join` splits its unfiltered and filtered paths** (`src/sparql.rs`).
   Applying an `OPTIONAL` filter needs the merged left++right row, and building
   it in the shared loop would have cost every plain `Join` and every
@@ -74,6 +98,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   forms test the same datatype IRI.
 
 ### Fixed
+- **`rdfs:range` inference read the wrong triple position** (`src/inference.rs`).
+  rdfs3 types the *object* of a data triple, but the rewrite looked for
+  `?s ?p ?c` with `?c` the queried class instead of `?x ?p ?s`, so the rule
+  never entailed anything.
+- **Inference no longer returns one row per derivation.** Two rules — or a rule
+  and an asserted triple — deriving the same entailed triple each contributed a
+  row. Every rewritten BGP is now wrapped in `Project`/`Distinct` over the
+  columns the pattern itself binds, which also keeps the rewrite's helper
+  variables inside the node.
 - **The response cache no longer mixes up inferred and plain results.**
   `sparql_handler` (`src/sparql.rs`) keyed the cache on the query string alone,
   but `infer` arrives as a separate parameter and never appears in it, so
