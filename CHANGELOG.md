@@ -11,14 +11,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   pattern is compatible with (`src/sparql.rs`): agreeing on every variable both
   sides bind, *and* binding at least one in common. That second half is what
   separates it from `FILTER NOT EXISTS` — a right side sharing no variable with
-  the left removes nothing, however well it matches. Binds nothing itself, so it
-  stays on the read-locked path and works under `?infer=rdfs`.
+  the left removes nothing, however well it matches. Binds nothing itself and
+  works under `?infer=rdfs`.
 - **`VALUES`** — an inline table of solutions, one or several variables wide,
   as a group element or trailing the `WHERE` clause (`src/sparql.rs`). Rows
-  carry dictionary IDs, so a term the graph lacks is interned on demand and a
-  standalone table hands it back verbatim. Only that case takes the write lock:
-  `query_needs_write` resolves the table first, so the common
-  `VALUES ?s { … } ?s ?p ?o` stays concurrent. `UNDEF` leaves a cell unbound,
+  carry term IDs, so a term the graph lacks takes a query-local one and a
+  standalone table hands it back verbatim. `UNDEF` leaves a cell unbound,
   which the join now reads as a wildcard — see below.
 - **Sub-`SELECT`** — a nested `SELECT` inside the `WHERE` clause
   (`src/sparql.rs`), with its own `DISTINCT`, `ORDER BY`, `LIMIT`/`OFFSET` and
@@ -28,14 +26,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   aggregates hard to use: an aggregate computed in the inner query can now be
   filtered and joined back against the graph
   (`{ SELECT ?s (COUNT(*) AS ?c) WHERE { ?s :knows ?o } GROUP BY ?s }
-  FILTER(?c > 1) . ?s rdfs:label ?label`). A plain sub-`SELECT` works under
-  `?infer=rdfs` too; one containing `GROUP BY` does not yet — see ROADMAP.
+  FILTER(?c > 1) . ?s rdfs:label ?label`). A sub-`SELECT` works under
+  `?infer=rdfs` too.
 - **The remaining `GROUP BY` aggregates** — `COUNT(?x)`, `SUM`, `AVG`, `MIN`,
   `MAX`, `SAMPLE` and `GROUP_CONCAT` (with `SEPARATOR`), each accepting
   `DISTINCT` (`src/sparql.rs`); the "not supported" error from 0.3.0 is gone.
   `MIN`/`MAX`/`SAMPLE` return the stored term and keep its datatype,
-  `GROUP_CONCAT` yields a plain string, and `SUM`/`AVG` intern a computed
-  number so they yield `xsd:double`. Over an empty group `SUM`/`AVG` are `0`
+  `GROUP_CONCAT` yields a plain string, and `SUM`/`AVG` compute a number so
+  they yield `xsd:double`. Over an empty group `SUM`/`AVG` are `0`
   (an `xsd:integer`, as SPARQL 1.1 defines) and `GROUP_CONCAT` is `""`, while
   `MIN`/`MAX`/`SAMPLE` are unbound.
 - **Expression arguments for `SUM`/`AVG`** — `SUM(?v + 1)`. The others still
@@ -51,6 +49,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   wherever it took `.nt`.
 
 ### Changed
+- **Each query is parsed once.** `query_needs_write` (`src/sparql.rs`) ran a
+  second full parse just to pick the lock, on every uncached `/sparql`,
+  `/stream` and `/count`. It is gone, with `execute_sparql_bind` and
+  `execute_count_bind`.
 - **`hash_join` splits its unfiltered and filtered paths** (`src/sparql.rs`).
   Applying an `OPTIONAL` filter needs the merged left++right row, and building
   it in the shared loop would have cost every plain `Join` and every
@@ -84,12 +86,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   two solutions compatible when they agree on the variables both bind. Lifts
   the `UNDEF` restriction on `VALUES`; a non-well-designed `OPTIONAL` chain
   now returns the extra solutions the standard calls for.
-- **A query no longer corrupts the write-ahead log.** The log records
-  operations by ID but reconstructs IDs from the order of its term records, so
-  an unlogged intern shifts every later one and the replay rebuilds the wrong
-  triples. Queries reach the write path too (`BIND`, `GROUP BY`, a `VALUES` term
-  the graph lacks) and did not log; the handlers now do, via
-  `log_interned_since` (`src/sparql.rs`).
+- **A query no longer writes anything.** A term a query computes (`BIND`, an
+  aggregate, a `VALUES` constant the graph lacks) was interned into the
+  dictionary under the write lock and logged, and a missed log entry shifted
+  every later ID on replay. Computed terms now take IDs from a query-local
+  overlay (`Ctx`/`Overlay`, `src/sparql.rs`), so a `SELECT` runs under the read
+  lock and touches neither the dictionary nor the log. The 48-query DBLP suite
+  at 37M triples grew the WAL by 7.5 MB before and by 0 B now.
+- **`BIND`, `GROUP BY`, aggregate sub-`SELECT`s and an unknown `VALUES` term
+  work under `?infer=rdfs`.** They were rejected because inference never took
+  the write lock interning needed; there is no longer one to take.
 - **A top-level `FILTER`/`BIND` Trillian cannot evaluate is now an error too.**
   Same cause as the `OPTIONAL` case below, different symptom: `FILTER` reads an
   expression error as "row does not pass", so `EXISTS`/`NOT EXISTS`, `COALESCE`
