@@ -172,16 +172,18 @@ pub async fn sparql_handler(
         );
     }
 
+    let infer = params.infer.as_deref();
+    let key = cache_key(&query_str, infer == Some("rdfs"));
+
     // Cache lookup (finished JSON body).
     {
         if let Ok(cache) = state.cache.lock()
-            && let Some(body) = cache.peek(&query_str)
+            && let Some(body) = cache.peek(&key)
         {
             return json_response(body.clone());
         }
     }
 
-    let infer = params.infer.as_deref();
     // A query that can put an unknown term into the result needs write access;
     // everything else keeps the fully concurrent read lock. The `infer != rdfs`
     // guard is what makes those unsupported under inference.
@@ -198,7 +200,7 @@ pub async fn sparql_handler(
     match result {
         Ok(body) => {
             if let Ok(mut cache) = state.cache.lock() {
-                cache.put(query_str, body.clone());
+                cache.put(key, body.clone());
             }
             json_response(body)
         }
@@ -376,6 +378,13 @@ pub async fn update_handler(
         }
         Err(e) => sparql_error(&e, StatusCode::BAD_REQUEST),
     }
+}
+
+/// Response-cache key: `infer` decides the answer but never reaches the query
+/// text, so plain and inferred results must not share an entry.
+fn cache_key(query_str: &str, infer_rdfs: bool) -> String {
+    let prefix = if infer_rdfs { "rdfs" } else { "" };
+    format!("{prefix}\u{1}{query_str}")
 }
 
 fn normalize_query(query_param: Option<String>, body: String) -> String {
@@ -5275,5 +5284,106 @@ mod tests {
              MINUS { ?s <http://example.org/age> ?a } }",
         );
         assert_eq!(values_of(&rows, "s"), vec!["http://example.org/alice"]);
+    }
+
+    /// `infer` arrives as its own query parameter and never reaches the query
+    /// text, so a cache keyed on that alone served each variant the other's
+    /// answer. Whichever request landed first decided both.
+    ///
+    /// Routed through [`sparql_handler`], the only caller of the cache.
+    #[tokio::test]
+    async fn the_response_cache_keeps_inferred_and_plain_results_apart() {
+        fn rdfs_state() -> Arc<AppState> {
+            let mut store = TripleStore::new();
+            store.ingest_str_triples(&[
+                (
+                    "http://example.org/Dog",
+                    "http://www.w3.org/2000/01/rdf-schema#subClassOf",
+                    "http://example.org/Animal",
+                ),
+                (
+                    "http://example.org/Fido",
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                    "http://example.org/Dog",
+                ),
+            ]);
+            Arc::new(AppState::new(store))
+        }
+
+        async fn ask(state: &Arc<AppState>, infer: Option<&str>) -> usize {
+            let params = SparqlQueryParams {
+                query: Some(
+                    "SELECT ?s WHERE { ?s \
+                     <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> \
+                     <http://example.org/Animal> }"
+                        .to_string(),
+                ),
+                infer: infer.map(str::to_string),
+            };
+            let resp = sparql_handler(State(Arc::clone(state)), Query(params), String::new()).await;
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: Value = serde_json::from_slice(&body).unwrap();
+            json["results"]["bindings"].as_array().unwrap().len()
+        }
+
+        // Plain first: it must not decide the inferred answer.
+        let state = rdfs_state();
+        assert_eq!(ask(&state, None).await, 0, "no direct Animal type");
+        assert_eq!(
+            ask(&state, Some("rdfs")).await,
+            1,
+            "inference served a cached plain result"
+        );
+
+        // Inferred first: it must not decide the plain answer.
+        let state = rdfs_state();
+        assert_eq!(ask(&state, Some("rdfs")).await, 1, "Fido is an Animal");
+        assert_eq!(
+            ask(&state, None).await,
+            0,
+            "a cached inferred result leaked into a plain query"
+        );
+    }
+
+    /// The other half of the same key: it must still collapse what *is* the
+    /// same request, and an update must still drop both variants.
+    #[tokio::test]
+    async fn the_response_cache_still_collapses_equivalent_requests() {
+        let state = Arc::new(AppState::new(test_store()));
+        let query = "SELECT ?s WHERE { ?s <http://example.org/knows> ?o }";
+        let entries = || state.cache.lock().unwrap().len();
+
+        let ask = |infer: Option<&'static str>| {
+            let state = Arc::clone(&state);
+            async move {
+                let params = SparqlQueryParams {
+                    query: Some(query.to_string()),
+                    infer: infer.map(str::to_string),
+                };
+                sparql_handler(State(state), Query(params), String::new()).await
+            }
+        };
+
+        ask(None).await;
+        assert_eq!(entries(), 1, "the plain result was not cached");
+        ask(None).await;
+        assert_eq!(entries(), 1, "a repeat of the same request added an entry");
+        // Only `rdfs` turns inference on, so any other value keys with the plain form.
+        ask(Some("nonsense")).await;
+        assert_eq!(entries(), 1, "an inert infer value split the entry");
+        ask(Some("rdfs")).await;
+        assert_eq!(entries(), 2, "the inferred result shared the plain entry");
+
+        let params = UpdateParams {
+            update: Some(
+                "INSERT DATA { <http://example.org/x> <http://example.org/p> \
+                 <http://example.org/y> }"
+                    .to_string(),
+            ),
+        };
+        update_handler(State(Arc::clone(&state)), Query(params), String::new()).await;
+        assert_eq!(entries(), 0, "an update left a stale entry behind");
     }
 }
