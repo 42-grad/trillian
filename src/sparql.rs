@@ -840,8 +840,7 @@ fn contains_node(
 }
 
 /// Whether `gp` contains a `GROUP BY` (`Group`) node anywhere in the tree.
-/// Aggregate results are computed values that must be interned into the
-/// dictionary, so such queries also need write access to the store.
+/// GROUP BY needs the full inner result, so this disables limit pushdown.
 fn contains_group(gp: &spargebra::algebra::GraphPattern) -> bool {
     contains_node(gp, &|g| {
         matches!(g, spargebra::algebra::GraphPattern::Group { .. })
@@ -851,8 +850,8 @@ fn contains_group(gp: &spargebra::algebra::GraphPattern) -> bool {
 /// Evaluates a `GROUP BY ... (COUNT(...) AS ?var)` pattern. The inner pattern
 /// is evaluated, rows are partitioned by the GROUP BY variables, and one row
 /// per group is emitted containing the group key plus the aggregate values.
-/// Aggregate results are interned into the dictionary, so this needs write
-/// access to the store.
+/// Aggregate results take IDs from the query-local overlay, so this runs under
+/// the read lock.
 fn eval_group(
     inner: &spargebra::algebra::GraphPattern,
     group_by_vars: &[Variable],
@@ -1025,10 +1024,9 @@ fn intern_count(ctx: &Ctx, n: i64) -> u32 {
     )
 }
 
-/// Interns a `BIND`-computed value into the dictionary, reusing the existing
-/// term if the same value is already present — so equality/joins against
-/// stored data keep working for the bound variable. Requires write access to
-/// the store.
+/// Gives a `BIND`-computed value an ID, reusing the stored term if the value
+/// is already in the dictionary so joins against stored data keep working.
+/// New values go to the query-local overlay, so this runs under the read lock.
 fn intern_fv(ctx: &Ctx, fv: &Fv) -> u32 {
     let (lex, typ) = match fv {
         Fv::Iri(s) => (s.clone(), TermType::iri()),
