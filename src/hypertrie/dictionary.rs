@@ -67,7 +67,7 @@ type Interner = StringInterner<StringBackend<SymbolU32>>;
 /// Type of an RDF term. Stored per dictionary ID so the SPARQL output
 /// (term_to_json) can distinguish between IRI, literal with datatype, and
 /// literal with language tag.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TermType {
     Iri,
     Literal {
@@ -300,15 +300,37 @@ impl Dictionary {
     /// Returns the ID of a term by lexical value **and** type.
     #[inline]
     pub fn lookup_term(&self, value: &str, typ: &TermType) -> Option<u32> {
-        let key = encode_key(value, typ);
+        self.lookup_encoded(&encode_key(value, typ))
+    }
+
+    /// Same, for a key already built by [`Dictionary::encode`].
+    #[inline]
+    pub fn lookup_encoded(&self, key: &str) -> Option<u32> {
         if let Some(m) = &self.mapped
-            && let Some(id) = m.lookup(&key)
+            && let Some(id) = m.lookup(key)
         {
             return Some(id);
         }
         self.interner
-            .get(&key)
+            .get(key)
             .map(|s| self.base_n() as u32 + s.to_usize() as u32)
+    }
+
+    /// The interned-key encoding, for a caller that mints IDs outside the
+    /// dictionary and must key terms exactly as it would.
+    pub fn encode(value: &str, typ: &TermType) -> String {
+        encode_key(value, typ)
+    }
+
+    /// Lexical value and type of such a key.
+    pub fn decode(key: &str) -> (Cow<'_, str>, TermType) {
+        let val = decode_value(key);
+        let value = if key.as_bytes().first() == Some(&b'I') {
+            unfold_iri(val)
+        } else {
+            Cow::Borrowed(val)
+        };
+        (value, decode_type(key))
     }
 
     /// Convenience: ID of an IRI term.

@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+use std::cell::RefCell;
 use std::sync::{Arc, Mutex, RwLock};
 
 use axum::Router;
@@ -7,6 +9,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use lru::LruCache;
+use rustc_hash::FxHashMap;
 use serde_json::{Map, Value, json};
 use spargebra::algebra::{Expression, Function, PropertyPathExpression as Ppe};
 use spargebra::term::{
@@ -54,50 +57,6 @@ impl AppState {
     fn clear_cache(&self) {
         if let Ok(mut cache) = self.cache.lock() {
             cache.clear();
-        }
-    }
-
-    /// Whether `query_str` has to run under the write lock. Deciding needs the
-    /// dictionary, so the read lock is taken and released before upgrading.
-    fn needs_write(&self, query_str: &str) -> bool {
-        let store = self.store.read().unwrap_or_else(|e| e.into_inner());
-        query_needs_write(query_str, &store)
-    }
-
-    /// Runs `f` under the write lock and logs whatever it interned to the WAL
-    /// (see [`log_interned_since`]).
-    fn write_locked<T>(
-        &self,
-        f: impl FnOnce(&mut TripleStore) -> Result<T, String>,
-    ) -> Result<T, String> {
-        let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
-        // Same order as `update_handler` takes the two locks.
-        let mut wal = self
-            .wal
-            .as_ref()
-            .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
-        let first_new_id = store.dict.len();
-        let result = f(&mut store);
-        if let Some(w) = wal.as_deref_mut() {
-            log_interned_and_sync(&store, first_new_id, w)?;
-        }
-        result
-    }
-}
-
-/// Either lock guard on [`AppState::store`], for call sites (like
-/// `stream_handler`) that pick read vs. write access at runtime depending on
-/// whether the query needs to intern a `BIND`-computed value.
-enum StoreGuard<'a> {
-    Read(std::sync::RwLockReadGuard<'a, TripleStore>),
-    Write(std::sync::RwLockWriteGuard<'a, TripleStore>),
-}
-
-impl StoreGuard<'_> {
-    fn as_ref(&self) -> &TripleStore {
-        match self {
-            StoreGuard::Read(g) => g,
-            StoreGuard::Write(g) => g,
         }
     }
 }
@@ -184,12 +143,9 @@ pub async fn sparql_handler(
         }
     }
 
-    // A query that can put an unknown term into the result needs write access;
-    // everything else keeps the fully concurrent read lock. The `infer != rdfs`
-    // guard is what makes those unsupported under inference.
-    let result = if infer != Some("rdfs") && state.needs_write(&query_str) {
-        state.write_locked(|store| execute_sparql_bind(store, &state.engine, &query_str))
-    } else {
+    // Every query is read-locked: a term it computes takes a query-local ID
+    // rather than a dictionary entry, so nothing here writes.
+    let result = {
         let store = state.store.read().unwrap_or_else(|e| e.into_inner());
         if infer == Some("rdfs") {
             execute_sparql_infer(&store, &state.engine, &query_str)
@@ -228,38 +184,13 @@ pub async fn stream_handler(
     let infer = params.infer.clone();
 
     tokio::task::spawn_blocking(move || {
-        // A query that can put an unknown term into the result needs write access.
-        let needs_write = infer.as_deref() != Some("rdfs") && state.needs_write(&query_str);
-        let mut guard = if needs_write {
-            StoreGuard::Write(state.store.write().unwrap_or_else(|e| e.into_inner()))
+        let store = state.store.read().unwrap_or_else(|e| e.into_inner());
+        let ctx = Ctx::new(&store);
+        let result = if infer.as_deref() == Some("rdfs") {
+            evaluate_select_infer(&ctx, &state.engine, &query_str)
         } else {
-            StoreGuard::Read(state.store.read().unwrap_or_else(|e| e.into_inner()))
+            evaluate_select(&ctx, &state.engine, &query_str)
         };
-        // Same lock order as `update_handler`. The guard has to outlive the
-        // serialization below, so `AppState::write_locked` does not fit here.
-        let mut wal = needs_write
-            .then(|| {
-                state
-                    .wal
-                    .as_ref()
-                    .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()))
-            })
-            .flatten();
-        let first_new_id = guard.as_ref().dict.len();
-        let mut result = match &mut guard {
-            StoreGuard::Write(store) => evaluate_select_bind(store, &state.engine, &query_str),
-            StoreGuard::Read(store) if infer.as_deref() == Some("rdfs") => {
-                evaluate_select_infer(store, &state.engine, &query_str)
-            }
-            StoreGuard::Read(store) => evaluate_select(store, &state.engine, &query_str),
-        };
-        if let Some(w) = wal.as_deref_mut()
-            && let Err(e) = log_interned_and_sync(guard.as_ref(), first_new_id, w)
-        {
-            result = Err(e);
-        }
-        drop(wal);
-        let dict = &guard.as_ref().dict;
         match result {
             Ok(select) => {
                 let var_order = select.var_order;
@@ -281,7 +212,7 @@ pub async fn stream_handler(
                         .enumerate()
                         .filter_map(|(i, var)| {
                             let id = row[var_indices[i]?];
-                            Some((var.clone(), term_to_json(id, dict)))
+                            Some((var.clone(), term_to_json(id, &ctx)))
                         })
                         .collect();
                     let line = serde_json::to_string(&obj).unwrap_or_default() + "\n";
@@ -320,9 +251,7 @@ pub async fn count_handler(
     }
 
     let infer = params.infer.as_deref();
-    let result = if infer != Some("rdfs") && state.needs_write(&query_str) {
-        state.write_locked(|store| execute_count_bind(store, &state.engine, &query_str))
-    } else {
+    let result = {
         let store = state.store.read().unwrap_or_else(|e| e.into_inner());
         if infer == Some("rdfs") {
             execute_count_infer(&store, &state.engine, &query_str)
@@ -394,26 +323,6 @@ fn normalize_query(query_param: Option<String>, body: String) -> String {
         .unwrap_or_else(|| body.trim().to_string())
 }
 
-/// Whether executing `query_str` needs write access, i.e. it can put a term
-/// into the result the dictionary does not hold yet: `BIND` and a `GROUP BY`
-/// aggregate always compute one, a `VALUES` table only when it names an unknown
-/// term. A parse failure is reported by the read-locked path, so it is `false`
-/// here rather than duplicating error handling.
-///
-/// Callers hold the read lock across this and release it before upgrading.
-/// Terms are never removed, so the answer stays valid; one added in between
-/// only costs a needless write lock.
-fn query_needs_write(query_str: &str, store: &TripleStore) -> bool {
-    match SparqlParser::new().parse_query(query_str) {
-        Ok(SparqlQuery::Select { pattern, .. } | SparqlQuery::Ask { pattern, .. }) => {
-            contains_extend(&pattern)
-                || contains_group(&pattern)
-                || contains_unknown_values_term(&pattern, &store.dict)
-        }
-        _ => false,
-    }
-}
-
 fn sparql_error(msg: &str, status: StatusCode) -> Response {
     let body = json!({ "error": msg });
     (status, axum::Json(body)).into_response()
@@ -459,11 +368,12 @@ pub fn profile_query(store: &TripleStore, engine: &HybridEngine, query_str: &str
         };
         let m = peel_modifiers(&pattern);
         let t = Instant::now();
-        let result = evaluate_select_with_modifiers(store, engine, &m).unwrap();
+        let ctx = Ctx::new(store);
+        let result = evaluate_select_with_modifiers(&ctx, engine, &m).unwrap();
         eval.push(t.elapsed().as_secs_f64() * 1000.0);
         rows = result.rows.n_rows();
         let t = Instant::now();
-        let _ = write_sparql_json(&result, store);
+        let _ = write_sparql_json(&result, &ctx);
         ser.push(t.elapsed().as_secs_f64() * 1000.0);
     }
     let med = |mut v: Vec<f64>| {
@@ -478,26 +388,80 @@ pub fn profile_query(store: &TripleStore, engine: &HybridEngine, query_str: &str
     println!("  total:     {:.3} ms", p + e + s);
 }
 
-fn evaluate_select(
-    store: &TripleStore,
-    engine: &HybridEngine,
-    query_str: &str,
-) -> Result<SelectResult, String> {
-    let query = SparqlParser::new()
-        .parse_query(query_str)
-        .map_err(|e| e.to_string())?;
+// ---------------------------------------------------------------------------
+// Query-local terms
+// ---------------------------------------------------------------------------
 
-    let SparqlQuery::Select { pattern, .. } = query else {
-        return Err("Only SELECT queries are supported here".to_string());
-    };
-
-    let m = peel_modifiers(&pattern);
-    evaluate_select_with_modifiers(store, engine, &m)
+/// Terms the running query computed that the graph does not hold: a `BIND`
+/// result, an aggregate's value, a `VALUES` constant absent from the
+/// dictionary. Their IDs continue above the dictionary, so a row stays
+/// `[u32]`, and the whole overlay is dropped when the query ends.
+///
+/// Terms are held in the dictionary's own key encoding, so an overlay ID and a
+/// dictionary ID describe a term identically.
+#[derive(Debug, Default)]
+struct Overlay {
+    keys: Vec<String>,
+    ids: FxHashMap<String, u32>,
 }
 
-/// Mutable twin of [`evaluate_select`] for queries that have to intern a term.
-fn evaluate_select_bind(
-    store: &mut TripleStore,
+/// The store plus that overlay. An ID below `base` belongs to the dictionary,
+/// the rest to the query. Interning takes `&self`, which is what lets a query
+/// that computes a term run under the read lock and leave no trace.
+struct Ctx<'a> {
+    store: &'a TripleStore,
+    base: u32,
+    overlay: RefCell<Overlay>,
+}
+
+impl<'a> Ctx<'a> {
+    fn new(store: &'a TripleStore) -> Self {
+        Self {
+            store,
+            base: store.dict.len() as u32,
+            overlay: RefCell::new(Overlay::default()),
+        }
+    }
+
+    /// ID for a term, reusing the dictionary's when it holds one so that
+    /// equality and joins against stored data keep working.
+    fn intern(&self, lex: &str, typ: TermType) -> u32 {
+        let key = Dictionary::encode(lex, &typ);
+        if let Some(id) = self.store.dict.lookup_encoded(&key) {
+            return id;
+        }
+        let mut o = self.overlay.borrow_mut();
+        if let Some(&id) = o.ids.get(&key) {
+            return id;
+        }
+        let id = self.base + o.keys.len() as u32;
+        o.ids.insert(key.clone(), id);
+        o.keys.push(key);
+        id
+    }
+
+    fn resolve(&self, id: u32) -> Option<Cow<'a, str>> {
+        if id < self.base {
+            return self.store.dict.resolve(id);
+        }
+        let o = self.overlay.borrow();
+        let key = o.keys.get((id - self.base) as usize)?;
+        Some(Cow::Owned(Dictionary::decode(key).0.into_owned()))
+    }
+
+    fn resolve_type(&self, id: u32) -> Option<TermType> {
+        if id < self.base {
+            return self.store.dict.resolve_type(id);
+        }
+        let o = self.overlay.borrow();
+        o.keys
+            .get((id - self.base) as usize)
+            .map(|k| Dictionary::decode(k).1)
+    }
+}
+
+fn evaluate_select(
+    ctx: &Ctx,
     engine: &HybridEngine,
     query_str: &str,
 ) -> Result<SelectResult, String> {
@@ -510,17 +474,16 @@ fn evaluate_select_bind(
     };
 
     let m = peel_modifiers(&pattern);
-    evaluate_select_with_modifiers_mut(store, engine, &m)
+    evaluate_select_with_modifiers(ctx, engine, &m)
 }
 
 /// Executes a SPARQL `SELECT`/`ASK` query against the store and returns the
 /// SPARQL-results JSON body (the same payload the HTTP `/sparql` endpoint
 /// serves). Lets embedders and tests run queries without standing up the server.
 ///
-/// Read-locked, so a `VALUES` term the store does not know has no ID and the
-/// query fails here rather than losing the row (see [`eval_values`]).
-/// [`execute_sparql_bind`] interns it instead, and is what the HTTP endpoints
-/// route such a query to (see [`query_needs_write`]).
+/// Read-locked. A term the query computes rather than reads (a `BIND` result,
+/// an aggregate's value, a `VALUES` constant the graph lacks) gets an ID from
+/// the query-local [`Overlay`], so the store is never written to.
 pub fn execute_sparql(
     store: &TripleStore,
     engine: &HybridEngine,
@@ -529,51 +492,18 @@ pub fn execute_sparql(
     let query = SparqlParser::new()
         .parse_query(query_str)
         .map_err(|e| e.to_string())?;
+    let ctx = Ctx::new(store);
 
     match query {
         SparqlQuery::Select { pattern, .. } => {
             let m = peel_modifiers(&pattern);
-            let result = evaluate_select_with_modifiers(store, engine, &m)?;
-            Ok(write_sparql_json(&result, store))
+            let result = evaluate_select_with_modifiers(&ctx, engine, &m)?;
+            Ok(write_sparql_json(&result, &ctx))
         }
         SparqlQuery::Ask { pattern, .. } => {
             // ASK over the full WHERE path (incl. OPTIONAL/FILTER/UNION) -> ≥1 solution?
             let m = peel_modifiers(&pattern);
-            let result = evaluate_select_with_modifiers(store, engine, &m)?;
-            Ok(format!(
-                "{{\"head\":{{}},\"boolean\":{}}}",
-                result.rows.n_rows() > 0
-            ))
-        }
-        _ => Err("Only SELECT and ASK queries are supported".to_string()),
-    }
-}
-
-/// Mutable twin of [`execute_sparql`] for queries that put a term into the
-/// result which the dictionary does not hold yet: `BIND` and `GROUP BY`
-/// aggregates compute one, a `VALUES` table may name one. Interning needs write
-/// access to the store (see [`eval_where_mut`]).
-///
-/// A server calling this outside the HTTP handlers must log what it interned to
-/// its write-ahead log — see [`log_interned_since`].
-pub fn execute_sparql_bind(
-    store: &mut TripleStore,
-    engine: &HybridEngine,
-    query_str: &str,
-) -> Result<String, String> {
-    let query = SparqlParser::new()
-        .parse_query(query_str)
-        .map_err(|e| e.to_string())?;
-
-    match query {
-        SparqlQuery::Select { pattern, .. } => {
-            let m = peel_modifiers(&pattern);
-            let result = evaluate_select_with_modifiers_mut(store, engine, &m)?;
-            Ok(write_sparql_json(&result, store))
-        }
-        SparqlQuery::Ask { pattern, .. } => {
-            let m = peel_modifiers(&pattern);
-            let result = evaluate_select_with_modifiers_mut(store, engine, &m)?;
+            let result = evaluate_select_with_modifiers(&ctx, engine, &m)?;
             Ok(format!(
                 "{{\"head\":{{}},\"boolean\":{}}}",
                 result.rows.n_rows() > 0
@@ -594,13 +524,9 @@ pub fn execute_sparql_bind(
 /// When `infer` is passed as a query parameter (e.g. `?infer=rdfs`) the HTTP
 /// handlers call this function automatically.
 ///
-/// **Limitation**, tracked in ROADMAP under "SPARQL features": inference only
-/// routes through the read-locked [`eval_where`], so anything needing a term
-/// the dictionary does not hold fails here — `BIND`, `GROUP BY` and an
-/// aggregate sub-`SELECT` as "unsupported WHERE pattern", an unknown `VALUES`
-/// term with the error from [`eval_values`]. One root cause: the callers skip
-/// the write path whenever `infer=rdfs` is set. Fixing that fixes all four, so
-/// widen the tests along with it.
+/// Takes the same query-local [`Overlay`] as [`execute_sparql`], so `BIND`,
+/// `GROUP BY`, an aggregate sub-`SELECT` and an unknown `VALUES` term all work
+/// under inference.
 pub fn execute_sparql_infer(
     store: &TripleStore,
     engine: &HybridEngine,
@@ -611,19 +537,21 @@ pub fn execute_sparql_infer(
         .parse_query(query_str)
         .map_err(|e| e.to_string())?;
 
+    let ctx = Ctx::new(store);
+
     match &mut query {
         SparqlQuery::Select { pattern, .. } => {
             let old = std::mem::replace(pattern, GP::Bgp { patterns: vec![] });
             *pattern = crate::inference::rewrite(old);
             let m = peel_modifiers(pattern);
-            let result = evaluate_select_with_modifiers(store, engine, &m)?;
-            Ok(write_sparql_json(&result, store))
+            let result = evaluate_select_with_modifiers(&ctx, engine, &m)?;
+            Ok(write_sparql_json(&result, &ctx))
         }
         SparqlQuery::Ask { pattern, .. } => {
             let old = std::mem::replace(pattern, GP::Bgp { patterns: vec![] });
             *pattern = crate::inference::rewrite(old);
             let m = peel_modifiers(pattern);
-            let result = evaluate_select_with_modifiers(store, engine, &m)?;
+            let result = evaluate_select_with_modifiers(&ctx, engine, &m)?;
             Ok(format!(
                 "{{\"head\":{{}},\"boolean\":{}}}",
                 result.rows.n_rows() > 0
@@ -634,7 +562,7 @@ pub fn execute_sparql_infer(
 }
 
 fn evaluate_select_infer(
-    store: &TripleStore,
+    ctx: &Ctx,
     engine: &HybridEngine,
     query_str: &str,
 ) -> Result<SelectResult, String> {
@@ -650,7 +578,7 @@ fn evaluate_select_infer(
     let old = std::mem::replace(pattern, GP::Bgp { patterns: vec![] });
     *pattern = crate::inference::rewrite(old);
     let m = peel_modifiers(pattern);
-    evaluate_select_with_modifiers(store, engine, &m)
+    evaluate_select_with_modifiers(ctx, engine, &m)
 }
 
 fn execute_count_infer(
@@ -663,19 +591,21 @@ fn execute_count_infer(
         .parse_query(query_str)
         .map_err(|e| e.to_string())?;
 
+    let ctx = Ctx::new(store);
+
     match &mut query {
         SparqlQuery::Select { pattern, .. } => {
             let old = std::mem::replace(pattern, GP::Bgp { patterns: vec![] });
             *pattern = crate::inference::rewrite(old);
             let m = peel_modifiers(pattern);
-            let result = evaluate_select_with_modifiers(store, engine, &m)?;
+            let result = evaluate_select_with_modifiers(&ctx, engine, &m)?;
             Ok(json!({ "count": result.rows.n_rows() }))
         }
         SparqlQuery::Ask { pattern, .. } => {
             let old = std::mem::replace(pattern, GP::Bgp { patterns: vec![] });
             *pattern = crate::inference::rewrite(old);
             let m = peel_modifiers(pattern);
-            let result = evaluate_select_with_modifiers(store, engine, &m)?;
+            let result = evaluate_select_with_modifiers(&ctx, engine, &m)?;
             Ok(json!({ "boolean": result.rows.n_rows() > 0 }))
         }
         _ => Err("Only SELECT and ASK queries are supported for /count".to_string()),
@@ -768,7 +698,7 @@ fn peel_modifiers(pattern: &spargebra::algebra::GraphPattern) -> Modifiers<'_> {
 /// Join, UNION. Returns (rows, variable order).
 fn eval_where(
     gp: &spargebra::algebra::GraphPattern,
-    store: &TripleStore,
+    ctx: &Ctx,
     engine: &HybridEngine,
     limit: Option<usize>,
 ) -> Result<(RowBlock, Vec<String>), String> {
@@ -777,13 +707,13 @@ fn eval_where(
     // Union/Filter/Path, early termination of the subtrees is not
     // result-preserving -> children get None, the limit applies post hoc.
     match gp {
-        GP::Bgp { patterns } => eval_bgp(patterns, store, engine, limit),
+        GP::Bgp { patterns } => eval_bgp(patterns, ctx.store, engine, limit),
         GP::Filter { expr, inner } => {
             check_expr(expr)?;
-            let (rows, vo) = eval_where(inner, store, engine, None)?;
+            let (rows, vo) = eval_where(inner, ctx, engine, None)?;
             let mut kept = RowBlock::new(rows.n_vars());
             for row in rows.rows() {
-                if row_passes(&[expr], row, &vo, store) {
+                if row_passes(&[expr], row, &vo, ctx) {
                     kept.push_row(row);
                 }
             }
@@ -794,36 +724,70 @@ fn eval_where(
             right,
             expression,
         } => {
-            let (lr, lvo) = eval_where(left, store, engine, None)?;
-            let (rr, rvo) = eval_where(right, store, engine, None)?;
-            hash_join(lr, &lvo, rr, &rvo, true, expression.as_ref(), store)
+            let (lr, lvo) = eval_where(left, ctx, engine, None)?;
+            let (rr, rvo) = eval_where(right, ctx, engine, None)?;
+            hash_join(lr, &lvo, rr, &rvo, true, expression.as_ref(), ctx)
         }
         GP::Join { left, right } => {
-            let (lr, lvo) = eval_where(left, store, engine, None)?;
-            let (rr, rvo) = eval_where(right, store, engine, None)?;
-            hash_join(lr, &lvo, rr, &rvo, false, None, store)
+            let (lr, lvo) = eval_where(left, ctx, engine, None)?;
+            let (rr, rvo) = eval_where(right, ctx, engine, None)?;
+            hash_join(lr, &lvo, rr, &rvo, false, None, ctx)
         }
         GP::Union { left, right } => {
-            let (lr, lvo) = eval_where(left, store, engine, None)?;
-            let (rr, rvo) = eval_where(right, store, engine, None)?;
+            let (lr, lvo) = eval_where(left, ctx, engine, None)?;
+            let (rr, rvo) = eval_where(right, ctx, engine, None)?;
             union_rows(lr, &lvo, rr, &rvo)
         }
         GP::Path {
             subject,
             path,
             object,
-        } => eval_path(store, subject, path, object),
+        } => eval_path(ctx.store, subject, path, object),
+        GP::Extend {
+            inner,
+            variable,
+            expression,
+        } => {
+            check_expr(expression)?;
+            let (rows, mut vo) = eval_where(inner, ctx, engine, None)?;
+            let mut extended = RowBlock::new(rows.n_vars() + 1);
+            for row in rows.rows() {
+                // BIND leaves the variable unbound on a type error rather than
+                // dropping the row (unlike FILTER).
+                let id = match expression {
+                    // Fast path: alias such as `COUNT(*) AS ?cnt`. Preserving
+                    // the original dictionary ID keeps the datatype (e.g.
+                    // xsd:integer) instead of re-interning as xsd:double.
+                    Expression::Variable(v) => vo
+                        .iter()
+                        .position(|x| x == v.as_str())
+                        .map(|c| row[c])
+                        .filter(|&id| id != NULL_ID)
+                        .unwrap_or(NULL_ID),
+                    _ => match eval(expression, row, &vo, ctx) {
+                        Ok(fv) => intern_fv(ctx, &fv),
+                        Err(()) => NULL_ID,
+                    },
+                };
+                extended.push_row_concat(row, &[id]);
+            }
+            vo.push(variable.as_str().to_string());
+            Ok((extended, vo))
+        }
+        GP::Group {
+            inner,
+            variables,
+            aggregates,
+        } => eval_group(inner, variables, aggregates, ctx, engine),
         GP::Minus { left, right } => {
-            let (lr, lvo) = eval_where(left, store, engine, None)?;
-            let (rr, rvo) = eval_where(right, store, engine, None)?;
+            let (lr, lvo) = eval_where(left, ctx, engine, None)?;
+            let (rr, rvo) = eval_where(right, ctx, engine, None)?;
             Ok(minus_rows(lr, &lvo, rr, &rvo))
         }
         GP::Values {
             variables,
             bindings,
-        } => eval_values(variables, bindings, |t| {
-            store.dict.lookup_term(&t.value, &t.typ)
-        }),
+        } => eval_values(variables, bindings, |t| ctx.intern(&t.value, t.typ.clone())),
         // Sub-SELECT: evaluated as its own query, so what it does not project
         // stays out of scope for the enclosing pattern.
         GP::Project { .. }
@@ -834,12 +798,13 @@ fn eval_where(
             let sub = peel_modifiers(gp);
             // `limit` is non-None only for a whole-body sub-SELECT, whose
             // rows map 1:1 onto the enclosing result -> the cap carries in.
-            let (rows, vo) = eval_where(sub.where_pat, store, engine, pushdown_rows(&sub, limit))?;
-            let r = apply_modifiers(&sub, rows, vo, store)?;
+            let (rows, vo) = eval_where(sub.where_pat, ctx, engine, pushdown_rows(&sub, limit))?;
+            let r = apply_modifiers(&sub, rows, vo, ctx)?;
             Ok((r.rows, r.var_order))
         }
         _ => Err(
-            "Unsupported WHERE pattern (only BGP/FILTER/OPTIONAL/UNION/Join/Path/MINUS/VALUES/sub-SELECT; use the mutable API for BIND/GROUP BY)".to_string(),
+            "Unsupported WHERE pattern (only BGP/FILTER/OPTIONAL/UNION/Join/Path/BIND/GROUP BY/MINUS/VALUES/sub-SELECT)"
+                .to_string(),
         ),
     }
 }
@@ -874,171 +839,24 @@ fn contains_node(
     }
 }
 
-/// Whether `gp` contains a `BIND` (`Extend`) node anywhere in the tree. BIND
-/// materializes a value not yet in the dictionary, so queries containing it
-/// need write access to the store (see [`eval_where_mut`]) instead of the
-/// usual read lock.
-fn contains_extend(gp: &spargebra::algebra::GraphPattern) -> bool {
-    contains_node(gp, &|g| {
-        matches!(g, spargebra::algebra::GraphPattern::Extend { .. })
-    })
-}
-
 /// Whether `gp` contains a `GROUP BY` (`Group`) node anywhere in the tree.
-/// Aggregate results are computed values that must be interned into the
-/// dictionary, so such queries also need write access to the store.
+/// GROUP BY needs the full inner result, so this disables limit pushdown.
 fn contains_group(gp: &spargebra::algebra::GraphPattern) -> bool {
     contains_node(gp, &|g| {
         matches!(g, spargebra::algebra::GraphPattern::Group { .. })
     })
 }
 
-/// Whether `gp` contains a `VALUES` table naming a term `dict` does not hold —
-/// the only case where the table forces the query off the read lock (see
-/// [`eval_values`]). An `UNDEF` cell names no term, so it does not count.
-fn contains_unknown_values_term(gp: &spargebra::algebra::GraphPattern, dict: &Dictionary) -> bool {
-    contains_node(gp, &|g| match g {
-        spargebra::algebra::GraphPattern::Values { bindings, .. } => {
-            bindings.iter().flatten().any(|cell| {
-                cell.as_ref().is_some_and(|term| {
-                    ground_term_to_parsed(term)
-                        .is_ok_and(|t| dict.lookup_term(&t.value, &t.typ).is_none())
-                })
-            })
-        }
-        _ => false,
-    })
-}
-
-/// Mutable twin of [`eval_where`] for queries that need to intern computed
-/// values (`BIND` and `GROUP BY` aggregates). Identical to `eval_where` except
-/// for the added `Extend` and `Group` arms — kept in sync with it by hand since
-/// Rust has no way to share one body across an `&`/`&mut` store parameter here
-/// without a larger refactor.
-fn eval_where_mut(
-    gp: &spargebra::algebra::GraphPattern,
-    store: &mut TripleStore,
-    engine: &HybridEngine,
-    limit: Option<usize>,
-) -> Result<(RowBlock, Vec<String>), String> {
-    use spargebra::algebra::GraphPattern as GP;
-    match gp {
-        GP::Bgp { patterns } => eval_bgp(patterns, store, engine, limit),
-        GP::Filter { expr, inner } => {
-            check_expr(expr)?;
-            let (rows, vo) = eval_where_mut(inner, store, engine, None)?;
-            let mut kept = RowBlock::new(rows.n_vars());
-            for row in rows.rows() {
-                if row_passes(&[expr], row, &vo, store) {
-                    kept.push_row(row);
-                }
-            }
-            Ok((kept, vo))
-        }
-        GP::LeftJoin {
-            left,
-            right,
-            expression,
-        } => {
-            let (lr, lvo) = eval_where_mut(left, store, engine, None)?;
-            let (rr, rvo) = eval_where_mut(right, store, engine, None)?;
-            hash_join(lr, &lvo, rr, &rvo, true, expression.as_ref(), store)
-        }
-        GP::Join { left, right } => {
-            let (lr, lvo) = eval_where_mut(left, store, engine, None)?;
-            let (rr, rvo) = eval_where_mut(right, store, engine, None)?;
-            hash_join(lr, &lvo, rr, &rvo, false, None, store)
-        }
-        GP::Union { left, right } => {
-            let (lr, lvo) = eval_where_mut(left, store, engine, None)?;
-            let (rr, rvo) = eval_where_mut(right, store, engine, None)?;
-            union_rows(lr, &lvo, rr, &rvo)
-        }
-        GP::Path {
-            subject,
-            path,
-            object,
-        } => eval_path(store, subject, path, object),
-        GP::Extend {
-            inner,
-            variable,
-            expression,
-        } => {
-            check_expr(expression)?;
-            let (rows, mut vo) = eval_where_mut(inner, store, engine, None)?;
-            let mut extended = RowBlock::new(rows.n_vars() + 1);
-            for row in rows.rows() {
-                // BIND leaves the variable unbound on a type error rather than
-                // dropping the row (unlike FILTER).
-                let id = match expression {
-                    // Fast path: alias such as `COUNT(*) AS ?cnt`. Preserving
-                    // the original dictionary ID keeps the datatype (e.g.
-                    // xsd:integer) instead of re-interning as xsd:double.
-                    Expression::Variable(v) => vo
-                        .iter()
-                        .position(|x| x == v.as_str())
-                        .map(|c| row[c])
-                        .filter(|&id| id != NULL_ID)
-                        .unwrap_or(NULL_ID),
-                    _ => match eval(expression, row, &vo, store) {
-                        Ok(fv) => intern_fv(store, &fv),
-                        Err(()) => NULL_ID,
-                    },
-                };
-                extended.push_row_concat(row, &[id]);
-            }
-            vo.push(variable.as_str().to_string());
-            Ok((extended, vo))
-        }
-        GP::Group {
-            inner,
-            variables,
-            aggregates,
-        } => eval_group(inner, variables, aggregates, store, engine),
-        GP::Minus { left, right } => {
-            let (lr, lvo) = eval_where_mut(left, store, engine, None)?;
-            let (rr, rvo) = eval_where_mut(right, store, engine, None)?;
-            Ok(minus_rows(lr, &lvo, rr, &rvo))
-        }
-        // Under the write lock an inline value the store has never seen can be
-        // interned, so a standalone VALUES hands the term back verbatim.
-        GP::Values {
-            variables,
-            bindings,
-        } => eval_values(variables, bindings, |t| {
-            Some(store.dict.insert_with_type(&t.value, t.typ.clone()))
-        }),
-        // Sub-SELECT: evaluated as its own query, so what it does not project
-        // stays out of scope for the enclosing pattern.
-        GP::Project { .. }
-        | GP::Distinct { .. }
-        | GP::Reduced { .. }
-        | GP::Slice { .. }
-        | GP::OrderBy { .. } => {
-            let sub = peel_modifiers(gp);
-            // `limit` is non-None only for a whole-body sub-SELECT, whose
-            // rows map 1:1 onto the enclosing result -> the cap carries in.
-            let (rows, vo) = eval_where_mut(sub.where_pat, store, engine, pushdown_rows(&sub, limit))?;
-            let r = apply_modifiers(&sub, rows, vo, store)?;
-            Ok((r.rows, r.var_order))
-        }
-        _ => Err(
-            "Unsupported WHERE pattern (only BGP/FILTER/OPTIONAL/UNION/Join/Path/BIND/GROUP BY/MINUS/VALUES/sub-SELECT)"
-                .to_string(),
-        ),
-    }
-}
-
 /// Evaluates a `GROUP BY ... (COUNT(...) AS ?var)` pattern. The inner pattern
 /// is evaluated, rows are partitioned by the GROUP BY variables, and one row
 /// per group is emitted containing the group key plus the aggregate values.
-/// Aggregate results are interned into the dictionary, so this needs write
-/// access to the store.
+/// Aggregate results take IDs from the query-local overlay, so this runs under
+/// the read lock.
 fn eval_group(
     inner: &spargebra::algebra::GraphPattern,
     group_by_vars: &[Variable],
     aggregates: &[(Variable, spargebra::algebra::AggregateExpression)],
-    store: &mut TripleStore,
+    ctx: &Ctx,
     engine: &HybridEngine,
 ) -> Result<(RowBlock, Vec<String>), String> {
     use rustc_hash::FxHashMap;
@@ -1047,7 +865,7 @@ fn eval_group(
     use spargebra::algebra::AggregateFunction as AF;
 
     // 1. Evaluate the inner pattern.
-    let (rows, vo) = eval_where_mut(inner, store, engine, None)?;
+    let (rows, vo) = eval_where(inner, ctx, engine, None)?;
 
     // 2. Find the column indices for the GROUP BY variables.
     let group_cols: Vec<usize> = group_by_vars
@@ -1102,7 +920,7 @@ fn eval_group(
                     } else {
                         row_indices.len() as i64
                     };
-                    intern_count(store, n)
+                    intern_count(ctx, n)
                 }
                 AE::FunctionCall {
                     name,
@@ -1120,7 +938,7 @@ fn eval_group(
                             &row_indices,
                             *distinct,
                             matches!(name, AF::Avg),
-                            store,
+                            ctx,
                         )?);
                         continue;
                     }
@@ -1143,7 +961,7 @@ fn eval_group(
                             } else {
                                 bound().count()
                             };
-                            intern_count(store, n as i64)
+                            intern_count(ctx, n as i64)
                         }
                         // Joins the terms' lexical forms. Always a plain string, and
                         // "" over an empty group rather than unbound.
@@ -1156,10 +974,10 @@ fn eval_group(
                             }
                             let joined = ids
                                 .iter()
-                                .filter_map(|&id| store.dict.resolve(id))
+                                .filter_map(|&id| ctx.resolve(id))
                                 .collect::<Vec<_>>()
                                 .join(sep);
-                            intern_fv(store, &Fv::Str(joined))
+                            intern_fv(ctx, &Fv::Str(joined))
                         }
                         // SPARQL lets SAMPLE return any element, so take the first.
                         AF::Sample => bound().next().map_or(NULL_ID, |&i| rows.row(i)[col]),
@@ -1169,7 +987,7 @@ fn eval_group(
                             let want_max = matches!(name, AF::Max);
                             bound()
                                 .map(|&i| {
-                                    (rows.row(i)[col], order_key(expr, rows.row(i), &vo, store))
+                                    (rows.row(i)[col], order_key(expr, rows.row(i), &vo, ctx))
                                 })
                                 .reduce(|best, cur| {
                                     let ord = cmp_key(&cur.1, &best.1);
@@ -1199,20 +1017,17 @@ fn eval_group(
 
 /// Interns an integer count as an `xsd:integer` literal. COUNT results are
 /// defined as integer typed literals by SPARQL 1.1.
-fn intern_count(store: &mut TripleStore, n: i64) -> u32 {
-    let lex = n.to_string();
-    let typ = TermType::literal_datatype(format!("{XSD}integer"));
-    store
-        .dict
-        .lookup_term(&lex, &typ)
-        .unwrap_or_else(|| store.dict.insert_with_type(&lex, typ))
+fn intern_count(ctx: &Ctx, n: i64) -> u32 {
+    ctx.intern(
+        &n.to_string(),
+        TermType::literal_datatype(format!("{XSD}integer")),
+    )
 }
 
-/// Interns a `BIND`-computed value into the dictionary, reusing the existing
-/// term if the same value is already present — so equality/joins against
-/// stored data keep working for the bound variable. Requires write access to
-/// the store.
-fn intern_fv(store: &mut TripleStore, fv: &Fv) -> u32 {
+/// Gives a `BIND`-computed value an ID, reusing the stored term if the value
+/// is already in the dictionary so joins against stored data keep working.
+/// New values go to the query-local overlay, so this runs under the read lock.
+fn intern_fv(ctx: &Ctx, fv: &Fv) -> u32 {
     let (lex, typ) = match fv {
         Fv::Iri(s) => (s.clone(), TermType::iri()),
         Fv::Blank(s) => (s.clone(), TermType::BlankNode),
@@ -1228,10 +1043,7 @@ fn intern_fv(store: &mut TripleStore, fv: &Fv) -> u32 {
         Fv::Lang(s, l) => (s.clone(), TermType::literal_lang(l.clone())),
         Fv::Typed(s, dt) => (s.clone(), TermType::literal_datatype(dt.clone())),
     };
-    store
-        .dict
-        .lookup_term(&lex, &typ)
-        .unwrap_or_else(|| store.dict.insert_with_type(&lex, typ))
+    ctx.intern(&lex, typ)
 }
 
 /// Column read by a bare-variable aggregate argument, e.g. the `?v` in MIN(?v).
@@ -1268,7 +1080,7 @@ fn agg_sum_avg(
     row_indices: &[usize],
     distinct: bool,
     avg: bool,
-    store: &mut TripleStore,
+    ctx: &Ctx,
 ) -> Result<u32, String> {
     use rustc_hash::FxHashSet;
 
@@ -1283,7 +1095,7 @@ fn agg_sum_avg(
         // An unbound argument - or one whose evaluation errors - is simply not
         // a contributor; a bound non-numeric one is a type error that makes the
         // whole aggregate unbound.
-        if let Ok(fv) = eval(expr, rows.row(i), vo, store) {
+        if let Ok(fv) = eval(expr, rows.row(i), vo, ctx) {
             match as_num(&fv) {
                 Some(n) => vals.push(n),
                 None => return Ok(NULL_ID),
@@ -1297,7 +1109,7 @@ fn agg_sum_avg(
         vals.retain(|n| seen.insert(n.to_bits()));
     }
     if vals.is_empty() {
-        return Ok(intern_count(store, 0));
+        return Ok(intern_count(ctx, 0));
     }
     let total: f64 = vals.iter().sum();
     let n = if avg {
@@ -1305,7 +1117,7 @@ fn agg_sum_avg(
     } else {
         total
     };
-    Ok(intern_fv(store, &Fv::Num(n)))
+    Ok(intern_fv(ctx, &Fv::Num(n)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1640,7 +1452,7 @@ fn hash_join(
     rvo: &[String],
     left_outer: bool,
     on: Option<&Expression>,
-    store: &TripleStore,
+    ctx: &Ctx,
 ) -> Result<(RowBlock, Vec<String>), String> {
     // `eval` reports unsupported constructs as an error, which a left join reads
     // as "no match" — that would silently unbind instead of failing. Reject up front.
@@ -1746,7 +1558,7 @@ fn hash_join(
     // row, and a match that fails it does not count — the left row then falls
     // through to the unbound-padded branch rather than being dropped.
     let mut merged: Vec<u32> = Vec::with_capacity(new_var_order.len());
-    let keeps = |merged: &[u32]| ebv(on, merged, &new_var_order, store) == Ok(true);
+    let keeps = |merged: &[u32]| ebv(on, merged, &new_var_order, ctx) == Ok(true);
     for row in left.rows() {
         let key: Vec<u32> = shared.iter().map(|&(lp, _)| row[lp]).collect();
         let mut matched = false;
@@ -1942,19 +1754,16 @@ fn merge_compatible(
 
 /// Evaluates a `VALUES` inline table into a row block.
 ///
-/// Rows carry dictionary IDs, so a term the store has never seen has none to
-/// carry. Dropping the row would be exact only under a plain join — not under
-/// `OPTIONAL`, in a `UNION` branch, or standing alone — so `resolve` returning
-/// `None` is an error, not a silent skip. [`query_needs_write`] routes such a
-/// query to the write path, whose resolver interns instead; that leaves
-/// `?infer=rdfs`, read-only by construction, as the one caller that sees it.
+/// Rows carry IDs, so a term the graph lacks takes one from the query-local
+/// overlay rather than being dropped: dropping would be exact only under a
+/// plain join, not under `OPTIONAL`, in a `UNION` branch, or standing alone.
 ///
 /// An `UNDEF` cell binds nothing, and [`hash_join`] reads the unbound column as
 /// the wildcard SPARQL compatibility makes it.
 fn eval_values(
     variables: &[Variable],
     bindings: &[Vec<Option<GroundTerm>>],
-    mut resolve: impl FnMut(&ParsedTermRdf) -> Option<u32>,
+    mut resolve: impl FnMut(&ParsedTermRdf) -> u32,
 ) -> Result<(RowBlock, Vec<String>), String> {
     let vo: Vec<String> = variables.iter().map(|v| v.as_str().to_string()).collect();
     let mut rows = RowBlock::new(vo.len());
@@ -1965,14 +1774,7 @@ fn eval_values(
             // UNDEF: leave the slot at NULL_ID, which the join treats as a wildcard.
             let Some(term) = cell else { continue };
             let parsed = ground_term_to_parsed(term)?;
-            *slot = resolve(&parsed).ok_or_else(|| {
-                format!(
-                    "VALUES names \"{}\", which the store does not contain; \
-                     only the write path can mint an ID for it, and `?infer=rdfs` \
-                     never takes it",
-                    parsed.value
-                )
-            })?;
+            *slot = resolve(&parsed);
         }
         rows.push_row(&buf);
     }
@@ -1989,8 +1791,8 @@ enum OrderKey {
     Str(String),
 }
 
-fn order_key(expr: &Expression, row: &[u32], vo: &[String], store: &TripleStore) -> OrderKey {
-    match eval(expr, row, vo, store) {
+fn order_key(expr: &Expression, row: &[u32], vo: &[String], ctx: &Ctx) -> OrderKey {
+    match eval(expr, row, vo, ctx) {
         Ok(Fv::Num(n)) => OrderKey::Num(n),
         Ok(Fv::Bool(b)) => OrderKey::Num(if b { 1.0 } else { 0.0 }),
         Ok(Fv::Iri(s)) => OrderKey::Iri(s),
@@ -2018,18 +1820,13 @@ fn cmp_key(a: &OrderKey, b: &OrderKey) -> std::cmp::Ordering {
     }
 }
 
-fn sort_rows(
-    rows: &mut RowBlock,
-    vo: &[String],
-    order_by: &[(&Expression, bool)],
-    store: &TripleStore,
-) {
+fn sort_rows(rows: &mut RowBlock, vo: &[String], order_by: &[(&Expression, bool)], ctx: &Ctx) {
     let n = rows.n_rows();
     let keys: Vec<Vec<OrderKey>> = (0..n)
         .map(|i| {
             order_by
                 .iter()
-                .map(|(e, _)| order_key(e, rows.row(i), vo, store))
+                .map(|(e, _)| order_key(e, rows.row(i), vo, ctx))
                 .collect()
         })
         .collect();
@@ -2079,13 +1876,13 @@ fn apply_modifiers(
     m: &Modifiers,
     rows: RowBlock,
     var_order: Vec<String>,
-    store: &TripleStore,
+    ctx: &Ctx,
 ) -> Result<SelectResult, String> {
     let mut rows = rows;
 
     // ORDER BY (on the full bindings, before projection).
     if !m.order_by.is_empty() {
-        sort_rows(&mut rows, &var_order, &m.order_by, store);
+        sort_rows(&mut rows, &var_order, &m.order_by, ctx);
     }
 
     // SELECT * : all variables except internal blank-node placeholders (__bn_),
@@ -2130,23 +1927,12 @@ fn apply_modifiers(
 }
 
 fn evaluate_select_with_modifiers(
-    store: &TripleStore,
+    ctx: &Ctx,
     engine: &HybridEngine,
     m: &Modifiers,
 ) -> Result<SelectResult, String> {
-    let (rows, var_order) = eval_where(m.where_pat, store, engine, pushdown_rows(m, None))?;
-    apply_modifiers(m, rows, var_order, store)
-}
-
-/// Mutable twin of [`evaluate_select_with_modifiers`] for queries containing
-/// `BIND` or `GROUP BY`, routed to [`eval_where_mut`] instead of [`eval_where`].
-fn evaluate_select_with_modifiers_mut(
-    store: &mut TripleStore,
-    engine: &HybridEngine,
-    m: &Modifiers,
-) -> Result<SelectResult, String> {
-    let (rows, var_order) = eval_where_mut(m.where_pat, store, engine, pushdown_rows(m, None))?;
-    apply_modifiers(m, rows, var_order, store)
+    let (rows, var_order) = eval_where(m.where_pat, ctx, engine, pushdown_rows(m, None))?;
+    apply_modifiers(m, rows, var_order, ctx)
 }
 
 fn variables_in_bgp(bgp: &[spargebra::term::TriplePattern]) -> Vec<String> {
@@ -2204,8 +1990,8 @@ fn append_json_str(out: &mut String, s: &str) {
 }
 
 /// Appends the SPARQL-JSON term object for an ID (uri/literal+datatype/lang).
-fn append_term(out: &mut String, id: u32, dict: &Dictionary) {
-    match (dict.resolve(id), dict.resolve_type(id)) {
+fn append_term(out: &mut String, id: u32, ctx: &Ctx) {
+    match (ctx.resolve(id), ctx.resolve_type(id)) {
         (Some(v), Some(TermType::Iri)) => {
             out.push_str("{\"type\":\"uri\",\"value\":");
             append_json_str(out, &v);
@@ -2244,7 +2030,7 @@ fn append_term(out: &mut String, id: u32, dict: &Dictionary) {
 
 /// Serializes the result **directly as a JSON string** – without allocating a
 /// `serde_json::Map`/`Value` per row (that was ~95% of the time of large queries).
-fn write_sparql_json(result: &SelectResult, store: &TripleStore) -> String {
+fn write_sparql_json(result: &SelectResult, ctx: &Ctx) -> String {
     let mut var_indices = Vec::with_capacity(result.vars.len());
     for var in &result.vars {
         let pos = result
@@ -2283,7 +2069,7 @@ fn write_sparql_json(result: &SelectResult, store: &TripleStore) -> String {
             first_cell = false;
             append_json_str(&mut out, var);
             out.push(':');
-            append_term(&mut out, id, &store.dict);
+            append_term(&mut out, id, ctx);
         }
         out.push('}');
     }
@@ -2299,41 +2085,17 @@ fn execute_count(
     let query = SparqlParser::new()
         .parse_query(query_str)
         .map_err(|e| e.to_string())?;
+    let ctx = Ctx::new(store);
 
     match query {
         SparqlQuery::Select { pattern, .. } => {
             let m = peel_modifiers(&pattern);
-            let result = evaluate_select_with_modifiers(store, engine, &m)?;
+            let result = evaluate_select_with_modifiers(&ctx, engine, &m)?;
             Ok(json!({ "count": result.rows.n_rows() }))
         }
         SparqlQuery::Ask { pattern, .. } => {
             let m = peel_modifiers(&pattern);
-            let result = evaluate_select_with_modifiers(store, engine, &m)?;
-            Ok(json!({ "boolean": result.rows.n_rows() > 0 }))
-        }
-        _ => Err("Only SELECT and ASK queries are supported for /count".to_string()),
-    }
-}
-
-/// Mutable twin of [`execute_count`] for queries containing `BIND`.
-fn execute_count_bind(
-    store: &mut TripleStore,
-    engine: &HybridEngine,
-    query_str: &str,
-) -> Result<Value, String> {
-    let query = SparqlParser::new()
-        .parse_query(query_str)
-        .map_err(|e| e.to_string())?;
-
-    match query {
-        SparqlQuery::Select { pattern, .. } => {
-            let m = peel_modifiers(&pattern);
-            let result = evaluate_select_with_modifiers_mut(store, engine, &m)?;
-            Ok(json!({ "count": result.rows.n_rows() }))
-        }
-        SparqlQuery::Ask { pattern, .. } => {
-            let m = peel_modifiers(&pattern);
-            let result = evaluate_select_with_modifiers_mut(store, engine, &m)?;
+            let result = evaluate_select_with_modifiers(&ctx, engine, &m)?;
             Ok(json!({ "boolean": result.rows.n_rows() > 0 }))
         }
         _ => Err("Only SELECT and ASK queries are supported for /count".to_string()),
@@ -2392,45 +2154,6 @@ fn execute_update(
     }
 
     store.apply_updates(&inserts, &deletes);
-    Ok(())
-}
-
-/// Logs every term interned since `first_new_id` to the WAL, in ID order, so a
-/// replay assigns them the same IDs.
-///
-/// The log records operations by ID but reconstructs IDs from the order of its
-/// term records (see [`crate::wal`]), so an unlogged intern shifts every later
-/// one and the replay rebuilds the wrong triples. Queries intern too: `BIND`
-/// and `GROUP BY` a computed value, `VALUES` a term its table names. No `sync`
-/// — these records share the log's buffer with the operations that reference
-/// them, so the next update's sync flushes both, in order.
-fn log_interned_since(
-    store: &TripleStore,
-    first_new_id: usize,
-    wal: &mut Wal,
-) -> Result<usize, String> {
-    for id in first_new_id..store.dict.len() {
-        let id = id as u32;
-        let (Some(value), Some(typ)) = (store.dict.resolve(id), store.dict.resolve_type(id)) else {
-            return Err(format!(
-                "dictionary term {id} disappeared before it was logged"
-            ));
-        };
-        wal.log_term(&value, &typ).map_err(|e| e.to_string())?;
-    }
-    Ok(store.dict.len() - first_new_id)
-}
-
-/// Logs what a query interned and forces it to disk. Unsynced term records sit
-/// in the writer's buffer, so a crash tears the log mid-record.
-fn log_interned_and_sync(
-    store: &TripleStore,
-    first_new_id: usize,
-    wal: &mut Wal,
-) -> Result<(), String> {
-    if log_interned_since(store, first_new_id, wal)? > 0 {
-        wal.sync().map_err(|e| e.to_string())?;
-    }
     Ok(())
 }
 
@@ -2586,9 +2309,9 @@ fn classify(lex: &str, datatype: Option<&str>, lang: Option<&str>) -> Fv {
     }
 }
 
-fn term_to_fv(id: u32, store: &TripleStore) -> Option<Fv> {
-    let v = store.dict.resolve(id)?;
-    match store.dict.resolve_type(id)? {
+fn term_to_fv(id: u32, ctx: &Ctx) -> Option<Fv> {
+    let v = ctx.resolve(id)?;
+    match ctx.resolve_type(id)? {
         TermType::Iri => Some(Fv::Iri(v.to_string())),
         TermType::BlankNode => Some(Fv::Blank(v.to_string())),
         TermType::Literal { datatype, lang } => {
@@ -2673,12 +2396,7 @@ fn lit_key(lexical: &str, datatype: Option<&str>, lang: Option<&str>) -> TermKey
 
 /// Resolves an expression to its RDF term identity, or `None` if it is unbound
 /// or a computed (non-term) expression — in which case `sameTerm` errors.
-fn term_key(
-    expr: &Expression,
-    row: &[u32],
-    vars: &[String],
-    store: &TripleStore,
-) -> Option<TermKey> {
+fn term_key(expr: &Expression, row: &[u32], vars: &[String], ctx: &Ctx) -> Option<TermKey> {
     match expr {
         Expression::NamedNode(nn) => Some(TermKey::Iri(nn.as_str().to_string())),
         Expression::Literal(lit) => Some(lit_key(
@@ -2692,8 +2410,8 @@ fn term_key(
             if id == NULL_ID {
                 return None;
             }
-            let value = store.dict.resolve(id)?;
-            match store.dict.resolve_type(id)? {
+            let value = ctx.resolve(id)?;
+            match ctx.resolve_type(id)? {
                 TermType::Iri => Some(TermKey::Iri(value.into_owned())),
                 TermType::BlankNode => Some(TermKey::Blank(value.into_owned())),
                 TermType::Literal { datatype, lang } => {
@@ -2705,7 +2423,7 @@ fn term_key(
     }
 }
 
-fn eval(expr: &Expression, row: &[u32], vars: &[String], store: &TripleStore) -> Result<Fv, ()> {
+fn eval(expr: &Expression, row: &[u32], vars: &[String], ctx: &Ctx) -> Result<Fv, ()> {
     match expr {
         Expression::NamedNode(nn) => Ok(Fv::Iri(nn.as_str().to_string())),
         Expression::Literal(lit) => Ok(literal_to_fv(lit)),
@@ -2715,16 +2433,16 @@ fn eval(expr: &Expression, row: &[u32], vars: &[String], store: &TripleStore) ->
             if id == NULL_ID {
                 return Err(());
             }
-            term_to_fv(id, store).ok_or(())
+            term_to_fv(id, ctx).ok_or(())
         }
         Expression::Or(a, b) => {
             // SPARQL 3-valued OR: true if either operand is true (even if the
             // other errors). Short-circuits once a `true` is found.
-            let ea = ebv(a, row, vars, store);
+            let ea = ebv(a, row, vars, ctx);
             if ea == Ok(true) {
                 return Ok(Fv::Bool(true));
             }
-            let eb = ebv(b, row, vars, store);
+            let eb = ebv(b, row, vars, ctx);
             if eb == Ok(true) {
                 return Ok(Fv::Bool(true));
             }
@@ -2737,11 +2455,11 @@ fn eval(expr: &Expression, row: &[u32], vars: &[String], store: &TripleStore) ->
         Expression::And(a, b) => {
             // SPARQL 3-valued AND: false if either operand is false (even if the
             // other errors). Short-circuits once a `false` is found.
-            let ea = ebv(a, row, vars, store);
+            let ea = ebv(a, row, vars, ctx);
             if ea == Ok(false) {
                 return Ok(Fv::Bool(false));
             }
-            let eb = ebv(b, row, vars, store);
+            let eb = ebv(b, row, vars, ctx);
             if eb == Ok(false) {
                 return Ok(Fv::Bool(false));
             }
@@ -2751,50 +2469,50 @@ fn eval(expr: &Expression, row: &[u32], vars: &[String], store: &TripleStore) ->
                 Ok(Fv::Bool(true))
             }
         }
-        Expression::Not(a) => Ok(Fv::Bool(!ebv(a, row, vars, store)?)),
+        Expression::Not(a) => Ok(Fv::Bool(!ebv(a, row, vars, ctx)?)),
         Expression::Equal(a, b) => {
-            let (x, y) = (eval(a, row, vars, store)?, eval(b, row, vars, store)?);
+            let (x, y) = (eval(a, row, vars, ctx)?, eval(b, row, vars, ctx)?);
             fv_equal(&x, &y).map(Fv::Bool).ok_or(())
         }
         Expression::SameTerm(a, b) => {
             // Exact term identity — NOT value equality (no numeric promotion).
-            match (term_key(a, row, vars, store), term_key(b, row, vars, store)) {
+            match (term_key(a, row, vars, ctx), term_key(b, row, vars, ctx)) {
                 (Some(x), Some(y)) => Ok(Fv::Bool(x == y)),
                 _ => Err(()), // unbound or non-term operand
             }
         }
         Expression::Greater(a, b) => {
-            cmp_op(a, b, row, vars, store, |o| o == std::cmp::Ordering::Greater)
+            cmp_op(a, b, row, vars, ctx, |o| o == std::cmp::Ordering::Greater)
         }
         Expression::GreaterOrEqual(a, b) => {
-            cmp_op(a, b, row, vars, store, |o| o != std::cmp::Ordering::Less)
+            cmp_op(a, b, row, vars, ctx, |o| o != std::cmp::Ordering::Less)
         }
-        Expression::Less(a, b) => cmp_op(a, b, row, vars, store, |o| o == std::cmp::Ordering::Less),
+        Expression::Less(a, b) => cmp_op(a, b, row, vars, ctx, |o| o == std::cmp::Ordering::Less),
         Expression::LessOrEqual(a, b) => {
-            cmp_op(a, b, row, vars, store, |o| o != std::cmp::Ordering::Greater)
+            cmp_op(a, b, row, vars, ctx, |o| o != std::cmp::Ordering::Greater)
         }
-        Expression::Add(a, b) => num_op(a, b, row, vars, store, |x, y| x + y),
-        Expression::Subtract(a, b) => num_op(a, b, row, vars, store, |x, y| x - y),
-        Expression::Multiply(a, b) => num_op(a, b, row, vars, store, |x, y| x * y),
+        Expression::Add(a, b) => num_op(a, b, row, vars, ctx, |x, y| x + y),
+        Expression::Subtract(a, b) => num_op(a, b, row, vars, ctx, |x, y| x - y),
+        Expression::Multiply(a, b) => num_op(a, b, row, vars, ctx, |x, y| x * y),
         Expression::Divide(a, b) => {
-            let x = as_num(&eval(a, row, vars, store)?).ok_or(())?;
-            let y = as_num(&eval(b, row, vars, store)?).ok_or(())?;
+            let x = as_num(&eval(a, row, vars, ctx)?).ok_or(())?;
+            let y = as_num(&eval(b, row, vars, ctx)?).ok_or(())?;
             // SPARQL 1.1: division by zero is an error -> the row is dropped.
             if y == 0.0 {
                 return Err(());
             }
             Ok(Fv::Num(x / y))
         }
-        Expression::UnaryPlus(a) => Ok(Fv::Num(as_num(&eval(a, row, vars, store)?).ok_or(())?)),
-        Expression::UnaryMinus(a) => Ok(Fv::Num(-as_num(&eval(a, row, vars, store)?).ok_or(())?)),
+        Expression::UnaryPlus(a) => Ok(Fv::Num(as_num(&eval(a, row, vars, ctx)?).ok_or(())?)),
+        Expression::UnaryMinus(a) => Ok(Fv::Num(-as_num(&eval(a, row, vars, ctx)?).ok_or(())?)),
         Expression::Bound(v) => {
             let col = vars.iter().position(|x| x == v.as_str());
             Ok(Fv::Bool(col.is_some_and(|c| row[c] != NULL_ID)))
         }
         Expression::In(e, list) => {
-            let x = eval(e, row, vars, store)?;
+            let x = eval(e, row, vars, ctx)?;
             for item in list {
-                if let Ok(y) = eval(item, row, vars, store)
+                if let Ok(y) = eval(item, row, vars, ctx)
                     && fv_equal(&x, &y) == Some(true)
                 {
                     return Ok(Fv::Bool(true));
@@ -2803,13 +2521,13 @@ fn eval(expr: &Expression, row: &[u32], vars: &[String], store: &TripleStore) ->
             Ok(Fv::Bool(false))
         }
         Expression::If(c, a, b) => {
-            if ebv(c, row, vars, store)? {
-                eval(a, row, vars, store)
+            if ebv(c, row, vars, ctx)? {
+                eval(a, row, vars, ctx)
             } else {
-                eval(b, row, vars, store)
+                eval(b, row, vars, ctx)
             }
         }
-        Expression::FunctionCall(func, args) => eval_func(func, args, row, vars, store),
+        Expression::FunctionCall(func, args) => eval_func(func, args, row, vars, ctx),
         _ => Err(()), // unsupported -> error (row is dropped)
     }
 }
@@ -2819,10 +2537,10 @@ fn cmp_op(
     b: &Expression,
     row: &[u32],
     vars: &[String],
-    store: &TripleStore,
+    ctx: &Ctx,
     pred: impl Fn(std::cmp::Ordering) -> bool,
 ) -> Result<Fv, ()> {
-    let (x, y) = (eval(a, row, vars, store)?, eval(b, row, vars, store)?);
+    let (x, y) = (eval(a, row, vars, ctx)?, eval(b, row, vars, ctx)?);
     fv_cmp(&x, &y).map(|o| Fv::Bool(pred(o))).ok_or(())
 }
 
@@ -2831,11 +2549,11 @@ fn num_op(
     b: &Expression,
     row: &[u32],
     vars: &[String],
-    store: &TripleStore,
+    ctx: &Ctx,
     op: impl Fn(f64, f64) -> f64,
 ) -> Result<Fv, ()> {
-    let x = as_num(&eval(a, row, vars, store)?).ok_or(())?;
-    let y = as_num(&eval(b, row, vars, store)?).ok_or(())?;
+    let x = as_num(&eval(a, row, vars, ctx)?).ok_or(())?;
+    let y = as_num(&eval(b, row, vars, ctx)?).ok_or(())?;
     Ok(Fv::Num(op(x, y)))
 }
 
@@ -2844,9 +2562,9 @@ fn eval_func(
     args: &[Expression],
     row: &[u32],
     vars: &[String],
-    store: &TripleStore,
+    ctx: &Ctx,
 ) -> Result<Fv, ()> {
-    let arg = |i: usize| eval(&args[i], row, vars, store);
+    let arg = |i: usize| eval(&args[i], row, vars, ctx);
     match func {
         Function::Str => Ok(Fv::Str(match arg(0)? {
             Fv::Iri(s) | Fv::Blank(s) | Fv::Str(s) | Fv::Lang(s, _) | Fv::Typed(s, _) => s,
@@ -2933,8 +2651,8 @@ fn format_num(n: f64) -> String {
 }
 
 /// Effective boolean value of an expression.
-fn ebv(expr: &Expression, row: &[u32], vars: &[String], store: &TripleStore) -> Result<bool, ()> {
-    match eval(expr, row, vars, store)? {
+fn ebv(expr: &Expression, row: &[u32], vars: &[String], ctx: &Ctx) -> Result<bool, ()> {
+    match eval(expr, row, vars, ctx)? {
         Fv::Bool(b) => Ok(b),
         Fv::Num(n) => Ok(n != 0.0 && !n.is_nan()),
         Fv::Str(s) => Ok(!s.is_empty()),
@@ -2995,8 +2713,8 @@ fn unsupported_in_expr(expr: &Expression) -> Option<String> {
 }
 
 /// Keeps a row if **all** FILTER expressions evaluate to EBV true.
-fn row_passes(filters: &[&Expression], row: &[u32], vars: &[String], store: &TripleStore) -> bool {
-    filters.iter().all(|f| ebv(f, row, vars, store) == Ok(true))
+fn row_passes(filters: &[&Expression], row: &[u32], vars: &[String], ctx: &Ctx) -> bool {
+    filters.iter().all(|f| ebv(f, row, vars, ctx) == Ok(true))
 }
 
 /// Rejects a `FILTER`/`BIND` expression [`eval`] cannot evaluate, before any row
@@ -3096,12 +2814,12 @@ fn translate_term_pattern(
 // SPARQL-JSON Output
 // ---------------------------------------------------------------------------
 
-fn term_to_json(id: u32, dict: &Dictionary) -> Value {
+fn term_to_json(id: u32, ctx: &Ctx) -> Value {
     if id == NULL_ID {
         return Value::Null;
     }
-    let value = dict.resolve(id);
-    let typ = dict.resolve_type(id);
+    let value = ctx.resolve(id);
+    let typ = ctx.resolve_type(id);
     match (value, typ) {
         (Some(v), Some(TermType::Iri)) => json!({ "type": "uri", "value": v }),
         (Some(v), Some(TermType::BlankNode)) => json!({ "type": "bnode", "value": v }),
@@ -3155,14 +2873,6 @@ mod tests {
         let engine = HybridEngine::new();
         let result: Value =
             serde_json::from_str(&execute_sparql(store, &engine, query).unwrap()).unwrap();
-        result["results"]["bindings"].as_array().unwrap().clone()
-    }
-
-    /// [`rows_of`] on the write-locked path, for what needs to intern a term.
-    fn rows_of_mut(store: &mut TripleStore, query: &str) -> Vec<Value> {
-        let engine = HybridEngine::new();
-        let result: Value =
-            serde_json::from_str(&execute_sparql_bind(store, &engine, query).unwrap()).unwrap();
         result["results"]["bindings"].as_array().unwrap().clone()
     }
 
@@ -3753,7 +3463,8 @@ mod tests {
         let store = test_store();
         let engine = HybridEngine::new();
         let query = "SELECT ?a ?b WHERE { ?a <http://example.org/knows> ?b }";
-        let select = evaluate_select(&store, &engine, query).unwrap();
+        let ctx = Ctx::new(&store);
+        let select = evaluate_select(&ctx, &engine, query).unwrap();
         assert_eq!(select.rows.n_rows(), 3);
         assert_eq!(select.vars, vec!["a", "b"]);
     }
@@ -4257,24 +3968,6 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[test]
-    fn contains_extend_detects_bind() {
-        let with_bind = SparqlParser::new()
-            .parse_query("SELECT ?y WHERE { ?a <http://example.org/p> ?x BIND(?x + 1 AS ?y) }")
-            .unwrap();
-        let without_bind = SparqlParser::new()
-            .parse_query("SELECT ?x WHERE { ?a <http://example.org/p> ?x }")
-            .unwrap();
-        let SparqlQuery::Select { pattern, .. } = with_bind else {
-            unreachable!()
-        };
-        assert!(contains_extend(&pattern));
-        let SparqlQuery::Select { pattern, .. } = without_bind else {
-            unreachable!()
-        };
-        assert!(!contains_extend(&pattern));
-    }
-
-    #[test]
     fn bind_computes_new_arithmetic_value() {
         let mut store = TripleStore::new();
         let dt = "http://www.w3.org/2001/XMLSchema#integer";
@@ -4288,8 +3981,7 @@ mod tests {
         let query = "SELECT ?p ?doubled WHERE { \
                      ?p <http://example.org/age> ?a BIND(?a * 2 AS ?doubled) }";
         let result: Value =
-            serde_json::from_str(&execute_sparql_bind(&mut store, &engine, query).unwrap())
-                .unwrap();
+            serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
         let rows = result["results"]["bindings"].as_array().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["doubled"]["value"], "50");
@@ -4304,13 +3996,12 @@ mod tests {
     /// the row — unlike FILTER, which would drop it.
     #[test]
     fn bind_leaves_variable_unbound_on_error() {
-        let mut store = test_store(); // 3 knows-triples
+        let store = test_store(); // 3 knows-triples
         let engine = HybridEngine::new();
         let query = "SELECT ?a ?y WHERE { \
                      ?a <http://example.org/knows> ?b BIND(?missing + 1 AS ?y) }";
         let result: Value =
-            serde_json::from_str(&execute_sparql_bind(&mut store, &engine, query).unwrap())
-                .unwrap();
+            serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
         let rows = result["results"]["bindings"].as_array().unwrap();
         assert_eq!(rows.len(), 3, "rows are kept, not dropped");
         for row in rows {
@@ -4342,8 +4033,7 @@ mod tests {
         let query = "SELECT ?p WHERE { \
                      ?p <http://example.org/age> ?a BIND(?a * 2 AS ?y) FILTER(?y > 40) }";
         let result: Value =
-            serde_json::from_str(&execute_sparql_bind(&mut store, &engine, query).unwrap())
-                .unwrap();
+            serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
         let rows = result["results"]["bindings"].as_array().unwrap();
         assert_eq!(rows.len(), 1, "only alice: 30*2=60 > 40");
         assert_eq!(rows[0]["p"]["value"], "http://example.org/alice");
@@ -4375,8 +4065,7 @@ mod tests {
                      ?p <http://example.org/age> ?a BIND(?a + 0 AS ?y) . \
                      ?ref <http://example.org/hasBaseline> ?y }";
         let result: Value =
-            serde_json::from_str(&execute_sparql_bind(&mut store, &engine, query).unwrap())
-                .unwrap();
+            serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
         let rows = result["results"]["bindings"].as_array().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["ref"]["value"], "http://example.org/baseline");
@@ -4571,15 +4260,14 @@ mod tests {
     /// join the aggregate back against the graph — impossible without it.
     #[test]
     fn subselect_aggregate_joins_back_against_the_graph() {
-        let mut store = subselect_store();
+        let store = subselect_store();
         let engine = HybridEngine::new();
         let query = "SELECT ?s ?c ?age WHERE { \
                      { SELECT ?s (COUNT(*) AS ?c) WHERE { ?s <http://example.org/knows> ?o } \
                        GROUP BY ?s } \
                      ?s <http://example.org/age> ?age }";
         let result: Value =
-            serde_json::from_str(&execute_sparql_bind(&mut store, &engine, query).unwrap())
-                .unwrap();
+            serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
         let rows = result["results"]["bindings"].as_array().unwrap();
         assert_eq!(rows.len(), 1, "only bob has an age");
         assert_eq!(rows[0]["s"]["value"], "http://example.org/bob");
@@ -4590,37 +4278,17 @@ mod tests {
     /// HAVING-style filtering on an aggregate from the enclosing query.
     #[test]
     fn subselect_aggregate_filtered_from_outside() {
-        let mut store = subselect_store();
+        let store = subselect_store();
         let engine = HybridEngine::new();
         let query = "SELECT ?s WHERE { \
                      { SELECT ?s (COUNT(*) AS ?c) WHERE { ?s <http://example.org/knows> ?o } \
                        GROUP BY ?s } \
                      FILTER(?c > 1) }";
         let result: Value =
-            serde_json::from_str(&execute_sparql_bind(&mut store, &engine, query).unwrap())
-                .unwrap();
+            serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
         let rows = result["results"]["bindings"].as_array().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["s"]["value"], "http://example.org/bob");
-    }
-
-    /// A sub-SELECT containing BIND/GROUP BY must route the whole query to the
-    /// write-locked path, since the computed values still need interning.
-    #[test]
-    fn query_needs_write_sees_through_subselect() {
-        let store = test_store();
-        assert!(query_needs_write(
-            "SELECT ?y WHERE { { SELECT ?y WHERE { ?s ?p ?a BIND(?a + 1 AS ?y) } } }",
-            &store
-        ));
-        assert!(query_needs_write(
-            "SELECT ?c WHERE { { SELECT (COUNT(*) AS ?c) WHERE { ?s ?p ?o } } }",
-            &store
-        ));
-        assert!(!query_needs_write(
-            "SELECT ?s WHERE { { SELECT ?s WHERE { ?s ?p ?o } LIMIT 1 } }",
-            &store
-        ));
     }
 
     /// An outer `SELECT *` resolves against the sub-`SELECT`'s projection, not
@@ -4817,15 +4485,6 @@ mod tests {
         );
     }
 
-    /// MINUS binds nothing new, so it stays on the read-locked path.
-    #[test]
-    fn minus_does_not_need_the_write_path() {
-        assert!(!query_needs_write(
-            "SELECT ?s WHERE { ?s ?p ?o MINUS { ?s <http://example.org/age> ?a } }",
-            &test_store()
-        ));
-    }
-
     // -----------------------------------------------------------------------
     // VALUES
     // -----------------------------------------------------------------------
@@ -4911,19 +4570,17 @@ mod tests {
         assert_eq!(rows[0]["s"]["value"], "http://example.org/dave");
     }
 
-    /// A term the store has never seen has no ID, so the read path says so
-    /// rather than dropping the row. The write path answers it.
+    /// A term the graph lacks takes an overlay ID rather than erroring, and
+    /// since no triple carries that ID it simply joins to nothing.
     #[test]
-    fn values_rejects_a_term_the_store_does_not_know_on_the_read_path() {
-        let mut store = test_store();
-        let engine = HybridEngine::new();
-        let query = "SELECT ?o WHERE { \
+    fn values_joins_an_unknown_term_to_nothing() {
+        let store = test_store();
+        let rows = rows_of(
+            &store,
+            "SELECT ?o WHERE { \
              VALUES ?s { <http://example.org/alice> <http://example.org/nobody> } \
-             ?s <http://example.org/knows> ?o }";
-        let err = execute_sparql(&store, &engine, query).unwrap_err();
-        assert!(err.contains("nobody"), "unexpected error: {err}");
-
-        let rows = rows_of_mut(&mut store, query);
+             ?s <http://example.org/knows> ?o }",
+        );
         assert_eq!(values_of(&rows, "o"), vec!["http://example.org/bob"]);
     }
 
@@ -4931,7 +4588,7 @@ mod tests {
     /// are the ones it answered wrongly.
     #[test]
     fn an_unknown_values_term_is_kept_where_a_join_would_not_have_dropped_it() {
-        let mut store = test_store();
+        let store = test_store();
         let unknown = "<http://example.org/nobody>";
         for query in [
             format!(
@@ -4942,7 +4599,7 @@ mod tests {
             ),
             format!("SELECT ?s WHERE {{ VALUES ?s {{ {unknown} }} FILTER(isIRI(?s)) }}"),
         ] {
-            let rows = rows_of_mut(&mut store, &query);
+            let rows = rows_of(&store, &query);
             assert!(
                 values_of(&rows, "s").contains(&"http://example.org/nobody"),
                 "lost the unknown term in: {query}"
@@ -4951,40 +4608,16 @@ mod tests {
     }
 
     /// A standalone `VALUES` is the table itself, so an unknown term has to come
-    /// back verbatim — which needs an ID, hence the write-locked path.
+    /// back verbatim — which needs an ID, hence the overlay.
     #[test]
-    fn standalone_values_returns_unknown_terms_via_the_write_path() {
-        let mut store = test_store();
+    fn standalone_values_returns_unknown_terms_via_the_overlay() {
+        let store = test_store();
         let engine = HybridEngine::new();
         let query = "SELECT ?s WHERE { VALUES ?s { <http://example.org/nobody> } }";
         let result: Value =
-            serde_json::from_str(&execute_sparql_bind(&mut store, &engine, query).unwrap())
-                .unwrap();
+            serde_json::from_str(&execute_sparql(&store, &engine, query).unwrap()).unwrap();
         let rows = result["results"]["bindings"].as_array().unwrap();
         assert_eq!(values_of(rows, "s"), vec!["http://example.org/nobody"]);
-    }
-
-    /// ... which is why an unknown term routes `VALUES` to the write path; a
-    /// table of known terms stays on the read lock.
-    #[test]
-    fn query_needs_write_only_for_an_unknown_values_term() {
-        let store = test_store();
-        assert!(query_needs_write(
-            "SELECT ?s WHERE { VALUES ?s { <http://example.org/nobody> } }",
-            &store
-        ));
-        assert!(query_needs_write(
-            "SELECT ?s WHERE { ?s ?p ?o } VALUES ?s { <http://example.org/nobody> }",
-            &store
-        ));
-        assert!(!query_needs_write(
-            "SELECT ?s WHERE { VALUES ?s { <http://example.org/alice> } }",
-            &store
-        ));
-        assert!(!query_needs_write(
-            "SELECT ?s WHERE { ?s ?p ?o } VALUES ?s { <http://example.org/alice> }",
-            &store
-        ));
     }
 
     /// An UNDEF column is a wildcard: it joins with any value, while the bound
@@ -5156,10 +4789,10 @@ mod tests {
     /// Same for `BIND`, which shares the evaluator.
     #[test]
     fn bind_with_an_unsupported_function_is_refused() {
-        let mut store = test_store();
+        let store = test_store();
         let engine = HybridEngine::new();
-        let err = execute_sparql_bind(
-            &mut store,
+        let err = execute_sparql(
+            &store,
             &engine,
             "SELECT ?x WHERE { ?s <http://example.org/knows> ?o BIND(ABS(-3) AS ?x) }",
         )
@@ -5180,96 +4813,96 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // WAL alignment
+    // Query-local terms
     // -----------------------------------------------------------------------
 
-    /// An intern the log never saw shifts every later ID, so the replay rebuilds
-    /// the wrong triples. Queries intern too, so they have to log as well.
-    ///
-    /// Routed through [`AppState::needs_write`]/[`AppState::write_locked`], the
-    /// wiring the handlers use and where the bug sat — repeating their body here
-    /// would test a copy of it instead.
-    #[test]
-    fn a_term_interned_by_a_query_is_logged_so_the_replay_stays_aligned() {
+    /// The point of the overlay: a read answers with terms the graph does not
+    /// hold and still leaves the dictionary and the log exactly as it found
+    /// them. Routed through [`sparql_handler`], the wiring the endpoint uses.
+    #[tokio::test]
+    async fn a_query_writes_neither_the_dictionary_nor_the_wal() {
         let path = std::env::temp_dir().join(format!(
-            "trillian_wal_align_{}_{:p}.wal",
+            "trillian_overlay_{}_{:p}.wal",
             std::process::id(),
             &0u8
         ));
         let _ = std::fs::remove_file(&path);
-        let state = AppState::with_wal(
+        let state = Arc::new(AppState::with_wal(
             test_store(),
             Some(Wal::open_append(path.to_str().unwrap()).unwrap()),
-        );
-        let dict_len = || state.store.read().unwrap().dict.len();
+        ));
+        let terms = || state.store.read().unwrap().dict.len();
+        let wal_bytes = || std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let (before_terms, before_wal) = (terms(), wal_bytes());
 
-        // A query that mints an ID, taking the same route the handlers take.
-        let query = "SELECT ?s WHERE { VALUES ?s { <http://example.org/ghost> } }";
-        assert!(
-            state.needs_write(query),
-            "the query should take the write lock"
-        );
-        let first_new_id = dict_len();
-        state
-            .write_locked(|store| execute_sparql_bind(store, &state.engine, query))
-            .unwrap();
-        assert!(dict_len() > first_new_id, "the query interned nothing");
-
-        // Then a logged update, whose IDs follow the ones the query took.
-        {
-            let mut store = state.store.write().unwrap();
-            let mut wal = state.wal.as_ref().unwrap().lock().unwrap();
-            execute_update(
-                &mut store,
-                "INSERT DATA { <http://example.org/x> <http://example.org/p> <http://example.org/y> }",
-                Some(&mut wal),
-            )
-            .unwrap();
-            wal.sync().unwrap();
+        // One query per shape that used to mint a durable ID.
+        for query in [
+            "SELECT ?s WHERE { VALUES ?s { <http://example.org/ghost> } }",
+            "SELECT ?x WHERE { ?s <http://example.org/age> ?a BIND(?a + 1 AS ?x) }",
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s <http://example.org/knows> ?o }",
+            "SELECT ?s (GROUP_CONCAT(?o) AS ?all) WHERE { ?s <http://example.org/knows> ?o } \
+             GROUP BY ?s",
+        ] {
+            let params = SparqlQueryParams {
+                query: Some(query.to_string()),
+                infer: None,
+            };
+            let resp =
+                sparql_handler(State(Arc::clone(&state)), Query(params), String::new()).await;
+            assert_eq!(resp.status(), StatusCode::OK, "query failed: {query}");
         }
 
-        let mut restored = test_store();
-        Wal::replay(path.to_str().unwrap(), &mut restored).unwrap();
-        let rows = rows_of(
-            &restored,
-            "SELECT ?o WHERE { <http://example.org/x> <http://example.org/p> ?o }",
-        );
-        assert_eq!(values_of(&rows, "o"), vec!["http://example.org/y"]);
+        assert_eq!(terms(), before_terms, "a query grew the dictionary");
+        assert_eq!(wal_bytes(), before_wal, "a query wrote to the WAL");
         let _ = std::fs::remove_file(&path);
     }
 
-    /// A query's interned terms have to reach disk, not sit in the writer's
-    /// buffer: an unsynced tail is what tears the log when the process dies,
-    /// and a torn record costs every update appended after it.
+    /// A computed value the graph already holds must come back as the stored
+    /// term, or it would stop joining and comparing against stored data.
     #[test]
-    fn a_term_interned_by_a_query_is_synced_not_left_buffered() {
-        let path = std::env::temp_dir().join(format!(
-            "trillian_wal_sync_{}_{:p}.wal",
-            std::process::id(),
-            &0u8
-        ));
-        let _ = std::fs::remove_file(&path);
-        let state = AppState::with_wal(
-            test_store(),
-            Some(Wal::open_append(path.to_str().unwrap()).unwrap()),
+    fn a_computed_term_reuses_the_dictionary_id() {
+        let store = test_store();
+        let ctx = Ctx::new(&store);
+        let stored = store
+            .dict
+            .lookup_iri("http://example.org/bob")
+            .expect("bob is in the fixture");
+        assert_eq!(
+            ctx.intern("http://example.org/bob", TermType::iri()),
+            stored
         );
-
-        let query = "SELECT ?s WHERE { VALUES ?s { <http://example.org/ghost> } }";
-        state
-            .write_locked(|store| execute_sparql_bind(store, &state.engine, query))
-            .unwrap();
-
-        // Nothing here synced, so the term is on disk only if the query path did.
-        let mut restored = test_store();
-        Wal::replay(path.to_str().unwrap(), &mut restored).unwrap();
-        assert!(
-            restored
-                .dict
-                .lookup_iri("http://example.org/ghost")
-                .is_some(),
-            "the query's term never reached disk"
+        // And a term it does not hold gets a fresh ID above the dictionary,
+        // the same one every time it is asked for.
+        let ghost = ctx.intern("http://example.org/ghost", TermType::iri());
+        assert!(ghost >= ctx.base);
+        assert_eq!(
+            ctx.intern("http://example.org/ghost", TermType::iri()),
+            ghost
         );
-        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `BIND`, `GROUP BY`, an aggregate sub-`SELECT` and an unknown `VALUES`
+    /// term all needed the write lock, which inference never takes; on the
+    /// overlay they answer under `?infer=rdfs` like any other query.
+    #[test]
+    fn computed_terms_work_under_inference() {
+        let store = test_store();
+        let engine = HybridEngine::new();
+        for query in [
+            "SELECT ?x WHERE { ?s <http://example.org/age> ?a BIND(?a + 1 AS ?x) }",
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s <http://example.org/knows> ?o }",
+            "SELECT ?n WHERE { { SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o } } }",
+            "SELECT ?s WHERE { VALUES ?s { <http://example.org/ghost> } }",
+        ] {
+            let body = execute_sparql_infer(&store, &engine, query)
+                .unwrap_or_else(|e| panic!("{query}: {e}"));
+            let json: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                json["results"]["bindings"].as_array().unwrap().len(),
+                1,
+                "unexpected rows for {query}"
+            );
+        }
     }
 
     /// The two combined: restrict with `VALUES`, then subtract with `MINUS`.
