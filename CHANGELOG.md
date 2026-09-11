@@ -51,6 +51,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   wherever it took `.nt`.
 
 ### Changed
+- **RDFS inference follows the whole schema** (`src/inference.rs`). Each rule's
+  schema lookup is one property path (`rdfs:subClassOf+`,
+  `rdfs:subPropertyOf+`, `rdfs:subPropertyOf*/rdfs:domain|rdfs:range/rdfs:subClassOf*`),
+  so the transitive rules need no fixpoint iteration and the four rules compose
+  in three branches per `rdf:type` pattern. Measured on a 1.2M-triple synthetic
+  graph with a three-level class tree: one subclass hop 10 ms/20k rows, two
+  hops 45 ms/200k rows, 1M rows through `rdfs:subPropertyOf` 68 ms.
+- **A `Join` with an empty left side no longer evaluates the right one**
+  (`src/sparql.rs`). `static_variables` reads a BGP's or path's column names
+  without evaluating it, which is what keeps an inference branch whose schema
+  path finds nothing from reading the data. A right side that would have
+  exceeded `TRILLIAN_MAX_ROWS` now returns an empty result instead of an error.
+- **`variables_in_bgp` counts blank nodes** (`src/sparql.rs`), under the same
+  `__bn_` name `translate_term_pattern` gives them.
 - **`hash_join` splits its unfiltered and filtered paths** (`src/sparql.rs`).
   Applying an `OPTIONAL` filter needs the merged left++right row, and building
   it in the shared loop would have cost every plain `Join` and every
@@ -74,6 +88,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   forms test the same datatype IRI.
 
 ### Fixed
+- **`rdfs:range` inference read the wrong triple position**
+  (`src/inference.rs`). rdfs3 types the *object* of a data triple, but the
+  rewrite looked for `?s ?p ?c` with `?c` the queried class, so it never
+  entailed anything.
+- **Inference no longer returns one row per derivation.** Every rewritten BGP
+  is wrapped in `Project`/`Distinct` over the columns the pattern itself binds,
+  which also keeps the rewrite's helper variables inside the node.
 - **The response cache no longer mixes up inferred and plain results.**
   `sparql_handler` (`src/sparql.rs`) keyed the cache on the query string alone,
   but `infer` arrives as a separate parameter and never appears in it, so
