@@ -1510,6 +1510,7 @@ fn static_variables(gp: &spargebra::algebra::GraphPattern) -> Option<Vec<String>
 /// An inner join with an empty side is empty, and needs only the other side's
 /// column names. Skipping that side is what keeps an inference branch whose
 /// schema path finds nothing from reading the data (see [`crate::inference`]).
+/// A skipped side is never checked against `TRILLIAN_MAX_ROWS`.
 fn skip_empty_join(
     left: &RowBlock,
     lvo: &[String],

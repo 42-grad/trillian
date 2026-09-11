@@ -61,7 +61,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **A `Join` with an empty left side no longer evaluates the right one**
   (`src/sparql.rs`). `static_variables` reads a BGP's or path's column names
   without evaluating it, which is what keeps an inference branch whose schema
-  path finds nothing from reading the data.
+  path finds nothing from reading the data. A right side that would have
+  exceeded `TRILLIAN_MAX_ROWS` now returns an empty result instead of an error.
 - **`variables_in_bgp` counts blank nodes** (`src/sparql.rs`), under the same
   `__bn_` name `translate_term_pattern` gives them.
 - **`hash_join` splits its unfiltered and filtered paths** (`src/sparql.rs`).

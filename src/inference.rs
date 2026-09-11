@@ -30,8 +30,10 @@
 //! pattern itself binds: the branches' helper variables never leave the node,
 //! and one entailed triple yields one row.
 //!
-//! Two gaps remain: a property path in the query is not rewritten, and a
-//! predicate that is a sub-property of `rdf:type` does not fire the type rules.
+//! Three gaps remain: a property path in the query is not rewritten, a
+//! predicate that is a sub-property of `rdf:type` does not fire the type rules,
+//! and each branch rewrites one pattern, so a solution that needs inference at
+//! two patterns of the same BGP is missed.
 
 use spargebra::algebra::{GraphPattern as GP, PropertyPathExpression as Ppe};
 use spargebra::term::{NamedNode, NamedNodePattern, TermPattern, TriplePattern, Variable};

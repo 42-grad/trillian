@@ -113,8 +113,9 @@ reachable through RDFS rules:
 
 Both hierarchies are followed transitively, and one entailed triple is one row
 however many rules derive it. Not covered: a property path in the query is not
-rewritten, and a predicate that is a sub-property of `rdf:type` does not fire
-the type rules.
+rewritten, a predicate that is a sub-property of `rdf:type` does not fire the
+type rules, and a solution that needs inference at two patterns of the same
+group is missed.
 
 ```bash
 curl -G 'http://localhost:9090/sparql' \
