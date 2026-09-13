@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use serde_json::Value;
 use trillian::hypertrie::{HybridEngine, TripleStore};
-use trillian::sparql::{execute_sparql, execute_sparql_bind};
+use trillian::sparql::execute_sparql;
 
 const EX: &str = "http://example.org/";
 const XSD_INT: &str = "http://www.w3.org/2001/XMLSchema#integer";
@@ -380,10 +380,10 @@ fn load_snapshot_corrupt_file_errors() {
 
 #[test]
 fn group_by_count_star() {
-    let mut store = social_store();
+    let store = social_store();
     let engine = HybridEngine::new();
     let q = format!("SELECT ?s (COUNT(*) AS ?cnt) WHERE {{ ?s <{EX}knows> ?o }} GROUP BY ?s");
-    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
     // alice, bob, charlie each have exactly one outgoing knows edge.
     assert_eq!(rows.len(), 3);
     for row in &rows {
@@ -395,23 +395,23 @@ fn group_by_count_star() {
 
 #[test]
 fn group_by_count_with_having() {
-    let mut store = social_store();
+    let store = social_store();
     let engine = HybridEngine::new();
     let q = format!(
         "SELECT ?s (COUNT(*) AS ?cnt) WHERE {{ ?s <{EX}knows> ?o }} GROUP BY ?s HAVING (COUNT(*) > 0)"
     );
-    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
     assert_eq!(rows.len(), 3);
 }
 
 #[test]
 fn group_by_count_order_by_aggregate() {
-    let mut store = social_store();
+    let store = social_store();
     let engine = HybridEngine::new();
     let q = format!(
         "SELECT ?s (COUNT(*) AS ?cnt) WHERE {{ ?s <{EX}knows> ?o }} GROUP BY ?s ORDER BY DESC(?cnt)"
     );
-    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
     assert_eq!(rows.len(), 3);
     // All counts are 1; the main assertion is that ordering by the aggregate
     // variable does not panic and returns a stable result.
@@ -422,10 +422,10 @@ fn group_by_count_order_by_aggregate() {
 
 #[test]
 fn group_by_count_empty_group_returns_zero() {
-    let mut store = TripleStore::new();
+    let store = TripleStore::new();
     let engine = HybridEngine::new();
     let q = format!("SELECT (COUNT(*) AS ?cnt) WHERE {{ ?s <{EX}knows> ?o }}");
-    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
     // SPARQL 1.1: without GROUP BY there is always one (empty) group, so an
     // aggregate-only query over no solutions yields one row with COUNT = 0.
     assert_eq!(rows.len(), 1);
@@ -435,7 +435,7 @@ fn group_by_count_empty_group_returns_zero() {
 
 #[test]
 fn count_distinct_star_dedupes_within_group() {
-    let mut store = social_store();
+    let store = social_store();
     let engine = HybridEngine::new();
     // Overlapping UNION branches produce duplicate full solutions within a
     // group; COUNT(*) must see both, COUNT(DISTINCT *) only one.
@@ -443,7 +443,7 @@ fn count_distinct_star_dedupes_within_group() {
         "SELECT ?s (COUNT(*) AS ?c_all) (COUNT(DISTINCT *) AS ?c_dist) WHERE {{ \
          {{ ?s <{EX}knows> ?o }} UNION {{ ?s <{EX}knows> ?o }} }} GROUP BY ?s"
     );
-    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
     assert_eq!(rows.len(), 3);
     for row in &rows {
         assert_eq!(row["c_all"]["value"], "2");
@@ -456,10 +456,10 @@ fn count_distinct_star_dedupes_within_group() {
 /// Runs `SELECT (AGG(?score) AS ?out)` with no GROUP BY; one implicit group
 /// over every solution and asserts the single result row.
 fn assert_global_agg(agg: &str, expected: &str) {
-    let mut store = score_store();
+    let store = score_store();
     let engine = HybridEngine::new();
     let q = format!("SELECT ({agg}(?score) AS ?out) WHERE {{ ?s <{EX}score> ?score }}");
-    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
     assert_eq!(rows.len(), 1, "no GROUP BY yields exactly one group");
     // Must be the stored term, not a value re-interned as xsd:double.
     assert_eq!(rows[0]["out"]["datatype"], XSD_INT);
@@ -475,10 +475,10 @@ fn assert_global_agg(agg: &str, expected: &str) {
 /// its choice unspecified. Group order is unspecified too (groups come out of a
 /// hash map), so rows are looked up by subject rather than by position.
 fn assert_grouped_agg(agg: &str, expected: &[(&str, &[&str])]) {
-    let mut store = score_store();
+    let store = score_store();
     let engine = HybridEngine::new();
     let q = format!("SELECT ?s ({agg}(?v) AS ?out) WHERE {{ ?s <{EX}score> ?v }} GROUP BY ?s");
-    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
     assert_eq!(rows.len(), expected.len(), "one row per grouped subject");
 
     let got: std::collections::HashMap<&str, &str> = rows
@@ -534,13 +534,13 @@ fn select_sample_within_group() {
 /// group aggregates over anything; bob's and charlie's groups have a row but
 /// nothing bound in it.
 fn assert_unbound_group_agg(agg: &str) {
-    let mut store = social_store();
+    let store = social_store();
     let engine = HybridEngine::new();
     let q = format!(
         "SELECT ?a ({agg}(?age) AS ?out) WHERE {{ ?a <{EX}knows> ?b \
          OPTIONAL {{ ?b <{EX}age> ?age }} }} GROUP BY ?a"
     );
-    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
     assert_eq!(rows.len(), 3, "one row per grouped subject, bound or not");
     for row in &rows {
         let a = row["a"]["value"].as_str().unwrap();
@@ -562,10 +562,10 @@ fn assert_unbound_group_agg(agg: &str) {
 /// With no solutions and no GROUP BY there is still one implicit group, and
 /// these aggregates are unbound over it - unlike COUNT, which yields 0.
 fn assert_empty_group_agg(agg: &str) {
-    let mut store = social_store();
+    let store = social_store();
     let engine = HybridEngine::new();
     let q = format!("SELECT ({agg}(?v) AS ?out) WHERE {{ ?s <{EX}missing> ?v }}");
-    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
     assert_eq!(
         rows.len(),
         1,
@@ -598,7 +598,7 @@ fn aggregate_over_empty_group_is_unbound() {
 fn assert_mixed_group_agg(agg: &str, expected: &[&str]) {
     // alice knows two people, but only bob has an age - so alice's group has
     // one bound row and one unbound row.
-    let mut store = store_from_nt(&format!(
+    let store = store_from_nt(&format!(
         "<{EX}alice> <{EX}knows> <{EX}bob> .\n\
          <{EX}alice> <{EX}knows> <{EX}dave> .\n\
          <{EX}bob> <{EX}age> \"25\"^^<{XSD_INT}> .\n"
@@ -608,7 +608,7 @@ fn assert_mixed_group_agg(agg: &str, expected: &[&str]) {
         "SELECT ?a ({agg}(?age) AS ?out) WHERE {{ ?a <{EX}knows> ?b \
          OPTIONAL {{ ?b <{EX}age> ?age }} }} GROUP BY ?a"
     );
-    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
     assert_eq!(rows.len(), 1, "one group: alice");
     let v = rows[0]["out"]["value"].as_str().unwrap_or_else(|| {
         panic!(
@@ -637,7 +637,7 @@ fn aggregate_over_mixed_group_ignores_unbound_rows() {
 fn count_var_ignores_unbound_rows() {
     // alice knows two people but only bob has an age, so the OPTIONAL leaves
     // one row unbound.
-    let mut store = store_from_nt(&format!(
+    let store = store_from_nt(&format!(
         "<{EX}alice> <{EX}knows> <{EX}bob> .\n\
          <{EX}alice> <{EX}knows> <{EX}dave> .\n\
          <{EX}bob> <{EX}age> \"25\"^^<{XSD_INT}> .\n"
@@ -647,7 +647,7 @@ fn count_var_ignores_unbound_rows() {
         "SELECT (COUNT(*) AS ?rows) (COUNT(?age) AS ?ages) WHERE {{ \
          <{EX}alice> <{EX}knows> ?b OPTIONAL {{ ?b <{EX}age> ?age }} }}"
     );
-    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
     assert_eq!(rows.len(), 1);
     assert_eq!(
         rows[0]["rows"]["value"], "2",
@@ -662,14 +662,14 @@ fn count_var_ignores_unbound_rows() {
 
 #[test]
 fn count_distinct_var_dedupes_within_group() {
-    let mut store = social_store();
+    let store = social_store();
     let engine = HybridEngine::new();
     // Overlapping UNION branches bind ?o to the same term twice per group.
     let q = format!(
         "SELECT ?s (COUNT(?o) AS ?c_all) (COUNT(DISTINCT ?o) AS ?c_dist) WHERE {{ \
          {{ ?s <{EX}knows> ?o }} UNION {{ ?s <{EX}knows> ?o }} }} GROUP BY ?s"
     );
-    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
     assert_eq!(rows.len(), 3);
     for row in &rows {
         assert_eq!(row["c_all"]["value"], "2", "both bindings counted");
@@ -682,11 +682,11 @@ fn count_distinct_var_dedupes_within_group() {
 
 #[test]
 fn count_var_over_empty_group_is_zero() {
-    let mut store = social_store();
+    let store = social_store();
     let engine = HybridEngine::new();
     // Unlike MIN/MAX/SAMPLE, COUNT is *bound* over an empty group.
     let q = format!("SELECT (COUNT(?v) AS ?c) WHERE {{ ?s <{EX}missing> ?v }}");
-    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
     assert_eq!(
         rows.len(),
         1,
@@ -714,11 +714,11 @@ fn assert_concat_parts(actual: &Value, sep: &str, expected: &[&str]) {
 
 #[test]
 fn group_concat_within_group() {
-    let mut store = score_store();
+    let store = score_store();
     let engine = HybridEngine::new();
     // No SEPARATOR given, so the default single space applies.
     let q = format!("SELECT ?s (GROUP_CONCAT(?v) AS ?g) WHERE {{ ?s <{EX}score> ?v }} GROUP BY ?s");
-    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
     assert_eq!(rows.len(), 2, "one row per grouped subject");
     for row in &rows {
         let parts: &[&str] = if row["s"]["value"] == format!("{EX}alice") {
@@ -732,13 +732,13 @@ fn group_concat_within_group() {
 
 #[test]
 fn group_concat_honours_separator() {
-    let mut store = score_store();
+    let store = score_store();
     let engine = HybridEngine::new();
     let q = format!(
         "SELECT ?s (GROUP_CONCAT(?v; SEPARATOR=\", \") AS ?g) \
          WHERE {{ ?s <{EX}score> ?v }} GROUP BY ?s"
     );
-    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
     assert_eq!(rows.len(), 2);
     for row in &rows {
         let parts: &[&str] = if row["s"]["value"] == format!("{EX}alice") {
@@ -754,7 +754,7 @@ fn group_concat_honours_separator() {
 
 #[test]
 fn group_concat_distinct_dedupes_within_group() {
-    let mut store = social_store();
+    let store = social_store();
     let engine = HybridEngine::new();
     // Overlapping UNION branches bind ?o to the same term twice per group.
     let q = format!(
@@ -762,7 +762,7 @@ fn group_concat_distinct_dedupes_within_group() {
          (GROUP_CONCAT(DISTINCT ?o; SEPARATOR=\",\") AS ?dist) WHERE {{ \
          {{ ?s <{EX}knows> ?o }} UNION {{ ?s <{EX}knows> ?o }} }} GROUP BY ?s"
     );
-    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
     assert_eq!(rows.len(), 3);
     for row in &rows {
         // Each subject knows exactly one person, so DISTINCT leaves one term and
@@ -775,11 +775,11 @@ fn group_concat_distinct_dedupes_within_group() {
 
 #[test]
 fn group_concat_over_empty_group_is_empty_string() {
-    let mut store = social_store();
+    let store = social_store();
     let engine = HybridEngine::new();
     // Unlike MIN/MAX/SAMPLE, GROUP_CONCAT is *bound* over an empty group.
     let q = format!("SELECT (GROUP_CONCAT(?v) AS ?g) WHERE {{ ?s <{EX}missing> ?v }}");
-    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
     assert_eq!(
         rows.len(),
         1,
@@ -812,13 +812,13 @@ fn assert_double(actual: &Value, expected: f64) {
 
 #[test]
 fn sum_and_avg_global() {
-    let mut store = score_store();
+    let store = score_store();
     let engine = HybridEngine::new();
     let q = format!(
         "SELECT (SUM(?score) AS ?total) (AVG(?score) AS ?mean) \
          WHERE {{ ?s <{EX}score> ?score }}"
     );
-    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
     assert_eq!(rows.len(), 1, "no GROUP BY yields exactly one group");
     assert_double(&rows[0]["total"], 39.0); // 7 + 10 + 9 + 8 + 5
     assert_double(&rows[0]["mean"], 7.8); // 39 / 5
@@ -826,13 +826,13 @@ fn sum_and_avg_global() {
 
 #[test]
 fn sum_and_avg_within_group() {
-    let mut store = score_store();
+    let store = score_store();
     let engine = HybridEngine::new();
     let q = format!(
         "SELECT ?s (SUM(?v) AS ?total) (AVG(?v) AS ?mean) \
          WHERE {{ ?s <{EX}score> ?v }} GROUP BY ?s"
     );
-    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
     assert_eq!(rows.len(), 2, "one row per grouped subject");
     for row in &rows {
         // Group order is unspecified, so dispatch on the subject.
@@ -848,14 +848,14 @@ fn sum_and_avg_within_group() {
 
 #[test]
 fn sum_distinct_dedupes_within_group() {
-    let mut store = score_store();
+    let store = score_store();
     let engine = HybridEngine::new();
     // Overlapping UNION branches bind ?v to each score twice per group.
     let q = format!(
         "SELECT ?s (SUM(?v) AS ?all) (SUM(DISTINCT ?v) AS ?dist) WHERE {{ \
          {{ ?s <{EX}score> ?v }} UNION {{ ?s <{EX}score> ?v }} }} GROUP BY ?s"
     );
-    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
     assert_eq!(rows.len(), 2);
     for row in &rows {
         let dist = if row["s"]["value"] == format!("{EX}alice") {
@@ -870,13 +870,13 @@ fn sum_distinct_dedupes_within_group() {
 
 #[test]
 fn sum_and_avg_over_empty_group_are_zero() {
-    let mut store = social_store();
+    let store = social_store();
     let engine = HybridEngine::new();
     // Unlike MIN/MAX/SAMPLE, these are *bound* over an empty group - and like
     // COUNT they yield an xsd:integer zero, not a double.
     for agg in ["SUM", "AVG"] {
         let q = format!("SELECT ({agg}(?v) AS ?out) WHERE {{ ?s <{EX}missing> ?v }}");
-        let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+        let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
         assert_eq!(
             rows.len(),
             1,
@@ -891,7 +891,7 @@ fn sum_and_avg_over_empty_group_are_zero() {
 fn sum_and_avg_ignore_unbound_rows() {
     // alice knows two people but only bob has an age, so the OPTIONAL leaves
     // one row of alice's group unbound; it must not drag the average down.
-    let mut store = store_from_nt(&format!(
+    let store = store_from_nt(&format!(
         "<{EX}alice> <{EX}knows> <{EX}bob> .\n\
          <{EX}alice> <{EX}knows> <{EX}dave> .\n\
          <{EX}bob> <{EX}age> \"25\"^^<{XSD_INT}> .\n"
@@ -901,7 +901,7 @@ fn sum_and_avg_ignore_unbound_rows() {
         "SELECT ?a (SUM(?age) AS ?total) (AVG(?age) AS ?mean) \
          WHERE {{ ?a <{EX}knows> ?b OPTIONAL {{ ?b <{EX}age> ?age }} }} GROUP BY ?a"
     );
-    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
     assert_eq!(rows.len(), 1, "one group: alice");
     assert_double(&rows[0]["total"], 25.0);
     assert_double(&rows[0]["mean"], 25.0);
@@ -909,11 +909,11 @@ fn sum_and_avg_ignore_unbound_rows() {
 
 #[test]
 fn sum_over_non_numeric_group_is_unbound() {
-    let mut store = store_from_nt(&format!("<{EX}alice> <{EX}name> \"Alice\" .\n"));
+    let store = store_from_nt(&format!("<{EX}alice> <{EX}name> \"Alice\" .\n"));
     let engine = HybridEngine::new();
     // A bound but non-numeric term is a type error for the whole aggregate.
     let q = format!("SELECT (SUM(?n) AS ?out) WHERE {{ ?s <{EX}name> ?n }}");
-    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
     assert_eq!(rows.len(), 1);
     assert!(
         rows[0]["out"].is_null(),
@@ -924,7 +924,7 @@ fn sum_over_non_numeric_group_is_unbound() {
 
 #[test]
 fn sum_accepts_a_computed_argument() {
-    let mut store = score_store();
+    let store = score_store();
     let engine = HybridEngine::new();
     // SUM/AVG intern a fresh value anyway, so unlike MIN/MAX/SAMPLE they do not
     // need a bare variable to preserve a stored term's datatype.
@@ -932,20 +932,20 @@ fn sum_accepts_a_computed_argument() {
         "SELECT (SUM(?v + 1) AS ?total) (AVG(?v * 2) AS ?mean) \
          WHERE {{ ?s <{EX}score> ?v }}"
     );
-    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
     assert_double(&rows[0]["total"], 44.0); // 39 + 5 rows
     assert_double(&rows[0]["mean"], 15.6); // 7.8 * 2
 }
 
 #[test]
 fn having_filters_on_sum() {
-    let mut store = score_store();
+    let store = score_store();
     let engine = HybridEngine::new();
     let q = format!(
         "SELECT ?s (SUM(?v) AS ?total) WHERE {{ ?s <{EX}score> ?v }} \
          GROUP BY ?s HAVING (SUM(?v) > 20)"
     );
-    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
     assert_eq!(rows.len(), 1, "only alice's scores sum above 20");
     assert_eq!(rows[0]["s"]["value"], format!("{EX}alice"));
     assert_double(&rows[0]["total"], 26.0);
@@ -998,32 +998,30 @@ fn values_restricts_the_solutions_to_the_inline_table() {
 }
 
 /// A `VALUES` term the graph does not contain still has to come back from a
-/// standalone table, which needs an ID for it — hence the write-locked path.
+/// standalone table, which needs an ID for it — hence the overlay.
 #[test]
 fn standalone_values_returns_a_term_the_graph_lacks() {
-    let mut store = social_store();
+    let store = social_store();
     let engine = HybridEngine::new();
     let q = format!("SELECT ?s WHERE {{ VALUES ?s {{ <{EX}nobody> }} }}");
-    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["s"]["value"], format!("{EX}nobody"));
 }
 
-/// The read-locked path has no ID for such a term and says so instead of
-/// dropping the row, which is wrong outside a plain join.
+/// Such a term takes an overlay ID, so the row survives the `OPTIONAL` with
+/// the right side unbound, which is what dropping it would have got wrong.
 #[test]
-fn values_naming_an_unknown_term_needs_the_write_path() {
-    let mut store = social_store();
+fn values_naming_an_unknown_term_keeps_the_row() {
+    let store = social_store();
     let engine = HybridEngine::new();
     let q = format!(
         "SELECT ?s ?o WHERE {{ VALUES ?s {{ <{EX}nobody> }} OPTIONAL {{ ?s <{EX}knows> ?o }} }}"
     );
-    let err = execute_sparql(&store, &engine, &q).unwrap_err();
-    assert!(err.contains("nobody"), "unexpected error: {err}");
-
-    let rows = bindings(&execute_sparql_bind(&mut store, &engine, &q).unwrap());
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["s"]["value"], format!("{EX}nobody"));
+    assert!(rows[0].get("o").is_none(), "?o must stay unbound");
 }
 
 /// An unbound column is not in the row's domain, so it contradicts nothing:
