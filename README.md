@@ -147,6 +147,7 @@ curl -G 'http://localhost:9090/sparql' \
 | `/stream` | GET/POST | NDJSON stream: header line + one binding per line |
 | `/count`  | GET/POST | Result count for a SELECT/ASK |
 | `/update` | POST    | `INSERT DATA` / `DELETE DATA` |
+| `/checkpoint` | POST | Fold the WAL into the snapshot and empty it |
 
 All query endpoints support an optional `infer=rdfs` query parameter that enables
 RDFS backward-chaining inference (subclass, subproperty, domain, range). Example:

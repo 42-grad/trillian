@@ -55,6 +55,18 @@ impl Wal {
         self.writer.get_ref().sync_data()
     }
 
+    /// Empties the log after its operations have been folded into a snapshot.
+    /// The file is opened for appending, so the next record lands at offset 0
+    /// again. A crash between the snapshot rename and this call is harmless:
+    /// replaying the old records onto the new snapshot is idempotent (inserts,
+    /// deletes and dictionary terms are all set operations).
+    pub fn truncate(&mut self) -> std::io::Result<()> {
+        self.writer.flush()?;
+        let file = self.writer.get_ref();
+        file.set_len(0)?;
+        file.sync_data()
+    }
+
     /// Replays the log onto a (freshly loaded) store, then drops an unreadable
     /// tail so that whatever is appended next is still reachable on the next
     /// replay. A torn last record (crash mid-write) is what produces one.
@@ -253,6 +265,27 @@ mod tests {
         assert_eq!(applied, 2); // one insert + one delete applied
         assert_eq!(store.triple_count(), 0);
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `truncate` empties the log, and appends after it start at offset 0
+    /// again (the checkpoint relies on both).
+    #[test]
+    fn truncate_empties_the_log_and_appends_again() {
+        let path = temp_path("truncate");
+        {
+            let mut wal = Wal::open_append(&path).unwrap();
+            wal.log_op(true, 0, 1, 2).unwrap();
+            wal.sync().unwrap();
+            wal.truncate().unwrap();
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+            wal.log_op(true, 3, 4, 5).unwrap();
+            wal.sync().unwrap();
+        }
+        let mut store = TripleStore::new();
+        let replay = Wal::replay(&path, &mut store).unwrap();
+        assert_eq!(replay.applied, 1);
+        assert_eq!(replay.discarded, 0);
         let _ = std::fs::remove_file(&path);
     }
 

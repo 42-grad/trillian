@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use trillian::hypertrie::{HybridEngine, TripleStore};
-use trillian::sparql::{profile_query, serve, serve_durable};
+use trillian::sparql::{profile_query, serve, serve_durable_at};
 use trillian::wal::Wal;
 
 #[cfg(feature = "dhat")]
@@ -102,7 +102,13 @@ async fn load_and_serve(snapshot: &str, port: u16) {
         replay.applied,
         t0.elapsed().as_millis()
     );
-    serve_durable(store, port, Some(wal)).await;
+    serve_durable_at(
+        store,
+        port,
+        Some(wal),
+        Some(std::path::PathBuf::from(snapshot)),
+    )
+    .await;
 }
 
 /// Profiling: build the index in RAM (heap, visible to dhat), print a memory
