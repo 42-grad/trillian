@@ -7,6 +7,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **`FILTER EXISTS` / `NOT EXISTS`** — the sub-pattern is evaluated with the
+  row's bindings substituted in (variables bound in the row become terms,
+  unbound ones stay free), over BGP, property paths, `FILTER`, `Join`,
+  `UNION` and `OPTIONAL` (`src/sparql.rs`). Works in a top-level `FILTER` and
+  inside an `OPTIONAL`'s filter alike. Constructs substitution cannot safely
+  enter (`MINUS`, `GROUP BY`, sub-`SELECT`, `BIND`, `VALUES`, federated
+  patterns) are refused up front with a message instead of every `EXISTS`
+  silently reading as false.
+- **`COALESCE`** — takes the first argument that does not error, an error only
+  when all do (`src/sparql.rs`).
+- **The previously unimplemented built-ins**: `SUBSTR` (XPath rounding
+  semantics), `CONCAT`, `REPLACE` (with `$1` capture references and the
+  `REGEX` flags), `ABS`/`CEIL`/`FLOOR`/`ROUND`, the date accessors
+  `YEAR`/`MONTH`/`DAY`/`HOURS`/`MINUTES`/`SECONDS` over `xsd:dateTime` and
+  `xsd:date` lexical forms (timezone validated, not applied), and the hash
+  functions `MD5`/`SHA1`/`SHA256`/`SHA384`/`SHA512` as hex digests
+  (`src/sparql.rs`; new dependencies `sha1`, `sha2`, `md-5`, `digest`).
 - **`MINUS`** — subtracts from the left solutions every one a right-hand
   pattern is compatible with (`src/sparql.rs`): agreeing on every variable both
   sides bind, *and* binding at least one in common. That second half is what

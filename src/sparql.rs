@@ -185,7 +185,7 @@ pub async fn stream_handler(
 
     tokio::task::spawn_blocking(move || {
         let store = state.store.read().unwrap_or_else(|e| e.into_inner());
-        let ctx = Ctx::new(&store);
+        let ctx = Ctx::new(&store, &state.engine);
         let result = if infer.as_deref() == Some("rdfs") {
             evaluate_select_infer(&ctx, &state.engine, &query_str)
         } else {
@@ -368,7 +368,7 @@ pub fn profile_query(store: &TripleStore, engine: &HybridEngine, query_str: &str
         };
         let m = peel_modifiers(&pattern);
         let t = Instant::now();
-        let ctx = Ctx::new(store);
+        let ctx = Ctx::new(store, engine);
         let result = evaluate_select_with_modifiers(&ctx, engine, &m).unwrap();
         eval.push(t.elapsed().as_secs_f64() * 1000.0);
         rows = result.rows.n_rows();
@@ -408,16 +408,19 @@ struct Overlay {
 /// The store plus that overlay. An ID below `base` belongs to the dictionary,
 /// the rest to the query. Interning takes `&self`, which is what lets a query
 /// that computes a term run under the read lock and leave no trace.
+/// `engine` is what a `FILTER EXISTS` needs to evaluate its sub-pattern.
 struct Ctx<'a> {
     store: &'a TripleStore,
+    engine: &'a HybridEngine,
     base: u32,
     overlay: RefCell<Overlay>,
 }
 
 impl<'a> Ctx<'a> {
-    fn new(store: &'a TripleStore) -> Self {
+    fn new(store: &'a TripleStore, engine: &'a HybridEngine) -> Self {
         Self {
             store,
+            engine,
             base: store.dict.len() as u32,
             overlay: RefCell::new(Overlay::default()),
         }
@@ -492,7 +495,7 @@ pub fn execute_sparql(
     let query = SparqlParser::new()
         .parse_query(query_str)
         .map_err(|e| e.to_string())?;
-    let ctx = Ctx::new(store);
+    let ctx = Ctx::new(store, engine);
 
     match query {
         SparqlQuery::Select { pattern, .. } => {
@@ -537,7 +540,7 @@ pub fn execute_sparql_infer(
         .parse_query(query_str)
         .map_err(|e| e.to_string())?;
 
-    let ctx = Ctx::new(store);
+    let ctx = Ctx::new(store, engine);
 
     match &mut query {
         SparqlQuery::Select { pattern, .. } => {
@@ -591,7 +594,7 @@ fn execute_count_infer(
         .parse_query(query_str)
         .map_err(|e| e.to_string())?;
 
-    let ctx = Ctx::new(store);
+    let ctx = Ctx::new(store, engine);
 
     match &mut query {
         SparqlQuery::Select { pattern, .. } => {
@@ -2140,7 +2143,7 @@ fn execute_count(
     let query = SparqlParser::new()
         .parse_query(query_str)
         .map_err(|e| e.to_string())?;
-    let ctx = Ctx::new(store);
+    let ctx = Ctx::new(store, engine);
 
     match query {
         SparqlQuery::Select { pattern, .. } => {
@@ -2583,8 +2586,150 @@ fn eval(expr: &Expression, row: &[u32], vars: &[String], ctx: &Ctx) -> Result<Fv
             }
         }
         Expression::FunctionCall(func, args) => eval_func(func, args, row, vars, ctx),
-        _ => Err(()), // unsupported -> error (row is dropped)
+        // SPARQL EXISTS: substitute the row's bindings into the pattern and
+        // report whether it matches. Errors (including an unsupported
+        // sub-pattern, see `substitute_bindings`) read as a filter error.
+        Expression::Exists(gp) => eval_exists(gp, row, vars, ctx),
+        // First expression that does not error; an error only when all do.
+        Expression::Coalesce(list) => {
+            for e in list {
+                if let Ok(fv) = eval(e, row, vars, ctx) {
+                    return Ok(fv);
+                }
+            }
+            Err(())
+        }
     }
+}
+
+/// `FILTER EXISTS { pattern }` evaluated with substitution semantics: every
+/// variable bound in the current row is replaced by its term before the
+/// sub-pattern runs, so `{ ?s <p> ?o } FILTER EXISTS { ?s <p2> ?x }` reuses
+/// the row's `?s`. Returns whether anything matches.
+fn eval_exists(
+    gp: &spargebra::algebra::GraphPattern,
+    row: &[u32],
+    vars: &[String],
+    ctx: &Ctx,
+) -> Result<Fv, ()> {
+    let sub = substitute_bindings(gp, row, vars, ctx)?;
+    match eval_where(&sub, ctx, ctx.engine, None) {
+        Ok((rows, _)) => Ok(Fv::Bool(rows.n_rows() > 0)),
+        Err(_) => Err(()),
+    }
+}
+
+/// Replaces every variable bound in the row with its term, so the EXISTS
+/// sub-pattern is evaluated with the row's bindings. Unbound variables stay
+/// free. Conservative on structure: BGP, property paths, FILTER, Join,
+/// Union and `OPTIONAL` are rewritten; a construct whose substitution
+/// semantics is subtle (`MINUS`, `GROUP BY`, sub-`SELECT`, `BIND`, `VALUES`)
+/// is reported as unsupported instead of guessed at.
+fn substitute_bindings(
+    gp: &spargebra::algebra::GraphPattern,
+    row: &[u32],
+    vars: &[String],
+    ctx: &Ctx,
+) -> Result<spargebra::algebra::GraphPattern, ()> {
+    use spargebra::algebra::GraphPattern as GP;
+    let sub_term = |t: &spargebra::term::TermPattern| -> Result<spargebra::term::TermPattern, ()> {
+        let spargebra::term::TermPattern::Variable(v) = t else {
+            return Ok(t.clone());
+        };
+        let Some(col) = vars.iter().position(|x| x == v.as_str()) else {
+            return Ok(t.clone());
+        };
+        let id = row[col];
+        if id == NULL_ID {
+            return Ok(t.clone()); // unbound stays free
+        }
+        let value = ctx.resolve(id).ok_or(())?;
+        let typ = ctx.resolve_type(id).ok_or(())?;
+        let term = match typ {
+            TermType::Iri => spargebra::term::TermPattern::NamedNode(
+                spargebra::term::NamedNode::new_unchecked(value.as_ref()),
+            ),
+            TermType::BlankNode => spargebra::term::TermPattern::BlankNode(
+                spargebra::term::BlankNode::new_unchecked(value.as_ref()),
+            ),
+            TermType::Literal { datatype, lang } => {
+                let l = match (lang.as_deref(), datatype) {
+                    // Language tags and datatypes from the dictionary are
+                    // well-formed, so construction is unchecked.
+                    (Some(l), _) => {
+                        spargebra::term::Literal::new_language_tagged_literal_unchecked(
+                            value.as_ref(),
+                            l,
+                        )
+                    }
+                    (None, Some(dt)) => spargebra::term::Literal::new_typed_literal(
+                        value.as_ref(),
+                        spargebra::term::NamedNode::new_unchecked(&dt),
+                    ),
+                    (None, None) => spargebra::term::Literal::new_simple_literal(value.as_ref()),
+                };
+                spargebra::term::TermPattern::Literal(l)
+            }
+        };
+        Ok(term)
+    };
+    let rec = |gp: &GP| substitute_bindings(gp, row, vars, ctx);
+    Ok(match gp {
+        GP::Bgp { patterns } => {
+            let mut out = Vec::with_capacity(patterns.len());
+            for tp in patterns {
+                out.push(spargebra::term::TriplePattern {
+                    subject: sub_term(&tp.subject)?,
+                    predicate: match &tp.predicate {
+                        spargebra::term::NamedNodePattern::NamedNode(nn) => {
+                            spargebra::term::NamedNodePattern::NamedNode(nn.clone())
+                        }
+                        spargebra::term::NamedNodePattern::Variable(v) => {
+                            match sub_term(&spargebra::term::TermPattern::Variable(v.clone()))? {
+                                spargebra::term::TermPattern::NamedNode(nn) => {
+                                    spargebra::term::NamedNodePattern::NamedNode(nn)
+                                }
+                                _ => return Err(()), // bound to a non-IRI predicate
+                            }
+                        }
+                    },
+                    object: sub_term(&tp.object)?,
+                });
+            }
+            GP::Bgp { patterns: out }
+        }
+        GP::Path {
+            subject,
+            path,
+            object,
+        } => GP::Path {
+            subject: sub_term(subject)?,
+            path: path.clone(),
+            object: sub_term(object)?,
+        },
+        GP::Filter { expr, inner } => GP::Filter {
+            expr: expr.clone(),
+            inner: Box::new(rec(inner)?),
+        },
+        GP::Join { left, right } => GP::Join {
+            left: Box::new(rec(left)?),
+            right: Box::new(rec(right)?),
+        },
+        GP::LeftJoin {
+            left,
+            right,
+            expression,
+        } => GP::LeftJoin {
+            left: Box::new(rec(left)?),
+            right: Box::new(rec(right)?),
+            expression: expression.clone(),
+        },
+        GP::Union { left, right } => GP::Union {
+            left: Box::new(rec(left)?),
+            right: Box::new(rec(right)?),
+        },
+        _ => return Err(()),
+    })
 }
 
 fn cmp_op(
@@ -2620,6 +2765,10 @@ fn eval_func(
     ctx: &Ctx,
 ) -> Result<Fv, ()> {
     let arg = |i: usize| eval(&args[i], row, vars, ctx);
+    let date = |i: usize| -> Result<(i64, u32, u32, u32, u32, f64), ()> {
+        let fv = arg(i)?;
+        parse_xsd_date_time(as_str(&fv).ok_or(())?).ok_or(())
+    };
     match func {
         Function::Str => Ok(Fv::Str(match arg(0)? {
             Fv::Iri(s) | Fv::Blank(s) | Fv::Str(s) | Fv::Lang(s, _) | Fv::Typed(s, _) => s,
@@ -2658,8 +2807,171 @@ fn eval_func(
             let re = cached_regex(&pattern, &flags)?;
             Ok(Fv::Bool(re.is_match(&text)))
         }
+        // XPath fn:substring: 1-based, character positions `p` with
+        // `round(start) <= p < round(start) + round(length)`. A start below 1
+        // reaches into the string only through the length window
+        // (`SUBSTR("12345", 0, 3)` = "12"); `NaN`/infinite or a non-positive
+        // length yield the empty string.
+        Function::SubStr => {
+            let src = arg(0)?;
+            let s = as_str(&src).ok_or(())?;
+            let start = as_num(&arg(1)?).ok_or(())?.round();
+            if start.is_nan() || start == f64::NEG_INFINITY || start == f64::INFINITY {
+                return Ok(Fv::Str(String::new()));
+            }
+            let chars: Vec<char> = s.chars().collect();
+            let from = (start.max(1.0) as usize).min(chars.len() + 1);
+            let to = match args.get(2) {
+                Some(_) => {
+                    let len = as_num(&arg(2)?).ok_or(())?.round();
+                    if len.is_nan() || len <= 0.0 {
+                        from
+                    } else {
+                        ((start + len) as usize).clamp(from, chars.len() + 1)
+                    }
+                }
+                None => chars.len() + 1,
+            };
+            Ok(Fv::Str(chars[from - 1..to - 1].iter().collect()))
+        }
+        Function::Concat => {
+            let mut out = String::new();
+            for a in args {
+                match eval(a, row, vars, ctx)? {
+                    Fv::Iri(s) | Fv::Blank(s) | Fv::Str(s) | Fv::Lang(s, _) | Fv::Typed(s, _) => {
+                        out.push_str(&s)
+                    }
+                    Fv::Num(n) => out.push_str(&format_num(n)),
+                    Fv::Bool(b) => out.push_str(if b { "true" } else { "false" }),
+                }
+            }
+            Ok(Fv::Str(out))
+        }
+        // `REPLACE` keeps the XPath `$1`-style capture references the `regex`
+        // crate natively supports; flags follow `REGEX` above.
+        Function::Replace => {
+            let text = as_str(&arg(0)?).ok_or(())?.to_string();
+            let pattern = as_str(&arg(1)?).ok_or(())?.to_string();
+            let replacement = as_str(&arg(2)?).ok_or(())?.to_string();
+            let flags = match args.get(3) {
+                Some(_) => as_str(&arg(3)?).ok_or(())?.to_string(),
+                None => String::new(),
+            };
+            let re = cached_regex(&pattern, &flags)?;
+            Ok(Fv::Str(re.replace_all(&text, &replacement).into_owned()))
+        }
+        Function::Abs => Ok(Fv::Num(as_num(&arg(0)?).ok_or(())?.abs())),
+        Function::Ceil => Ok(Fv::Num(as_num(&arg(0)?).ok_or(())?.ceil())),
+        Function::Floor => Ok(Fv::Num(as_num(&arg(0)?).ok_or(())?.floor())),
+        Function::Round => Ok(Fv::Num(as_num(&arg(0)?).ok_or(())?.round())),
+        // Date accessors over `xsd:dateTime` / `xsd:date` lexical forms
+        // (`parse_xsd_date_time`). The time parts error on a `date` without
+        // a time.
+        Function::Year => Ok(Fv::Num(date(0)?.0 as f64)),
+        Function::Month => Ok(Fv::Num(date(0)?.1 as f64)),
+        Function::Day => Ok(Fv::Num(date(0)?.2 as f64)),
+        Function::Hours => Ok(Fv::Num(date(0)?.3 as f64)),
+        Function::Minutes => Ok(Fv::Num(date(0)?.4 as f64)),
+        Function::Seconds => Ok(Fv::Num(date(0)?.5)),
+        // SPARQL hashes over the string form; hex digest, lower case.
+        Function::Md5 => hex_hash::<md5::Md5>(&arg(0)?),
+        Function::Sha1 => hex_hash::<sha1::Sha1>(&arg(0)?),
+        Function::Sha256 => hex_hash::<sha2::Sha256>(&arg(0)?),
+        Function::Sha384 => hex_hash::<sha2::Sha384>(&arg(0)?),
+        Function::Sha512 => hex_hash::<sha2::Sha512>(&arg(0)?),
         _ => Err(()),
     }
+}
+
+/// Hex digest of the string form of `fv`.
+fn hex_hash<D: digest::Digest>(fv: &Fv) -> Result<Fv, ()> {
+    let s = as_str(fv).ok_or(())?;
+    let mut h = D::new();
+    digest::Digest::update(&mut h, s.as_bytes());
+    Ok(Fv::Str(
+        digest::Digest::finalize(h)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    ))
+}
+
+/// Parses an `xsd:dateTime` (`YYYY-MM-DDThh:mm:ss(.fff)?(Z|±hh:mm)?`) or
+/// `xsd:date` (`YYYY-MM-DD(Z|±hh:mm)?`) lexical form. Returns
+/// `(year, month, day, hour, minute, seconds-with-fraction)`; the time parts
+/// of a `date` without a time read as 0. The timezone is validated but
+/// discarded (no arithmetic across zones).
+fn parse_xsd_date_time(lex: &str) -> Option<(i64, u32, u32, u32, u32, f64)> {
+    let (date_part, time_part) = match lex.split_once('T') {
+        Some((d, t)) => (d, Some(t)),
+        None => (lex, None),
+    }; // Date = [-]YYYY-MM-DD, optionally followed by a timezone (xsd:date). The
+    // timezone can only start at index 10 (the `-` inside the date is earlier);
+    // a leading `-` is a negative year's sign.
+    let signed = date_part.strip_prefix('-');
+    let unsigned = signed.unwrap_or(date_part);
+    let (date_digits, tz) = match unsigned
+        .char_indices()
+        .find(|(i, c)| *i >= 10 && matches!(c, 'Z' | '+' | '-'))
+    {
+        Some((i, _)) => (&unsigned[..i], Some(&unsigned[i..])),
+        None => (unsigned, None),
+    };
+    if let Some(tz) = tz {
+        let valid = tz == "Z"
+            || (tz.len() == 6
+                && tz.starts_with(['+', '-'])
+                && tz[1..].chars().all(|c| c.is_ascii_digit() || c == ':'));
+        if !valid {
+            return None;
+        }
+    }
+    let mut dp = date_digits.split('-');
+    let y: i64 = dp.next()?.parse().ok()?;
+    let month: u32 = dp.next()?.parse().ok()?;
+    let day: u32 = dp.next()?.parse().ok()?;
+    if dp.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let year = if signed.is_some() { -y } else { y };
+    let (h, mi, s) = match time_part {
+        None => (0, 0, 0.0),
+        Some(t) => {
+            // Strip the timezone first: it trails the fraction.
+            let (t, tzs) = match t.find(['Z', '+', '-']) {
+                Some(i) => (&t[..i], Some(&t[i..])),
+                None => (t, None),
+            };
+            if let Some(tzs) = tzs {
+                let valid = tzs == "Z" || {
+                    tzs.len() == 6
+                        && tzs.starts_with(['+', '-'])
+                        && tzs[1..].chars().all(|c| c.is_ascii_digit() || c == ':')
+                };
+                if !valid {
+                    return None;
+                }
+            }
+            let (hms, frac) = match t.split_once('.') {
+                Some((hms, f)) => (hms, f),
+                None => (t, ""),
+            };
+            let mut t = hms.split(':');
+            let h: u32 = t.next()?.parse().ok()?;
+            let m: u32 = t.next()?.parse().ok()?;
+            let s: f64 = t.next()?.parse().ok()?;
+            if t.next().is_some() || h > 24 || m > 59 || s >= 60.0 {
+                return None;
+            }
+            let frac: f64 = if frac.is_empty() {
+                0.0
+            } else {
+                format!("0.{frac}").parse().ok()?
+            };
+            (h, m, s + frac)
+        }
+    };
+    Some((year, month, day, h, mi, s))
 }
 
 fn str2(a: &Fv, b: &Fv, f: impl Fn(&str, &str) -> bool) -> Result<Fv, ()> {
@@ -2720,8 +3032,10 @@ fn ebv(expr: &Expression, row: &[u32], vars: &[String], ctx: &Ctx) -> Result<boo
 fn unsupported_in_expr(expr: &Expression) -> Option<String> {
     let any = |es: &[&Expression]| es.iter().copied().find_map(unsupported_in_expr);
     match expr {
-        Expression::Exists(_) => Some("EXISTS".to_string()),
-        Expression::Coalesce(_) => Some("COALESCE".to_string()),
+        // EXISTS is supported, but its sub-pattern is only as supported as
+        // what substitution can safely enter and what the inner FILTERs use.
+        Expression::Exists(gp) => unsupported_in_graph_pattern(gp),
+        Expression::Coalesce(list) => any(&list.iter().collect::<Vec<_>>()),
         Expression::FunctionCall(f, args) => {
             if matches!(
                 f,
@@ -2739,6 +3053,24 @@ fn unsupported_in_expr(expr: &Expression) -> Option<String> {
                     | Function::IsLiteral
                     | Function::IsNumeric
                     | Function::Regex
+                    | Function::SubStr
+                    | Function::Concat
+                    | Function::Replace
+                    | Function::Abs
+                    | Function::Ceil
+                    | Function::Floor
+                    | Function::Round
+                    | Function::Year
+                    | Function::Month
+                    | Function::Day
+                    | Function::Hours
+                    | Function::Minutes
+                    | Function::Seconds
+                    | Function::Md5
+                    | Function::Sha1
+                    | Function::Sha256
+                    | Function::Sha384
+                    | Function::Sha512
             ) {
                 any(&args.iter().collect::<Vec<_>>())
             } else {
@@ -2764,6 +3096,44 @@ fn unsupported_in_expr(expr: &Expression) -> Option<String> {
         | Expression::Literal(_)
         | Expression::Variable(_)
         | Expression::Bound(_) => None,
+    }
+}
+
+/// [`unsupported_in_expr`] for the pattern inside an `EXISTS`: the constructs
+/// [`substitute_bindings`] can rewrite carry their FILTER/BIND expressions
+/// along, everything else (`MINUS`, `GROUP BY`, sub-`SELECT`, `BIND`, `VALUES`,
+/// federated `SERVICE`) is named as unsupported — up front, so a query fails
+/// with a message instead of every `EXISTS` silently reading as false.
+fn unsupported_in_graph_pattern(gp: &spargebra::algebra::GraphPattern) -> Option<String> {
+    use spargebra::algebra::GraphPattern as GP;
+    match gp {
+        GP::Bgp { .. } | GP::Path { .. } => None,
+        GP::Filter { expr, inner } => {
+            unsupported_in_expr(expr).or_else(|| unsupported_in_graph_pattern(inner))
+        }
+        GP::Join { left, right } | GP::Union { left, right } => {
+            unsupported_in_graph_pattern(left).or_else(|| unsupported_in_graph_pattern(right))
+        }
+        GP::LeftJoin {
+            left,
+            right,
+            expression,
+        } => unsupported_in_graph_pattern(left)
+            .or_else(|| unsupported_in_graph_pattern(right))
+            .or_else(|| expression.as_ref().and_then(unsupported_in_expr)),
+        GP::Extend { .. } => Some("BIND inside EXISTS".to_string()),
+        GP::Minus { .. } => Some("MINUS inside EXISTS".to_string()),
+        GP::Values { .. } => Some("VALUES inside EXISTS".to_string()),
+        GP::Group { .. } => Some("GROUP BY inside EXISTS".to_string()),
+        GP::Project { .. } | GP::Distinct { .. } | GP::Reduced { .. } => {
+            Some("a sub-SELECT inside EXISTS".to_string())
+        }
+        GP::Slice { .. } | GP::OrderBy { .. } => {
+            Some("solution modifiers inside EXISTS".to_string())
+        }
+        GP::Graph { .. } | GP::Service { .. } => {
+            Some("a federated/Graph pattern inside EXISTS".to_string())
+        }
     }
 }
 
@@ -2896,6 +3266,26 @@ fn term_to_json(id: u32, ctx: &Ctx) -> Value {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod xsd_dt_tests {
+    use super::parse_xsd_date_time;
+    #[test]
+    fn parse_smoke() {
+        assert_eq!(
+            parse_xsd_date_time("2023-05-12T14:30:05.25Z"),
+            Some((2023, 5, 12, 14, 30, 5.25))
+        );
+        assert_eq!(
+            parse_xsd_date_time("2021-12-31"),
+            Some((2021, 12, 31, 0, 0, 0.0))
+        );
+        assert_eq!(
+            parse_xsd_date_time("2023-05-12+02:00"),
+            Some((2023, 5, 12, 0, 0, 0.0))
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -3536,7 +3926,7 @@ mod tests {
         let store = test_store();
         let engine = HybridEngine::new();
         let query = "SELECT ?a ?b WHERE { ?a <http://example.org/knows> ?b }";
-        let ctx = Ctx::new(&store);
+        let ctx = Ctx::new(&store, &engine);
         let select = evaluate_select(&ctx, &engine, query).unwrap();
         assert_eq!(select.rows.n_rows(), 3);
         assert_eq!(select.vars, vec!["a", "b"]);
@@ -5030,23 +5420,23 @@ mod tests {
         for (query, expected) in [
             (
                 "SELECT ?s WHERE { ?s <http://example.org/knows> ?o \
-                 FILTER NOT EXISTS { ?s <http://example.org/age> ?a } }",
-                "EXISTS",
+                 FILTER NOT EXISTS { ?s <http://example.org/age> ?a MINUS { ?a ?p ?q } } }",
+                "MINUS inside EXISTS",
             ),
             (
                 "SELECT ?s WHERE { ?s <http://example.org/knows> ?o \
-                 FILTER EXISTS { ?s <http://example.org/age> ?a } }",
-                "EXISTS",
+                 FILTER(LANGMATCHES(STR(?o), \"en\")) }",
+                "LANGMATCHES",
             ),
             (
                 "SELECT ?s WHERE { ?s <http://example.org/knows> ?o \
-                 FILTER(SUBSTR(STR(?s), 1, 4) = \"http\") }",
-                "SUBSTR",
+                 FILTER(RAND() > 0.5) }",
+                "RAND",
             ),
             (
                 "SELECT ?s WHERE { ?s <http://example.org/knows> ?o \
-                 FILTER(COALESCE(?z, \"x\") = \"x\") }",
-                "COALESCE",
+                 FILTER(TIMEZONE(STR(?o)) = \"PT0S\") }",
+                "TIMEZONE",
             ),
         ] {
             let err = execute_sparql(&store, &engine, query).unwrap_err();
@@ -5062,10 +5452,10 @@ mod tests {
         let err = execute_sparql(
             &store,
             &engine,
-            "SELECT ?x WHERE { ?s <http://example.org/knows> ?o BIND(ABS(-3) AS ?x) }",
+            "SELECT ?x WHERE { ?s <http://example.org/knows> ?o BIND(NOW() AS ?x) }",
         )
         .unwrap_err();
-        assert!(err.contains("ABS"), "unexpected error: {err}");
+        assert!(err.contains("NOW"), "unexpected error: {err}");
     }
 
     /// The supported ones still evaluate, i.e. the check is not over-eager.
@@ -5078,6 +5468,189 @@ mod tests {
              FILTER(isIRI(?s) && CONTAINS(STR(?o), \"example\") && !(STRLEN(STR(?s)) = 0)) }",
         );
         assert_eq!(rows.len(), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // FILTER EXISTS / NOT EXISTS
+    // -----------------------------------------------------------------------
+
+    /// `EXISTS` evaluates the sub-pattern with the row's bindings substituted:
+    /// only the row whose object carries an `age` keeps the filter true.
+    #[test]
+    fn filter_exists_uses_the_row_bindings() {
+        let store = test_store();
+        let rows = rows_of(
+            &store,
+            "SELECT ?s WHERE { ?s <http://example.org/knows> ?o \
+             FILTER EXISTS { ?o <http://example.org/age> ?a } }",
+        );
+        assert_eq!(rows.len(), 1, "only alice's ?o (= bob) has an age");
+        assert_eq!(rows[0]["s"]["value"], "http://example.org/alice");
+    }
+
+    #[test]
+    fn filter_not_exists_negates() {
+        let store = test_store();
+        let rows = rows_of(
+            &store,
+            "SELECT ?s WHERE { ?s <http://example.org/knows> ?o \
+             FILTER NOT EXISTS { ?o <http://example.org/age> ?a } }",
+        );
+        assert_eq!(rows.len(), 2);
+        let s: Vec<&str> = rows
+            .iter()
+            .map(|r| r["s"]["value"].as_str().unwrap())
+            .collect();
+        assert!(s.contains(&"http://example.org/bob"));
+        assert!(s.contains(&"http://example.org/charlie"));
+    }
+
+    /// Free variables of the sub-pattern stay free: every row whose subject
+    /// appears as someone's object matches, for each such row separately.
+    #[test]
+    fn filter_exists_leaves_free_variables_free() {
+        let store = test_store();
+        let rows = rows_of(
+            &store,
+            "SELECT ?s ?o WHERE { ?s <http://example.org/knows> ?o \
+             FILTER EXISTS { ?o <http://example.org/knows> ?free } }",
+        );
+        // alice→bob (bob knows charlie), bob→charlie (charlie knows alice),
+        // charlie→alice (alice knows bob) — every edge qualifies.
+        assert_eq!(rows.len(), 3);
+    }
+
+    /// A construct substitution cannot safely enter is refused up front.
+    #[test]
+    fn filter_exists_over_unsupported_structure_is_refused() {
+        let store = test_store();
+        let engine = HybridEngine::new();
+        let err = execute_sparql(
+            &store,
+            &engine,
+            "SELECT ?s WHERE { ?s <http://example.org/knows> ?o \
+             FILTER EXISTS { ?s <http://example.org/knows> ?o \
+             MINUS { ?o <http://example.org/age> ?a } } }",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("MINUS inside EXISTS"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // COALESCE and the previously unimplemented functions
+    // -----------------------------------------------------------------------
+
+    fn single_value(store: &TripleStore, query: &str) -> String {
+        let rows = rows_of(store, query);
+        assert_eq!(rows.len(), 4, "one result row per fixture triple");
+        let term = rows[0].as_object().unwrap().values().next().unwrap();
+        term["value"].as_str().unwrap().to_string()
+    }
+
+    /// `COALESCE` takes the first argument that does not error; a bound
+    /// `OPTIONAL` value wins over the fallback.
+    #[test]
+    fn coalesce_takes_the_first_non_error_argument() {
+        let store = test_store();
+        let rows = rows_of(
+            &store,
+            "SELECT ?s ?v WHERE { ?s <http://example.org/knows> ?o \
+             OPTIONAL { ?o <http://example.org/age> ?a } \
+             BIND(COALESCE(?a, \"none\") AS ?v) }",
+        );
+        let v = |s: &str| {
+            rows.iter().find(|r| r["s"]["value"] == s).unwrap()["v"]["value"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(v("http://example.org/alice"), "25"); // ?a bound for bob
+        assert_eq!(v("http://example.org/bob"), "none");
+    }
+
+    #[test]
+    fn previously_unsupported_functions_evaluate() {
+        let store = test_store();
+        assert_eq!(
+            single_value(
+                &store,
+                "SELECT (SUBSTR(\"hello world\", 7, 5) AS ?v) WHERE { ?s ?p ?o }"
+            ),
+            "world"
+        );
+        assert_eq!(
+            single_value(
+                &store,
+                "SELECT (SUBSTR(\"12345\", 0, 3) AS ?v) WHERE { ?s ?p ?o }"
+            ),
+            "12"
+        );
+        assert_eq!(
+            single_value(
+                &store,
+                "SELECT (CONCAT(\"a\", 2, true) AS ?v) WHERE { ?s ?p ?o }"
+            ),
+            "a2true"
+        );
+        assert_eq!(
+            single_value(
+                &store,
+                "SELECT (REPLACE(\"hello world\", \"o\", \"0\") AS ?v) WHERE { ?s ?p ?o }"
+            ),
+            "hell0 w0rld"
+        );
+        assert_eq!(
+            single_value(&store, "SELECT (ABS(-3.5) AS ?v) WHERE { ?s ?p ?o }"),
+            "3.5"
+        );
+        assert_eq!(
+            single_value(&store, "SELECT (CEIL(3.2) AS ?v) WHERE { ?s ?p ?o }"),
+            "4"
+        );
+    }
+
+    #[test]
+    fn date_functions_read_xsd_date_time() {
+        let store = test_store();
+        let q = |expr: &str| {
+            single_value(
+                &store,
+                &format!("SELECT ({expr} AS ?v) WHERE {{ ?s ?p ?o }}"),
+            )
+        };
+        assert_eq!(q("YEAR(\"2023-05-12T14:30:05.25Z\")"), "2023");
+        assert_eq!(q("MONTH(\"2023-05-12T14:30:05.25Z\")"), "5");
+        assert_eq!(q("DAY(\"2023-05-12T14:30:05.25Z\")"), "12");
+        assert_eq!(q("HOURS(\"2023-05-12T14:30:05.25+02:00\")"), "14");
+        assert_eq!(q("MINUTES(\"2023-05-12T14:30:05.25Z\")"), "30");
+        assert_eq!(q("SECONDS(\"2023-05-12T14:30:05.25Z\")"), "5.25");
+        // A plain xsd:date: year reads fine, absent time parts read as 0.
+        assert_eq!(q("YEAR(\"2021-12-31\")"), "2021");
+        assert_eq!(q("HOURS(\"2021-12-31\")"), "0");
+    }
+
+    #[test]
+    fn hash_functions_return_the_hex_digest() {
+        let store = test_store();
+        let q = |expr: &str| {
+            single_value(
+                &store,
+                &format!("SELECT ({expr} AS ?v) WHERE {{ ?s ?p ?o }}"),
+            )
+        };
+        assert_eq!(q("MD5(\"abc\")"), "900150983cd24fb0d6963f7d28e17f72");
+        assert_eq!(
+            q("SHA1(\"abc\")"),
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
+        assert_eq!(
+            q("SHA256(\"abc\")"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(q("SHA512(\"abc\")").len(), 128);
     }
 
     // -----------------------------------------------------------------------
@@ -5130,7 +5703,8 @@ mod tests {
     #[test]
     fn a_computed_term_reuses_the_dictionary_id() {
         let store = test_store();
-        let ctx = Ctx::new(&store);
+        let engine = HybridEngine::new();
+        let ctx = Ctx::new(&store, &engine);
         let stored = store
             .dict
             .lookup_iri("http://example.org/bob")
