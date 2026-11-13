@@ -140,6 +140,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   forms test the same datatype IRI.
 
 ### Fixed
+- **RDFS inference now reaches two more patterns** (`src/inference.rs`).
+  A property path is expanded into the equivalent triple patterns where it
+  leads with plain predicates, so the `rdf:type` step inside
+  `?s rdf:type/rdfs:subClassOf* ?c` carries the type branches instead of
+  looking at asserted triples only (e.g. a type derived through
+  `rdfs:domain` is now found). And an `rdf:type` pattern gains a fourth
+  branch for rdfs9 through a predicate declared a sub-property of
+  `rdf:type` (`?s ?q ?t . ?q rdfs:subPropertyOf+ rdf:type .
+  ?t rdfs:subClassOf* ?c`), so `ex:isA ⊑ rdf:type` fires the type rules —
+  including zero-hop class matches and the class hierarchy above them.
 - **An empty group pattern is the join identity** (`src/sparql.rs`). `eval_bgp`
   forwarded `{ }` to the engine, whose plan is empty for it and yields **zero**
   rows; the algebra says it is *one empty solution*. The wrong shape made

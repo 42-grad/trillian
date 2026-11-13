@@ -4609,6 +4609,48 @@ mod tests {
         assert_eq!(values_of(&rows, "s"), vec!["http://example.org/Fido"]);
     }
 
+    /// The `rdf:type` step inside a property path is rewritten like the
+    /// equivalent triple, so it sees inferred types — here one derived from
+    /// `rdfs:domain` (rdfs2). Without the expansion the path only looked at
+    /// asserted `rdf:type` triples.
+    #[test]
+    fn inference_reaches_the_type_step_inside_a_path() {
+        let store = rdfs_store(&[
+            ("worksAt", "domain", "Person"),
+            ("Alice", "worksAt", "Acme"),
+        ]);
+        let rows = infer_rows_of(
+            &store,
+            "SELECT ?s WHERE { ?s \
+             <http://www.w3.org/1999/02/22-rdf-syntax-ns#type>/\
+             <http://www.w3.org/2000/01/rdf-schema#subClassOf>* \
+             <http://example.org/Person> }",
+        );
+        assert_eq!(values_of(&rows, "s"), vec!["http://example.org/Alice"]);
+    }
+
+    /// rdfs9 through a predicate declared a sub-property of `rdf:type`: the
+    /// derived type is the declared class itself (zero `subClassOf` hops) and
+    /// is generalized along the class hierarchy otherwise.
+    #[test]
+    fn inference_fires_type_rules_through_a_subproperty_of_type() {
+        let store = rdfs_store(&[
+            ("isA", "subPropertyOf", "type"),
+            ("Dog", "subClassOf", "Animal"),
+            ("Rex", "isA", "Dog"),
+        ]);
+        let direct = infer_rows_of(
+            &store,
+            "SELECT ?s WHERE { ?s \
+             <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> \
+             <http://example.org/Dog> }",
+        );
+        assert_eq!(values_of(&direct, "s"), vec!["http://example.org/Rex"]);
+        // And the class hierarchy still applies on top.
+        let rows = infer_rows_of(&store, TYPE_OF_ANIMAL);
+        assert_eq!(values_of(&rows, "s"), vec!["http://example.org/Rex"]);
+    }
+
     /// `rdfs:domain` types the subject (rdfs2), and the class it yields is
     /// itself generalized along `rdfs:subClassOf`.
     #[test]
