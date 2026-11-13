@@ -20,8 +20,8 @@ use spargebra::{Query as SparqlQuery, SparqlParser};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::hypertrie::{
-    Dictionary, GraphPattern, HybridEngine, NULL_ID, PatternTerm, RowBlock, TermType,
-    TriplePattern, TripleStore, max_result_rows,
+    DatatypeRef, Dictionary, GraphPattern, HybridEngine, NULL_ID, PatternTerm, RowBlock, TermType,
+    TermTypeRef, TriplePattern, TripleStore, decode_type_ref_owned, max_result_rows,
 };
 use crate::wal::Wal;
 
@@ -449,14 +449,18 @@ impl<'a> Ctx<'a> {
         Some(Cow::Owned(Dictionary::decode(key).0.into_owned()))
     }
 
-    fn resolve_type(&self, id: u32) -> Option<TermType> {
+    /// [`Self::resolve_type`], but borrowing: base IDs resolve zero-copy out
+    /// of the mmap'd keys. Overlay keys cannot outlive the `RefCell` borrow,
+    /// so their datatype/language tags come back owned — that path is cold
+    /// (only query-local computed terms live there).
+    fn resolve_type_ref(&self, id: u32) -> Option<TermTypeRef<'a>> {
         if id < self.base {
-            return self.store.dict.resolve_type(id);
+            return self.store.dict.resolve_type_ref(id);
         }
         let o = self.overlay.borrow();
         o.keys
             .get((id - self.base) as usize)
-            .map(|k| Dictionary::decode(k).1)
+            .map(|k| decode_type_ref_owned(k))
     }
 }
 
@@ -2027,9 +2031,10 @@ fn term_pattern_variables(tp: &spargebra::term::TermPattern) -> Vec<String> {
     }
 }
 
-/// Appends a JSON string literal (with escaping) to the buffer.
-fn append_json_str(out: &mut String, s: &str) {
-    out.push('"');
+/// Appends the escaped body of a JSON string (no surrounding quotes), so
+/// callers can write a datatype IRI as two pieces (folded prefix + suffix)
+/// without unfolding it into a fresh allocation.
+fn append_json_body(out: &mut String, s: &str) {
     for c in s.chars() {
         match c {
             '"' => out.push_str("\\\""),
@@ -2041,28 +2046,42 @@ fn append_json_str(out: &mut String, s: &str) {
             c => out.push(c),
         }
     }
+}
+
+/// Appends a JSON string literal (with escaping) to the buffer.
+fn append_json_str(out: &mut String, s: &str) {
+    out.push('"');
+    append_json_body(out, s);
     out.push('"');
 }
 
 /// Appends the SPARQL-JSON term object for an ID (uri/literal+datatype/lang).
 fn append_term(out: &mut String, id: u32, ctx: &Ctx) {
-    match (ctx.resolve(id), ctx.resolve_type(id)) {
-        (Some(v), Some(TermType::Iri)) => {
+    match (ctx.resolve(id), ctx.resolve_type_ref(id)) {
+        (Some(v), Some(TermTypeRef::Iri)) => {
             out.push_str("{\"type\":\"uri\",\"value\":");
             append_json_str(out, &v);
             out.push('}');
         }
-        (Some(v), Some(TermType::BlankNode)) => {
+        (Some(v), Some(TermTypeRef::BlankNode)) => {
             out.push_str("{\"type\":\"bnode\",\"value\":");
             append_json_str(out, &v);
             out.push('}');
         }
-        (Some(v), Some(TermType::Literal { datatype, lang })) => {
+        (Some(v), Some(TermTypeRef::Literal { datatype, lang })) => {
             out.push_str("{\"type\":\"literal\",\"value\":");
             append_json_str(out, &v);
-            if let Some(dt) = &datatype {
-                out.push_str(",\"datatype\":");
-                append_json_str(out, dt);
+            if let Some(dt) = datatype {
+                // Written in folded pieces — no unfolding allocation per row.
+                out.push_str(",\"datatype\":\"");
+                match &dt {
+                    DatatypeRef::Full(s) => append_json_body(out, s),
+                    DatatypeRef::Folded { prefix, rest } => {
+                        append_json_body(out, prefix);
+                        append_json_body(out, rest);
+                    }
+                }
+                out.push('"');
             }
             if let Some(l) = &lang {
                 out.push_str(",\"xml:lang\":");
@@ -2321,56 +2340,42 @@ enum Fv {
     Typed(String, String), // (lexical, datatype IRI) – not numeric/string
 }
 
-fn is_numeric_dt(dt: &str) -> bool {
-    matches!(
-        dt.strip_prefix(XSD),
-        Some(
-            "integer"
-                | "decimal"
-                | "double"
-                | "float"
-                | "int"
-                | "long"
-                | "short"
-                | "byte"
-                | "nonNegativeInteger"
-                | "positiveInteger"
-                | "nonPositiveInteger"
-                | "negativeInteger"
-                | "unsignedInt"
-                | "unsignedLong"
-                | "unsignedShort"
-                | "unsignedByte"
-        )
+fn classify(lex: &str, datatype: Option<&str>, lang: Option<&str>) -> Fv {
+    classify_ref(
+        lex,
+        datatype
+            .map(|d| DatatypeRef::Full(Cow::Borrowed(d)))
+            .as_ref(),
+        lang,
     )
 }
 
-fn classify(lex: &str, datatype: Option<&str>, lang: Option<&str>) -> Fv {
+fn classify_ref(lex: &str, datatype: Option<&DatatypeRef<'_>>, lang: Option<&str>) -> Fv {
     if let Some(l) = lang {
         return Fv::Lang(lex.to_string(), l.to_string());
     }
     match datatype {
         None => Fv::Str(lex.to_string()),
-        // strip_prefix, not format!: the guards ran on every row. With this, the compiler can optimize the string comparison to a single pointer comparison.
-        Some(dt) if dt.strip_prefix(XSD) == Some("string") => Fv::Str(lex.to_string()),
-        Some(dt) if dt.strip_prefix(XSD) == Some("boolean") => {
-            Fv::Bool(lex == "true" || lex == "1")
-        }
-        Some(dt) if is_numeric_dt(dt) => match lex.parse::<f64>() {
+        // strip_xsd, not format!: the guards run on every row, and on a folded
+        // datatype (see DatatypeRef) they compare in folded space — the
+        // compiler can optimize the prefix comparison to a pointer check.
+        Some(dt) if dt.strip_xsd() == Some("string") => Fv::Str(lex.to_string()),
+        Some(dt) if dt.strip_xsd() == Some("boolean") => Fv::Bool(lex == "true" || lex == "1"),
+        Some(dt) if dt.is_numeric_xsd() => match lex.parse::<f64>() {
             Ok(n) => Fv::Num(n),
-            Err(_) => Fv::Typed(lex.to_string(), dt.to_string()),
+            Err(_) => Fv::Typed(lex.to_string(), dt.unfolded().into_owned()),
         },
-        Some(dt) => Fv::Typed(lex.to_string(), dt.to_string()),
+        Some(dt) => Fv::Typed(lex.to_string(), dt.unfolded().into_owned()),
     }
 }
 
 fn term_to_fv(id: u32, ctx: &Ctx) -> Option<Fv> {
     let v = ctx.resolve(id)?;
-    match ctx.resolve_type(id)? {
-        TermType::Iri => Some(Fv::Iri(v.to_string())),
-        TermType::BlankNode => Some(Fv::Blank(v.to_string())),
-        TermType::Literal { datatype, lang } => {
-            Some(classify(&v, datatype.as_deref(), lang.as_deref()))
+    match ctx.resolve_type_ref(id)? {
+        TermTypeRef::Iri => Some(Fv::Iri(v.to_string())),
+        TermTypeRef::BlankNode => Some(Fv::Blank(v.to_string())),
+        TermTypeRef::Literal { datatype, lang } => {
+            Some(classify_ref(&v, datatype.as_ref(), lang.as_deref()))
         }
     }
 }
@@ -2442,10 +2447,10 @@ enum TermKey {
 /// Normalizes a literal to a `TermKey`. Per RDF 1.1 a plain literal and an
 /// explicit `xsd:string` literal are the same term, so `xsd:string` collapses
 /// to "no datatype".
-fn lit_key(lexical: &str, datatype: Option<&str>, lang: Option<&str>) -> TermKey {
+fn lit_key(lexical: &str, datatype: Option<&DatatypeRef<'_>>, lang: Option<&str>) -> TermKey {
     let dt = datatype
-        .filter(|d| d.strip_prefix(XSD) != Some("string"))
-        .map(str::to_string);
+        .filter(|d| d.strip_xsd() != Some("string"))
+        .map(|d| d.unfolded().into_owned());
     TermKey::Lit(lexical.to_string(), dt, lang.map(str::to_string))
 }
 
@@ -2456,7 +2461,7 @@ fn term_key(expr: &Expression, row: &[u32], vars: &[String], ctx: &Ctx) -> Optio
         Expression::NamedNode(nn) => Some(TermKey::Iri(nn.as_str().to_string())),
         Expression::Literal(lit) => Some(lit_key(
             lit.value(),
-            Some(lit.datatype().as_str()),
+            Some(&DatatypeRef::Full(Cow::Borrowed(lit.datatype().as_str()))),
             lit.language(),
         )),
         Expression::Variable(v) => {
@@ -2466,11 +2471,11 @@ fn term_key(expr: &Expression, row: &[u32], vars: &[String], ctx: &Ctx) -> Optio
                 return None;
             }
             let value = ctx.resolve(id)?;
-            match ctx.resolve_type(id)? {
-                TermType::Iri => Some(TermKey::Iri(value.into_owned())),
-                TermType::BlankNode => Some(TermKey::Blank(value.into_owned())),
-                TermType::Literal { datatype, lang } => {
-                    Some(lit_key(&value, datatype.as_deref(), lang.as_deref()))
+            match ctx.resolve_type_ref(id)? {
+                TermTypeRef::Iri => Some(TermKey::Iri(value.into_owned())),
+                TermTypeRef::BlankNode => Some(TermKey::Blank(value.into_owned())),
+                TermTypeRef::Literal { datatype, lang } => {
+                    Some(lit_key(&value, datatype.as_ref(), lang.as_deref()))
                 }
             }
         }
@@ -2874,14 +2879,14 @@ fn term_to_json(id: u32, ctx: &Ctx) -> Value {
         return Value::Null;
     }
     let value = ctx.resolve(id);
-    let typ = ctx.resolve_type(id);
+    let typ = ctx.resolve_type_ref(id);
     match (value, typ) {
-        (Some(v), Some(TermType::Iri)) => json!({ "type": "uri", "value": v }),
-        (Some(v), Some(TermType::BlankNode)) => json!({ "type": "bnode", "value": v }),
-        (Some(v), Some(TermType::Literal { datatype, lang })) => {
+        (Some(v), Some(TermTypeRef::Iri)) => json!({ "type": "uri", "value": v }),
+        (Some(v), Some(TermTypeRef::BlankNode)) => json!({ "type": "bnode", "value": v }),
+        (Some(v), Some(TermTypeRef::Literal { datatype, lang })) => {
             let mut obj = json!({ "type": "literal", "value": v });
             if let Some(dt) = datatype {
-                obj["datatype"] = json!(dt);
+                obj["datatype"] = json!(dt.unfolded());
             }
             if let Some(l) = lang {
                 obj["xml:lang"] = json!(l);

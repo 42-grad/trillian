@@ -10,6 +10,9 @@ use string_interner::{StringInterner, Symbol};
 /// literals, or language/datatype strings (like `SEP` = `0x01`).
 const NS_ESC: char = '\u{2}';
 
+/// [`NS_ESC`] as the byte it appears as in keys.
+const NS_ESC_BYTE: u8 = NS_ESC as u8;
+
 /// Known long IRI prefixes. On real Wikidata data `entity/Q*` and
 /// `prop/direct/P*` make up the bulk of all IRIs; their prefix (29–37 chars)
 /// repeats millions of times. Folding replaces it with 2 bytes (`NS_ESC` +
@@ -104,10 +107,125 @@ impl TermType {
     }
 }
 
+/// Borrowed view of a literal's datatype IRI. Datatype IRIs are
+/// namespace-**folded** at ingest (see [`fold_iri`]) — on Wikidata data most
+/// are `xsd:*` or Wikidata-prefixed — so the key stores `\x02` + code +
+/// suffix, and reconstructing the full IRI would cost one allocation per row.
+/// [`DatatypeRef`] keeps the two pieces apart so consumers can compare
+/// ([`DatatypeRef::strip_xsd`]) and append ([`DatatypeRef::write_json_body`])
+/// without ever unfolding; [`DatatypeRef::unfolded`] allocates only for the
+/// callers that genuinely need the whole IRI as one string.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum DatatypeRef<'a> {
+    /// The complete IRI, borrowed when it was stored unfolded.
+    Full(Cow<'a, str>),
+    /// A folded IRI: the static namespace prefix plus the suffix borrowed
+    /// (or owned, for query-local overlay keys) from the key.
+    Folded {
+        prefix: &'static str,
+        rest: Cow<'a, str>,
+    },
+}
+
+impl DatatypeRef<'_> {
+    /// The part after `http://www.w3.org/2001/XMLSchema#`, compared in folded
+    /// space — no allocation, no unfolding. `None` for other namespaces.
+    pub fn strip_xsd(&self) -> Option<&str> {
+        match self {
+            DatatypeRef::Full(s) => s.strip_prefix(XSD),
+            DatatypeRef::Folded { prefix, rest } if *prefix == XSD => Some(rest),
+            _ => None,
+        }
+    }
+
+    /// Whether the datatype is one of the numeric `xsd:` types.
+    pub fn is_numeric_xsd(&self) -> bool {
+        matches!(
+            self.strip_xsd(),
+            Some(
+                "integer"
+                    | "decimal"
+                    | "double"
+                    | "float"
+                    | "int"
+                    | "long"
+                    | "short"
+                    | "byte"
+                    | "nonNegativeInteger"
+                    | "positiveInteger"
+                    | "nonPositiveInteger"
+                    | "negativeInteger"
+                    | "unsignedInt"
+                    | "unsignedLong"
+                    | "unsignedShort"
+                    | "unsignedByte"
+            )
+        )
+    }
+
+    /// The full IRI, unfolded only when it was folded (then `Cow::Owned`).
+    pub fn unfolded(&self) -> Cow<'_, str> {
+        match self {
+            DatatypeRef::Full(s) => Cow::Borrowed(s),
+            DatatypeRef::Folded { prefix, rest } => {
+                let mut s = String::with_capacity(prefix.len() + rest.len());
+                s.push_str(prefix);
+                s.push_str(rest);
+                Cow::Owned(s)
+            }
+        }
+    }
+
+    /// The owned counterpart: suffix and full IRI become `Cow::Owned`.
+    pub fn into_owned_datatype(self) -> DatatypeRef<'static> {
+        match self {
+            DatatypeRef::Full(s) => DatatypeRef::Full(Cow::Owned(s.into_owned())),
+            DatatypeRef::Folded { prefix, rest } => DatatypeRef::Folded {
+                prefix,
+                rest: Cow::Owned(rest.into_owned()),
+            },
+        }
+    }
+}
+
+/// Borrowed view of a [`TermType`] for the hot read path. The datatype IRI and
+/// language tag borrow straight out of the interned key, so resolving a term's type
+/// under every `FILTER`, `ORDER BY`, `BIND` and aggregate allocates **nothing**
+/// — `TermType` allocated both strings per row. Convert with
+/// [`TermTypeRef::into_owned`] where an owned `TermType` is needed (parsing,
+/// WAL, cold paths).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TermTypeRef<'a> {
+    Iri,
+    Literal {
+        datatype: Option<DatatypeRef<'a>>,
+        lang: Option<Cow<'a, str>>,
+    },
+    BlankNode,
+}
+
+impl TermTypeRef<'_> {
+    /// The owned [`TermType`] counterpart (`Cow::Owned` for the datatype IRI
+    /// and language tag).
+    pub fn into_owned(self) -> TermType {
+        match self {
+            TermTypeRef::Iri => TermType::Iri,
+            TermTypeRef::BlankNode => TermType::BlankNode,
+            TermTypeRef::Literal { datatype, lang } => TermType::Literal {
+                datatype: datatype.map(|d| d.unfolded().into_owned()),
+                lang: lang.map(|l| l.into_owned()),
+            },
+        }
+    }
+}
+
 /// `xsd:string` – a plain literal (`datatype: None`) is, per RDF 1.1,
 /// **identical** to a literal explicitly typed with `xsd:string`. Both must
 /// therefore get the same dictionary key.
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
+
+/// The XSD namespace, for folded-datatype comparisons in [`DatatypeRef`].
+const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
 
 /// Separator between the type prefix and the lexical value in the interned key.
 /// `0x01` does not occur in normal IRIs, datatype IRIs, or language tags; the
@@ -150,23 +268,91 @@ fn decode_value(key: &str) -> &str {
 /// Reconstructs the term type from the prefix of an interned key.
 /// The type is fully encoded in the key (see [`encode_key`]) – a separate
 /// `Vec<TermType>` (48 B/term + its own strings) is thus unnecessary.
+#[inline]
 fn decode_type(key: &str) -> TermType {
-    let bytes = key.as_bytes();
-    match bytes.first() {
-        Some(b'I') => TermType::Iri,
-        Some(b'B') => TermType::BlankNode,
-        Some(b'L') => TermType::literal_plain(),
+    decode_type_ref(key).into_owned()
+}
+
+/// [`decode_type`], but borrowing: the datatype IRI and language tag come back
+/// as `Cow`s into the key (the datatype namespace-unfolds where folded), so
+/// the hot read path never allocates.
+fn decode_type_ref(key: &str) -> TermTypeRef<'_> {
+    match key.as_bytes().first() {
+        Some(b'I') => TermTypeRef::Iri,
+        Some(b'B') => TermTypeRef::BlankNode,
+        Some(b'L') => TermTypeRef::Literal {
+            datatype: None,
+            lang: None,
+        },
         Some(b'G') => {
             // G<lang>\x01<value>  -> language literal
             let sep = key.find(SEP).unwrap_or(key.len());
-            TermType::literal_lang(&key[1..sep])
+            TermTypeRef::Literal {
+                datatype: None,
+                lang: Some(Cow::Borrowed(&key[1..sep])),
+            }
         }
         Some(b'D') => {
-            // D<datatype>\x01<value>  -> typed literal (unfold the datatype)
+            // D<datatype>\x01<value>  -> typed literal. The datatype IRI is
+            // namespace-folded in the key; keep prefix and suffix apart
+            // instead of unfolding (that would allocate per row).
             let sep = key.find(SEP).unwrap_or(key.len());
-            TermType::literal_datatype(unfold_iri(&key[1..sep]).into_owned())
+            TermTypeRef::Literal {
+                datatype: Some(split_datatype(&key[1..sep])),
+                lang: None,
+            }
         }
-        _ => TermType::Iri, // defensive
+        _ => TermTypeRef::Iri, // defensive
+    }
+}
+
+/// Splits a stored datatype IRI into [`DatatypeRef`] pieces: a namespace-
+/// folded IRI (`\x02` + code + suffix) keeps its static prefix, an unfolded
+/// one comes back complete. Zero allocation.
+fn split_datatype(folded: &str) -> DatatypeRef<'_> {
+    let bytes = folded.as_bytes();
+    match bytes.first() {
+        Some(&NS_ESC_BYTE) if folded.len() >= 2 => {
+            let idx = (bytes[1].wrapping_sub(b'A')) as usize;
+            match NS_PREFIXES.get(idx) {
+                Some(&prefix) => DatatypeRef::Folded {
+                    prefix,
+                    rest: Cow::Borrowed(&folded[2..]),
+                },
+                None => DatatypeRef::Full(Cow::Borrowed(folded)),
+            }
+        }
+        _ => DatatypeRef::Full(Cow::Borrowed(folded)),
+    }
+}
+
+/// [`decode_type_ref`], but the language tag and the datatype suffix are
+/// always **owned**. For overlays whose keys do not outlive the call (the
+/// query-local term overlay in `src/sparql.rs`); that path is cold.
+pub fn decode_type_ref_owned(key: &str) -> TermTypeRef<'static> {
+    match key.as_bytes().first() {
+        Some(b'G') => {
+            let sep = key.find(SEP).unwrap_or(key.len());
+            TermTypeRef::Literal {
+                datatype: None,
+                lang: Some(Cow::Owned(key[1..sep].to_string())),
+            }
+        }
+        Some(b'D') => {
+            let sep = key.find(SEP).unwrap_or(key.len());
+            TermTypeRef::Literal {
+                datatype: Some(split_datatype(&key[1..sep]).into_owned_datatype()),
+                lang: None,
+            }
+        }
+        // IRI / blank node / plain literal carry no strings to own.
+        _ => match key.as_bytes().first() {
+            Some(b'L') => TermTypeRef::Literal {
+                datatype: None,
+                lang: None,
+            },
+            _ => TermTypeRef::Iri, // defensive
+        },
     }
 }
 
@@ -356,7 +542,15 @@ impl Dictionary {
     /// Returns the type of a term (reconstructed from the key prefix).
     #[inline]
     pub fn resolve_type(&self, id: u32) -> Option<TermType> {
-        self.raw_key(id).map(decode_type)
+        self.raw_key(id).map(|k| decode_type_ref(k).into_owned())
+    }
+
+    /// [`Dictionary::resolve_type`], but borrowing: the datatype IRI and
+    /// language tag come back as `Cow`s into the mmap'd key, so the hot read
+    /// path (`append_term`, `term_to_fv`, …) allocates nothing.
+    #[inline]
+    pub fn resolve_type_ref(&self, id: u32) -> Option<TermTypeRef<'_>> {
+        self.raw_key(id).map(decode_type_ref)
     }
 
     /// Rough byte estimate of the **owned** RAM (for the memory report). The
@@ -537,6 +731,61 @@ mod tests {
         let id = d.insert_with_type(weird, TermType::literal_plain());
         assert_eq!(d.resolve(id).as_deref(), Some(weird));
         assert_eq!(d.lookup_term(weird, &TermType::literal_plain()), Some(id));
+    }
+
+    /// The borrowed type view agrees with the owned one, and borrows the
+    /// datatype/language tag straight out of the key (only a *folded*
+    /// datatype IRI comes back as an owned `Cow` after unfolding).
+    #[test]
+    fn type_ref_matches_owned_and_borrows() {
+        let mut d = Dictionary::new();
+        let lang = d.insert_with_type("hallo", TermType::literal_lang("de"));
+        let xsd = d.insert_with_type(
+            "25",
+            TermType::literal_datatype("http://www.w3.org/2001/XMLSchema#integer"),
+        );
+        let custom = d.insert_with_type("x", TermType::literal_datatype("http://example.org/c"));
+        let plain = d.insert_with_type("y", TermType::literal_plain());
+        let iri = d.insert("http://example.org/i");
+
+        let owned_of_ref = |id: u32| d.resolve_type_ref(id).map(|t| t.into_owned());
+        for id in [lang, xsd, custom, plain, iri] {
+            assert_eq!(owned_of_ref(id), d.resolve_type(id), "id {id}");
+        }
+        // Language tag borrows.
+        assert!(matches!(
+            d.resolve_type_ref(lang),
+            Some(TermTypeRef::Literal {
+                lang: Some(Cow::Borrowed("de")),
+                ..
+            })
+        ));
+        // Unfolded datatype IRI borrows; the folded XSD one keeps pieces apart.
+        assert!(matches!(
+            d.resolve_type_ref(custom),
+            Some(TermTypeRef::Literal {
+                datatype: Some(DatatypeRef::Full(Cow::Borrowed("http://example.org/c"))),
+                ..
+            })
+        ));
+        assert!(matches!(
+            d.resolve_type_ref(xsd),
+            Some(TermTypeRef::Literal {
+                datatype: Some(DatatypeRef::Folded {
+                    prefix: "http://www.w3.org/2001/XMLSchema#",
+                    rest: Cow::Borrowed("integer")
+                }),
+                ..
+            })
+        ));
+        assert!(matches!(
+            d.resolve_type_ref(plain),
+            Some(TermTypeRef::Literal {
+                datatype: None,
+                lang: None
+            })
+        ));
+        assert!(matches!(d.resolve_type_ref(iri), Some(TermTypeRef::Iri)));
     }
 }
 
