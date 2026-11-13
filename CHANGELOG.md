@@ -49,6 +49,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   wherever it took `.nt`.
 
 ### Changed
+- **The read path no longer re-validates UTF-8 per term** — `MappedDict::key`
+  (`src/hypertrie/dictionary.rs`) ran `str::from_utf8` on every bound term of
+  every result row (`append_term` and `term_to_json` resolve value and type
+  separately, so twice per row), re-proving what `from_mapped` already checks
+  once over the whole keys blob. `from_mapped` now also validates the offset
+  array at load — starts at 0, monotonic, inside the blob, on char boundaries
+  — which is the complete safety proof for the hot path, and `key` converts
+  with `from_utf8_unchecked` (debug builds keep the asserts; a corrupt
+  snapshot is rejected at load with a message instead of degrading term by
+  term to `""`). Measured over 50 rounds × 100k `resolve` + `resolve_type`
+  calls on multi-byte literals (release build): 28.4 → 2.4 ms per round,
+  ~11x on the dictionary read path.
 - **`decode_type` no longer allocates on the read path** — resolving a term's
   type still built the datatype IRI for every `D`-prefixed key and the
   language tag for every `G`-prefixed one, under every `FILTER`, `ORDER BY`,

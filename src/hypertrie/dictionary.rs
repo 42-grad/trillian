@@ -356,6 +356,15 @@ pub fn decode_type_ref_owned(key: &str) -> TermTypeRef<'static> {
     }
 }
 
+/// Whether `i` is a character boundary of a byte slice (`str::is_char_boundary`
+/// exists for `str` only; the offsets array indexes the blob as bytes).
+#[inline]
+fn is_boundary(blob: &[u8], i: usize) -> bool {
+    // A boundary is the end or any byte that does not continue a multi-byte
+    // character (UTF-8 continuation bytes are 0b10xxxxxx, negative as `i8`).
+    i == blob.len() || (i < blob.len() && (blob[i] as i8) >= 0)
+}
+
 /// Read-only dictionary base, **zero-copy from the mmap snapshot**. Holds no
 /// strings in RAM – keys, offsets, and the sorted lookup index live in the
 /// mapped file (kept alive via `Arc<Mmap>`). Mirrors the index's base+delta
@@ -385,14 +394,23 @@ impl MappedDict {
     fn key(&self, id: usize) -> &str {
         let o = self.key_offsets();
         let blob = &self.map[self.keys_off..self.keys_off + self.keys_len];
-        // Checked: the snapshot is attacker-controllable, so a corrupt offset or
-        // non-UTF-8/boundary-splitting slice must NOT cause UB. Fall back to ""
-        // (a corrupt snapshot already failed validation in `from_mapped`; this is
-        // defence in depth on the hot path).
+        // Unchecked on the hot path: `from_mapped` proved at load that the blob
+        // is valid UTF-8 and that every offset is monotonic, inside the blob,
+        // and on a char boundary — re-checking that per bound term of every
+        // result row (measured at ~6% of query time on 100k-row results) is
+        // pure overhead. `raw_key` only calls this for `id < n`, so the offset
+        // array always has the `id` and `id + 1` entries; an out-of-range ID
+        // panics on the index and can never reach a slice. Debug builds
+        // re-check the invariants anyway; release trusts the load-time proof.
+        debug_assert!(o[id] <= o[id + 1]);
         let (lo, hi) = (o[id] as usize, o[id + 1] as usize);
-        blob.get(lo..hi)
-            .and_then(|b| std::str::from_utf8(b).ok())
-            .unwrap_or("")
+        debug_assert!(hi <= blob.len() && lo <= hi);
+        debug_assert!(is_boundary(blob, lo) && is_boundary(blob, hi));
+        debug_assert!(std::str::from_utf8(&blob[lo..hi]).is_ok());
+        // SAFETY: every offset was validated against exactly these invariants
+        // in `from_mapped` (monotonicity, bounds, char boundaries, and the blob
+        // being UTF-8) — see the validation block there.
+        unsafe { std::str::from_utf8_unchecked(&blob[lo..hi]) }
     }
     /// Binary search over the key-sorted IDs. O(log n).
     fn lookup(&self, key: &str) -> Option<u32> {
@@ -662,6 +680,28 @@ impl Dictionary {
         if std::str::from_utf8(&b[keys_off..keys_end]).is_err() {
             return Err("dictionary keys blob is not valid UTF-8".to_string());
         }
+        // Validate the offsets once at load so the per-term hot path
+        // (`MappedDict::key`) can go back to unchecked conversion: they must
+        // start at 0, be monotonic, stay inside the blob (whose length **is**
+        // the last offset), and sit on char boundaries — otherwise slicing a
+        // key could split a multi-byte character. Together with the UTF-8
+        // check above this is the complete safety proof for `key`.
+        let offs: &[u64] = bytemuck::try_cast_slice(&b[offs_off..offs_off + (n + 1) * 8])
+            .map_err(|_| "dictionary offset array is misaligned".to_string())?;
+        let blob = &b[keys_off..keys_end];
+        if offs[0] != 0 {
+            return Err("dictionary key offsets do not start at 0".to_string());
+        }
+        let mut prev = 0u64;
+        for &off in offs {
+            if off < prev || off > blob.len() as u64 {
+                return Err("dictionary key offsets are corrupt".to_string());
+            }
+            if !is_boundary(blob, off as usize) {
+                return Err("dictionary key offset splits a character".to_string());
+            }
+            prev = off;
+        }
         Ok(Dictionary {
             mapped: Some(MappedDict {
                 map: map.clone(),
@@ -786,6 +826,132 @@ mod tests {
             })
         ));
         assert!(matches!(d.resolve_type_ref(iri), Some(TermTypeRef::Iri)));
+    }
+}
+
+#[cfg(test)]
+mod snapshot {
+    use super::*;
+    use memmap2::Mmap;
+    use std::fs::File;
+    use std::io::Write;
+
+    /// Layout of `serialize_into`: `[n:u32][pad][offsets:(n+1)×u64][blob][pad][sorted]`.
+    fn section_parts(buf: &[u8], n: usize) -> (usize, usize, usize) {
+        let offs = 8;
+        let last_off = offs + n * 8;
+        let keys_len = u64::from_le_bytes(buf[last_off..last_off + 8].try_into().unwrap()) as usize;
+        let keys = last_off + 8;
+        (offs, keys, keys_len)
+    }
+
+    /// Serializes `d` into a temp file and maps it read-only (as
+    /// `from_mapped` receives it in production). `tag` keeps parallel tests
+    /// from sharing (and racing on) one path.
+    fn mapped(d: &Dictionary, tag: &str) -> (Mmap, usize) {
+        let mut buf = Vec::new();
+        d.serialize_into(&mut buf);
+        let n = d.len();
+        let path =
+            std::env::temp_dir().join(format!("trillian_dict_test_{}_{tag}", std::process::id()));
+        let mut f = File::create(&path).unwrap();
+        f.write_all(&buf).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+        // SAFETY: mapping a file we just closed after writing; its length is
+        // fixed, so no concurrent truncation can unmap pages under us.
+        (
+            unsafe { Mmap::map(&File::open(&path).unwrap()) }.unwrap(),
+            n,
+        )
+    }
+
+    /// A dictionary with one ASCII and one multi-byte term, ready to map.
+    fn sample() -> Dictionary {
+        let mut d = Dictionary::new();
+        d.insert("http://example.org/a");
+        d.insert_with_type("é", TermType::literal_plain());
+        d
+    }
+
+    /// A valid snapshot loads and resolves both terms intact.
+    #[test]
+    fn mapped_snapshot_roundtrips() {
+        let d = sample();
+        let (map, n) = mapped(&d, "roundtrip");
+        let dict = Dictionary::from_mapped(Arc::new(map), 0).unwrap();
+        assert_eq!(dict.len(), n);
+        assert_eq!(dict.resolve(0).as_deref(), Some("http://example.org/a"));
+        assert_eq!(dict.resolve(1).as_deref(), Some("é"));
+        assert_eq!(dict.lookup_iri("http://example.org/a"), Some(0));
+    }
+
+    /// Corrupting one region must be rejected at load, never yield UB on the
+    /// (now unchecked) hot path: bad UTF-8, non-monotonic / out-of-bounds /
+    /// char-boundary-splitting offsets, and a tail short of the blob end.
+    #[test]
+    fn corrupt_snapshot_is_rejected_at_load() {
+        let d = sample();
+        let mut buf = Vec::new();
+        d.serialize_into(&mut buf);
+        let (offs, keys, keys_len) = section_parts(&buf, d.len());
+        drop(buf);
+        // u64 offset slot `i` in little-endian.
+        let set_off = |buf: &mut [u8], i: usize, v: u64| {
+            let at = offs + i * 8;
+            buf[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        };
+        // The blob contains only ASCII + one 'é' at key 1; putting 0xFF inside
+        // the blob makes it invalid UTF-8.
+        let c_utf8 = |b: &mut [u8]| b[keys] = 0xFF;
+        let c_monotonic = |b: &mut [u8]| {
+            // offsets[1] jumps past offsets[2] -> non-monotonic
+            let at = offs + 2 * 8;
+            let next = u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+            set_off(b, 1, next + 1);
+        };
+        let c_bounds = |b: &mut [u8]| {
+            // offsets[1] beyond the blob end -> out of bounds
+            set_off(b, 1, keys_len as u64 + 1);
+        };
+        let c_split = |b: &mut [u8]| {
+            // key 1 ("L\x01é") occupies blob bytes 22..26, so its 'é' sits at
+            // 24..26 and offset 25 would split it
+            set_off(b, 1, 25);
+        };
+        let c_cover = |b: &mut [u8]| {
+            // offsets[0] pushed forward -> the first key's head is unreachable
+            set_off(b, 0, 5);
+        };
+        type CorruptCase<'a> = (&'a str, &'a dyn Fn(&mut [u8]));
+        let cases: [CorruptCase; 5] = [
+            ("not valid UTF-8", &c_utf8),
+            ("offsets are corrupt", &c_monotonic),
+            ("offsets are corrupt", &c_bounds),
+            ("splits a character", &c_split),
+            ("do not start at 0", &c_cover),
+        ];
+        for (expect, corrupt) in cases {
+            let mut buf = Vec::new();
+            d.serialize_into(&mut buf);
+            corrupt(&mut buf);
+            let path = std::env::temp_dir().join(format!(
+                "trillian_dict_corrupt_{}_{}",
+                std::process::id(),
+                expect.len()
+            ));
+            File::create(&path).unwrap().write_all(&buf).unwrap();
+            // SAFETY: same as in `mapped` — a freshly written, fixed-length file.
+            let map = unsafe { Mmap::map(&File::open(&path).unwrap()) }.unwrap();
+            let err = Dictionary::from_mapped(Arc::new(map), 0).unwrap_err();
+            assert!(
+                err.contains(expect),
+                "expected \"{expect}\" in error, got: {err}"
+            );
+        }
+        // The valid snapshot still loads after all the corruption runs.
+        let (map, _) = mapped(&d, "corrupt-tail");
+        assert!(Dictionary::from_mapped(Arc::new(map), 0).is_ok());
     }
 }
 
