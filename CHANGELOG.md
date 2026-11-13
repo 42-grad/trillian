@@ -16,6 +16,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   lock in the same order as `/update`, so no update can slip between the
   snapshot and the truncation (`src/sparql.rs`, `src/wal.rs`,
   `src/hypertrie/query.rs`; `serve_durable_at` carries the snapshot path).
+- **`FILTER EXISTS` / `NOT EXISTS`** — the sub-pattern is evaluated with the
+  row's bindings substituted in (variables bound in the row become terms,
+  unbound ones stay free), over BGP, property paths, `FILTER`, `Join`,
+  `UNION` and `OPTIONAL` (`src/sparql.rs`). Works in a top-level `FILTER` and
+  inside an `OPTIONAL`'s filter alike. Constructs substitution cannot safely
+  enter (`MINUS`, `GROUP BY`, sub-`SELECT`, `BIND`, `VALUES`, federated
+  patterns) are refused up front with a message instead of every `EXISTS`
+  silently reading as false.
+- **`COALESCE`** — takes the first argument that does not error, an error only
+  when all do (`src/sparql.rs`).
+- **The previously unimplemented built-ins**: `SUBSTR` (XPath rounding
+  semantics), `CONCAT`, `REPLACE` (with `$1` capture references and the
+  `REGEX` flags), `ABS`/`CEIL`/`FLOOR`/`ROUND`, the date accessors
+  `YEAR`/`MONTH`/`DAY`/`HOURS`/`MINUTES`/`SECONDS` over `xsd:dateTime` and
+  `xsd:date` lexical forms (timezone validated, not applied), and the hash
+  functions `MD5`/`SHA1`/`SHA256`/`SHA384`/`SHA512` as hex digests
+  (`src/sparql.rs`; new dependencies `sha1`, `sha2`, `md-5`, `digest`).
 - **`MINUS`** — subtracts from the left solutions every one a right-hand
   pattern is compatible with (`src/sparql.rs`): agreeing on every variable both
   sides bind, *and* binding at least one in common. That second half is what
@@ -58,6 +75,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   wherever it took `.nt`.
 
 ### Changed
+- **The read path no longer re-validates UTF-8 per term** — `MappedDict::key`
+  (`src/hypertrie/dictionary.rs`) ran `str::from_utf8` on every bound term of
+  every result row (`append_term` and `term_to_json` resolve value and type
+  separately, so twice per row), re-proving what `from_mapped` already checks
+  once over the whole keys blob. `from_mapped` now also validates the offset
+  array at load — starts at 0, monotonic, inside the blob, on char boundaries
+  — which is the complete safety proof for the hot path, and `key` converts
+  with `from_utf8_unchecked` (debug builds keep the asserts; a corrupt
+  snapshot is rejected at load with a message instead of degrading term by
+  term to `""`). Measured over 50 rounds × 100k `resolve` + `resolve_type`
+  calls on multi-byte literals (release build): 28.4 → 2.4 ms per round,
+  ~11x on the dictionary read path.
+- **`decode_type` no longer allocates on the read path** — resolving a term's
+  type still built the datatype IRI for every `D`-prefixed key and the
+  language tag for every `G`-prefixed one, under every `FILTER`, `ORDER BY`,
+  `BIND` and aggregate (`src/hypertrie/dictionary.rs`). The hot paths now go
+  through a borrowed `TermTypeRef<'_>`: the language tag and an unfolded
+  datatype IRI borrow straight out of the key, and a **namespace-folded**
+  datatype (`xsd:*`, Wikidata) stays a static prefix + borrowed suffix in a
+  new `DatatypeRef`, so `classify` compares in folded space and the JSON
+  writer appends in pieces — both zero-alloc (`src/sparql.rs`). `TermType`
+  (owned) remains for parsing, WAL and other cold paths. Measured over
+  50 rounds × 200k typed-literal (`xsd:integer`) `resolve_type` calls
+  (release build): 20.4 → 9.1 ms per round, 2.2x on the type resolution.
 - **RDFS inference follows the whole schema** (`src/inference.rs`). Each rule's
   schema lookup is one property path (`rdfs:subClassOf+`,
   `rdfs:subPropertyOf+`, `rdfs:subPropertyOf*/rdfs:domain|rdfs:range/rdfs:subClassOf*`),
@@ -99,6 +140,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   forms test the same datatype IRI.
 
 ### Fixed
+- **An empty group pattern is the join identity** (`src/sparql.rs`). `eval_bgp`
+  forwarded `{ }` to the engine, whose plan is empty for it and yields **zero**
+  rows; the algebra says it is *one empty solution*. The wrong shape made
+  `OPTIONAL { OPTIONAL { … } }` silently unbind every row (the inner
+  `LeftJoin`'s left side never matched) and `{ } ?s ?p ?o` return nothing.
+  Nested and chained `OPTIONAL`s now bind through the empty group.
+- **N-Triples output escapes control and forbidden IRI characters**
+  (`src/hypertrie/export.rs`). `escape_literal` wrote every control character
+  except `\b`/`\f`/`\n`/`\r`/`\t` raw — invalid N-Triples — and IRIs were
+  emitted unescaped. Both now use `\uXXXX`/`\UXXXXXXXX` for the characters
+  N-Triples forbids raw (all of `#x00-#x20` in literals, plus `#x7F`; the
+  `IRIREF` set `< > " { } | ^ `` ` `` \` and `#x00-#x20` in IRIs), and
+  `parse_iri` decodes the escapes again, so export → import round-trips.
 - **`rdfs:range` inference read the wrong triple position**
   (`src/inference.rs`). rdfs3 types the *object* of a data triple, but the
   rewrite looked for `?s ?p ?c` with `?c` the queried class, so it never

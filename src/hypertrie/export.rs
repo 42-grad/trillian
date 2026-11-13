@@ -130,7 +130,14 @@ fn parse_blank_node(s: &str) -> Option<(ParsedTerm, &str)> {
 
 fn parse_iri(s: &str) -> Option<(ParsedTerm, &str)> {
     let end = s.find('>')?;
-    let iri = s[1..end].to_string();
+    let raw = &s[1..end];
+    // `\u`/`\U` escapes are legal inside an IRIREF; decode them so a
+    // serialized IRI round-trips.
+    let iri = if raw.contains('\\') {
+        unescape_iri(raw)?
+    } else {
+        raw.to_string()
+    };
     Some((
         ParsedTerm {
             value: iri,
@@ -138,6 +145,24 @@ fn parse_iri(s: &str) -> Option<(ParsedTerm, &str)> {
         },
         &s[end + 1..],
     ))
+}
+
+/// Resolves `\uXXXX` / `\UXXXXXXXX` escapes in an IRIREF.
+fn unescape_iri(raw: &str) -> Option<String> {
+    let mut out = String::with_capacity(raw.len());
+    let mut it = raw.char_indices();
+    while let Some((_, c)) = it.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match it.next()?.1 {
+            'u' => out.push(take_hex(&mut it, 4)?),
+            'U' => out.push(take_hex(&mut it, 8)?),
+            _ => return None,
+        }
+    }
+    Some(out)
 }
 
 fn parse_literal(s: &str) -> Option<(ParsedTerm, &str)> {
@@ -220,7 +245,7 @@ fn take_hex(it: &mut std::str::CharIndices, n: usize) -> Option<char> {
 /// identity (up to whitespace).
 pub fn serialize_term(value: &str, typ: &TermType) -> String {
     match typ {
-        TermType::Iri => format!("<{}>", value),
+        TermType::Iri => format!("<{}>", escape_iri(value)),
         TermType::BlankNode => format!("_:{}", value),
         TermType::Literal { datatype, lang } => {
             let escaped = escape_literal(value);
@@ -236,6 +261,8 @@ pub fn serialize_term(value: &str, typ: &TermType) -> String {
 }
 
 /// Escapes the special characters of a literal lexical form for N-Triples.
+/// Everything below `0x20` is escaped (the named escapes where one exists),
+/// and so is `0x7F`; a raw control character would make the output invalid.
 fn escape_literal(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -247,10 +274,40 @@ fn escape_literal(s: &str) -> String {
             '\t' => out.push_str("\\t"),
             '\u{8}' => out.push_str("\\b"),
             '\u{c}' => out.push_str("\\f"),
-            _ => out.push(c),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => push_uescape(&mut out, c),
+            c => out.push(c),
         }
     }
     out
+}
+
+/// Escapes the characters N-Triples forbids raw inside an `IRIREF`
+/// (`#x00-#x20`, `<`, `>`, `"`, `{`, `}`, `|`, `^`, `` ` ``, `\`) as `\u`/`\U`
+/// escapes, so an IRI that arrived through a lenient ingest still serializes to
+/// valid N-Triples.
+fn escape_iri(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            c if (c as u32) <= 0x20
+                || matches!(c, '<' | '>' | '"' | '{' | '}' | '|' | '^' | '`' | '\\') =>
+            {
+                push_uescape(&mut out, c);
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Appends `\uXXXX` (BMP) or `\UXXXXXXXX` (astral) for one character.
+fn push_uescape(out: &mut String, c: char) {
+    let code = c as u32;
+    if code <= 0xffff {
+        out.push_str(&format!("\\u{code:04X}"));
+    } else {
+        out.push_str(&format!("\\U{code:08X}"));
+    }
 }
 
 #[cfg(test)]
@@ -356,6 +413,44 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(back.object.value, t.object.value);
+    }
+
+    /// Control characters beyond the named escapes must be written as `\u`
+    /// escapes: raw they would make the N-Triples output invalid.
+    #[test]
+    fn control_characters_are_escaped_in_literals() {
+        let value = "a\u{0}b\u{1}c\u{b}d\u{1f}e\u{7f}f";
+        let out = serialize_term(value, &TermType::literal_plain());
+        assert!(
+            out.contains("\\u0000")
+                && out.contains("\\u0001")
+                && out.contains("\\u000B")
+                && out.contains("\\u001F")
+                && out.contains("\\u007F"),
+            "control characters not escaped: {out}"
+        );
+        let back = parse_triple_line(&format!(
+            "<http://example.org/s> <http://example.org/p> {out} ."
+        ))
+        .unwrap();
+        assert_eq!(back.object.value, value);
+    }
+
+    /// IRI characters N-Triples forbids raw are escaped and decoded back.
+    #[test]
+    fn forbidden_iri_characters_are_escaped_and_parse_back() {
+        let value = "http://example.org/a b<c>\"d{e}f|g^h`i\\j";
+        let out = serialize_term(value, &TermType::Iri);
+        assert!(
+            out.contains("\\u0020") && out.contains("\\u003C") && out.contains("\\u005C"),
+            "IRI characters not escaped: {out}"
+        );
+        assert!(!out.contains(' '), "raw space left in IRI: {out}");
+        let back = parse_triple_line(&format!(
+            "<http://example.org/s> <http://example.org/p> {out} ."
+        ))
+        .unwrap();
+        assert_eq!(back.object.value, value);
     }
 
     #[test]
