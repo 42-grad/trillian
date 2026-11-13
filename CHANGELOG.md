@@ -90,6 +90,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   forms test the same datatype IRI.
 
 ### Fixed
+- **An empty group pattern is the join identity** (`src/sparql.rs`). `eval_bgp`
+  forwarded `{ }` to the engine, whose plan is empty for it and yields **zero**
+  rows; the algebra says it is *one empty solution*. The wrong shape made
+  `OPTIONAL { OPTIONAL { … } }` silently unbind every row (the inner
+  `LeftJoin`'s left side never matched) and `{ } ?s ?p ?o` return nothing.
+  Nested and chained `OPTIONAL`s now bind through the empty group.
 - **`rdfs:range` inference read the wrong triple position**
   (`src/inference.rs`). rdfs3 types the *object* of a data triple, but the
   rewrite looked for `?s ?p ?c` with `?c` the queried class, so it never

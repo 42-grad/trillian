@@ -10,7 +10,6 @@ open an issue first to agree on the approach (see [CONTRIBUTING.md](CONTRIBUTING
   named by `unsupported_in_expr` and rejected today, in a top-level `FILTER`
   and inside an `OPTIONAL` alike. `EXISTS` needs the filter evaluator to reach
   `eval_where`; the functions are additions to `eval_func`.
-- Nested/multiple `OPTIONAL` patterns.
 - Remaining `?infer=rdfs` gaps: a property path in the query is not rewritten,
   so `?s rdf:type/rdfs:subClassOf* ?c` sees asserted triples only; a predicate
   that is a sub-property of `rdf:type` does not fire the type rules; each
