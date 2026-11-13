@@ -85,6 +85,11 @@ are streamed directly to SPARQL-JSON. The HTTP server (`axum`) exposes
 - **WAL** — `INSERT DATA`/`DELETE DATA` updates are appended to a write-ahead
   log and `fsync`'d, then replayed on top of the snapshot at startup, so durable
   updates survive a restart without rewriting the whole snapshot.
+- **Checkpoint** — `POST /checkpoint` writes the current state atomically over
+  the snapshot (`<path>.tmp` + fsync + rename), empties the WAL, and re-maps the
+  new snapshot, so the log does not grow without bound. A crash between the
+  rename and the truncation is harmless: replaying the old records onto the new
+  snapshot is idempotent.
 
 ## Source map
 

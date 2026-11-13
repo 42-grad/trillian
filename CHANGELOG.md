@@ -7,6 +7,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **`POST /checkpoint`** — folds the write-ahead log into a fresh snapshot and
+  empties it, so the log no longer grows without bound. The snapshot is written
+  atomically (`<path>.tmp` + fsync + rename), the store then re-maps it and
+  drops the checkpointed overlay. A crash between the rename and the truncation
+  is harmless: replaying the old records onto the new snapshot is idempotent
+  (inserts, deletes and terms are all set operations). Holds the store's write
+  lock in the same order as `/update`, so no update can slip between the
+  snapshot and the truncation (`src/sparql.rs`, `src/wal.rs`,
+  `src/hypertrie/query.rs`; `serve_durable_at` carries the snapshot path).
 - **`MINUS`** — subtracts from the left solutions every one a right-hand
   pattern is compatible with (`src/sparql.rs`): agreeing on every variable both
   sides bind, *and* binding at least one in common. That second half is what

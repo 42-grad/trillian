@@ -44,7 +44,6 @@ open an issue first to agree on the approach (see [CONTRIBUTING.md](CONTRIBUTING
   attributes 3-6 percentage points to this check.
 - Derive `pred_subjects` on demand from the index (the last predicate-keyed list
   still held in owned RAM), or back it by a `BTreeSet` for O(log n) deletes.
-- WAL checkpointing / snapshot rotation.
 - A structure-sharing index (sharing common subtrees across the three
   permutations) to cut the dominant index footprint — a larger undertaking.
 

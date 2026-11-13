@@ -473,6 +473,19 @@ impl TripleStore {
         std::fs::write(path, buf)
     }
 
+    /// [`TripleStore::save_snapshot`], but atomic and durable: the snapshot is
+    /// written to `<path>.tmp`, forced to disk, then renamed into place, so a
+    /// crash never leaves a half-written snapshot at `path`.
+    pub fn save_snapshot_atomic(&mut self, path: &str) -> std::io::Result<()> {
+        let tmp = format!("{path}.tmp");
+        self.save_snapshot(&tmp)?;
+        {
+            let file = std::fs::OpenOptions::new().write(true).open(&tmp)?;
+            file.sync_all()?;
+        }
+        std::fs::rename(&tmp, path)
+    }
+
     /// Loads a snapshot via `mmap`: the index arrays are mapped **zero-copy**
     /// into the file, the dictionary is read through the mmap base; statistics
     /// and predicate lists are derived.
