@@ -36,6 +36,9 @@ pub struct AppState {
     /// Optional write-ahead log. If set, updates are logged durably
     /// (append + fsync) so they survive a restart.
     pub wal: Option<Mutex<crate::wal::Wal>>,
+    /// Path of the running snapshot, when there is one. Enables
+    /// `POST /checkpoint` (fold the WAL into a fresh snapshot).
+    snapshot: Option<std::path::PathBuf>,
 }
 
 impl AppState {
@@ -51,7 +54,57 @@ impl AppState {
                 std::num::NonZeroUsize::new(DEFAULT_CACHE_SIZE).unwrap(),
             )),
             wal: wal.map(Mutex::new),
+            snapshot: None,
         }
+    }
+
+    /// Records where the running snapshot lives, so `POST /checkpoint` can
+    /// rewrite it.
+    pub fn with_snapshot_path(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.snapshot = Some(path.into());
+        self
+    }
+
+    /// Folds the write-ahead log into a fresh snapshot and empties it: writes
+    /// the current state atomically over the snapshot path, truncates the log,
+    /// and reloads the store so the checkpointed overlay is released. Holds the
+    /// store's write lock throughout (same order as [`update_handler`]: store,
+    /// then WAL), so no update can slip in between the snapshot and the
+    /// truncation. Returns the number of triples checkpointed.
+    pub fn checkpoint(&self) -> Result<usize, String> {
+        let Some(path) = &self.snapshot else {
+            return Err(
+                "checkpointing needs a snapshot path (start the server via `load`, not `build`)"
+                    .to_string(),
+            );
+        };
+        let path = path.to_string_lossy().to_string();
+        let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
+        let mut wal = self
+            .wal
+            .as_ref()
+            .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
+        store
+            .save_snapshot_atomic(&path)
+            .map_err(|e| format!("writing the snapshot failed: {e}"))?;
+        let triples = store.triple_count();
+        if let Some(w) = wal.as_deref_mut() {
+            w.truncate()
+                .map_err(|e| format!("emptying the WAL failed: {e}"))?;
+        }
+        // Re-map the fresh snapshot and drop the (now checkpointed) overlay.
+        match TripleStore::load_snapshot(&path) {
+            Ok(fresh) => *store = fresh,
+            Err(e) => {
+                return Err(format!(
+                    "snapshot written and WAL emptied, but reloading it failed: {e}"
+                ));
+            }
+        }
+        drop(wal);
+        drop(store);
+        self.clear_cache();
+        Ok(triples)
     }
 
     fn clear_cache(&self) {
@@ -81,13 +134,28 @@ fn max_body_bytes() -> usize {
 
 /// Like [`serve`], but with an optional write-ahead log for durable updates.
 pub async fn serve_durable(store: TripleStore, port: u16, wal: Option<crate::wal::Wal>) {
-    let state = Arc::new(AppState::with_wal(store, wal));
+    serve_durable_at(store, port, wal, None).await
+}
+
+/// [`serve_durable`], with the snapshot path that enables `POST /checkpoint`.
+pub async fn serve_durable_at(
+    store: TripleStore,
+    port: u16,
+    wal: Option<crate::wal::Wal>,
+    snapshot: Option<std::path::PathBuf>,
+) {
+    let mut state = AppState::with_wal(store, wal);
+    if let Some(path) = snapshot {
+        state = state.with_snapshot_path(path);
+    }
+    let state = Arc::new(state);
 
     let app = Router::new()
         .route("/sparql", get(sparql_handler).post(sparql_handler))
         .route("/stream", get(stream_handler).post(stream_handler))
         .route("/count", get(count_handler).post(count_handler))
         .route("/update", post(update_handler))
+        .route("/checkpoint", post(checkpoint_handler))
         // Cap request bodies so a giant POST can't exhaust memory.
         .layer(DefaultBodyLimit::max(max_body_bytes()))
         .with_state(state);
@@ -97,7 +165,7 @@ pub async fn serve_durable(store: TripleStore, port: u16, wal: Option<crate::wal
         .await
         .unwrap_or_else(|e| panic!("could not bind to {addr}: {e}"));
     println!(
-        "SPARQL endpoint listening on http://{}/sparql, /stream, /count, /update",
+        "SPARQL endpoint listening on http://{}/sparql, /stream, /count, /update, /checkpoint",
         addr
     );
     axum::serve(listener, app)
@@ -306,6 +374,20 @@ pub async fn update_handler(
             (StatusCode::OK, axum::Json(json!({ "status": "ok" }))).into_response()
         }
         Err(e) => sparql_error(&e, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// `POST /checkpoint` — folds the write-ahead log into a fresh snapshot and
+/// empties it. Idempotent; safe to call periodically so the log does not grow
+/// without bound.
+pub async fn checkpoint_handler(State(state): State<Arc<AppState>>) -> Response {
+    match state.checkpoint() {
+        Ok(triples) => (
+            StatusCode::OK,
+            axum::Json(json!({ "status": "ok", "checkpointed_triples": triples })),
+        )
+            .into_response(),
+        Err(e) => sparql_error(&e, StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
@@ -4236,6 +4318,68 @@ mod tests {
         assert_eq!(q("(?v / 0) > 0 || ?v = 5"), 1, "error || true -> true");
         assert_eq!(q("?v = 99 || (?v / 0) > 0"), 0, "false || error -> error");
         assert_eq!(q("?v = 99 && (?v / 0) > 0"), 0, "false && error -> false");
+    }
+
+    /// A checkpoint folds the WAL into a fresh snapshot, empties the log, and
+    /// the reloaded store answers from the new snapshot.
+    #[test]
+    fn checkpoint_folds_the_wal_into_the_snapshot() {
+        let snap = std::env::temp_dir()
+            .join(format!(
+                "trillian_ckpt_{}_{:p}.bin",
+                std::process::id(),
+                &0u8
+            ))
+            .to_string_lossy()
+            .into_owned();
+        let wal_path = format!("{snap}.wal");
+        let _ = std::fs::remove_file(&snap);
+        let _ = std::fs::remove_file(&wal_path);
+
+        // Baseline snapshot with one triple.
+        let mut base = TripleStore::new();
+        execute_update(
+            &mut base,
+            "INSERT DATA { <http://ex/a> <http://ex/p> <http://ex/b> }",
+            None,
+        )
+        .unwrap();
+        base.save_snapshot(&snap).unwrap();
+        drop(base);
+
+        // Load it; a second update goes through the WAL.
+        let store = TripleStore::load_snapshot(&snap).unwrap();
+        let wal = Wal::open_append(&wal_path).unwrap();
+        let state = AppState::with_wal(store, Some(wal)).with_snapshot_path(snap.clone());
+        {
+            let mut store = state.store.write().unwrap();
+            let mut wal = state.wal.as_ref().unwrap().lock().unwrap();
+            execute_update(
+                &mut store,
+                "INSERT DATA { <http://ex/a> <http://ex/q> <http://ex/c> }",
+                Some(&mut wal),
+            )
+            .unwrap();
+            wal.sync().unwrap();
+        }
+
+        assert_eq!(state.checkpoint().unwrap(), 2);
+
+        // The log is empty, the snapshot holds both triples, and the running
+        // store answers from the checkpointed state.
+        let mut replayed = TripleStore::new();
+        assert_eq!(Wal::replay(&wal_path, &mut replayed).unwrap().applied, 0);
+        let reloaded = TripleStore::load_snapshot(&snap).unwrap();
+        assert_eq!(reloaded.triple_count(), 2);
+        let rows = rows_of(
+            &state.store.read().unwrap(),
+            "SELECT ?o WHERE { <http://ex/a> <http://ex/q> ?o }",
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["o"]["value"], "http://ex/c");
+
+        let _ = std::fs::remove_file(&snap);
+        let _ = std::fs::remove_file(&wal_path);
     }
 
     #[test]
