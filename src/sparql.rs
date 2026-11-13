@@ -1477,6 +1477,16 @@ fn eval_bgp(
     engine: &HybridEngine,
     limit: Option<usize>,
 ) -> Result<(RowBlock, Vec<String>), String> {
+    if patterns.is_empty() {
+        // An empty group pattern (`{}`) is the join identity: exactly one
+        // (empty) solution — not "no solutions". The engine's plan is empty
+        // for it and yields zero rows, which would make patterns like
+        // `OPTIONAL { OPTIONAL { … } }` never bind (and `{ } { ?s ?p ?o }`
+        // return nothing).
+        let mut one = RowBlock::new(0);
+        one.push_row(&[]);
+        return Ok((one, Vec::new()));
+    }
     match translate_bgp(patterns, &store.dict)? {
         Some(internal) => {
             let vo: Vec<String> = internal.variable_order().into_iter().cloned().collect();

@@ -5,7 +5,6 @@ open an issue first to agree on the approach (see [CONTRIBUTING.md](CONTRIBUTING
 
 ## SPARQL features
 
-- Nested/multiple `OPTIONAL` patterns.
 - Remaining `?infer=rdfs` gaps: a property path in the query is not rewritten,
   so `?s rdf:type/rdfs:subClassOf* ?c` sees asserted triples only; a predicate
   that is a sub-property of `rdf:type` does not fire the type rules; each

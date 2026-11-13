@@ -167,6 +167,56 @@ fn select_optional_keeps_unmatched_rows() {
     assert_eq!(with_age, 1);
 }
 
+/// Multiple `OPTIONAL`s chain in order: the second one sees the bindings the
+/// first left (or did not), and neither drops a left row.
+#[test]
+fn multiple_optionals_chain() {
+    let store = social_store();
+    let engine = HybridEngine::new();
+    let q = format!(
+        "\
+         SELECT ?a ?c ?age WHERE {{ ?a <{EX}knows> ?b \
+         OPTIONAL {{ ?b <{EX}knows> ?c }} \
+         OPTIONAL {{ ?c <{EX}age> ?age }} }}"
+    );
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
+    // All three knows-edges; ?c binds for every row, ?age only where the
+    // optional-bound ?c (= bob) has an age.
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|r| r.get("c").is_some()));
+    let with_age = rows.iter().filter(|r| r.get("age").is_some()).count();
+    assert_eq!(with_age, 1);
+}
+
+/// `OPTIONAL { OPTIONAL { … } }`: the inner group's left side is the empty
+/// pattern, which is the join identity (one empty solution), so the optional
+/// still binds — it used to yield nothing and silently unbind every row.
+#[test]
+fn nested_optional_binds_through_the_empty_group() {
+    let store = social_store();
+    let engine = HybridEngine::new();
+    let q = format!(
+        "SELECT ?a ?x WHERE {{ ?a <{EX}knows> ?b OPTIONAL {{ OPTIONAL {{ ?b <{EX}age> ?x }} }} }}"
+    );
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
+    assert_eq!(rows.len(), 3);
+    let with_age = rows.iter().filter(|r| r.get("x").is_some()).count();
+    assert_eq!(with_age, 1, "the inner OPTIONAL binds where the age exists");
+}
+
+/// An empty group pattern is one empty solution, not zero: `{ } pattern` is
+/// just `pattern`, and `WHERE { }` alone has exactly one (all-unbound) row.
+#[test]
+fn empty_group_pattern_is_the_join_identity() {
+    let store = social_store();
+    let engine = HybridEngine::new();
+    let q = format!("SELECT ?a WHERE {{ {{ }} ?a <{EX}knows> ?b }}");
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
+    assert_eq!(rows.len(), 3);
+    let rows = bindings(&execute_sparql(&store, &engine, "SELECT * WHERE { }").unwrap());
+    assert_eq!(rows.len(), 1);
+}
+
 /// Two people with an age, so an inner FILTER can accept one and reject the
 /// other. The rejected row must survive with ?age unbound.
 fn optional_filter_store() -> TripleStore {
