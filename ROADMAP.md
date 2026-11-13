@@ -48,10 +48,6 @@ open an issue first to agree on the approach (see [CONTRIBUTING.md](CONTRIBUTING
 - A structure-sharing index (sharing common subtrees across the three
   permutations) to cut the dominant index footprint — a larger undertaking.
 
-## Data model & I/O
-
-- Quoted/escaped literal coverage beyond the current benchmark needs.
-
 ## Tooling
 
 - A fixed performance suite (large-result queries) as a regression guard in CI.
