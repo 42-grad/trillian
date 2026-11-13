@@ -2649,15 +2649,15 @@ fn substitute_bindings(
             return Ok(t.clone()); // unbound stays free
         }
         let value = ctx.resolve(id).ok_or(())?;
-        let typ = ctx.resolve_type(id).ok_or(())?;
+        let typ = ctx.resolve_type_ref(id).ok_or(())?;
         let term = match typ {
-            TermType::Iri => spargebra::term::TermPattern::NamedNode(
+            TermTypeRef::Iri => spargebra::term::TermPattern::NamedNode(
                 spargebra::term::NamedNode::new_unchecked(value.as_ref()),
             ),
-            TermType::BlankNode => spargebra::term::TermPattern::BlankNode(
+            TermTypeRef::BlankNode => spargebra::term::TermPattern::BlankNode(
                 spargebra::term::BlankNode::new_unchecked(value.as_ref()),
             ),
-            TermType::Literal { datatype, lang } => {
+            TermTypeRef::Literal { datatype, lang } => {
                 let l = match (lang.as_deref(), datatype) {
                     // Language tags and datatypes from the dictionary are
                     // well-formed, so construction is unchecked.
@@ -2669,7 +2669,7 @@ fn substitute_bindings(
                     }
                     (None, Some(dt)) => spargebra::term::Literal::new_typed_literal(
                         value.as_ref(),
-                        spargebra::term::NamedNode::new_unchecked(&dt),
+                        spargebra::term::NamedNode::new_unchecked(dt.unfolded().as_ref()),
                     ),
                     (None, None) => spargebra::term::Literal::new_simple_literal(value.as_ref()),
                 };
