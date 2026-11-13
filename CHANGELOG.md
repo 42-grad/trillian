@@ -61,6 +61,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   term to `""`). Measured over 50 rounds × 100k `resolve` + `resolve_type`
   calls on multi-byte literals (release build): 28.4 → 2.4 ms per round,
   ~11x on the dictionary read path.
+- **`decode_type` no longer allocates on the read path** — resolving a term's
+  type still built the datatype IRI for every `D`-prefixed key and the
+  language tag for every `G`-prefixed one, under every `FILTER`, `ORDER BY`,
+  `BIND` and aggregate (`src/hypertrie/dictionary.rs`). The hot paths now go
+  through a borrowed `TermTypeRef<'_>`: the language tag and an unfolded
+  datatype IRI borrow straight out of the key, and a **namespace-folded**
+  datatype (`xsd:*`, Wikidata) stays a static prefix + borrowed suffix in a
+  new `DatatypeRef`, so `classify` compares in folded space and the JSON
+  writer appends in pieces — both zero-alloc (`src/sparql.rs`). `TermType`
+  (owned) remains for parsing, WAL and other cold paths. Measured over
+  50 rounds × 200k typed-literal (`xsd:integer`) `resolve_type` calls
+  (release build): 20.4 → 9.1 ms per round, 2.2x on the type resolution.
 - **RDFS inference follows the whole schema** (`src/inference.rs`). Each rule's
   schema lookup is one property path (`rdfs:subClassOf+`,
   `rdfs:subPropertyOf+`, `rdfs:subPropertyOf*/rdfs:domain|rdfs:range/rdfs:subClassOf*`),
