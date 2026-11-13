@@ -1,6 +1,6 @@
 [package]
 name = "trillian"
-version = "0.2.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.87"
 # Not published to crates.io yet; flip to allow `cargo publish` when ready.
@@ -27,6 +27,11 @@ tokio-stream = "0.1"
 memmap2 = "0.9"
 bytemuck = "1"
 string-interner = "0.20"
+regex = "1"
+sha1 = "0.10"
+sha2 = "0.10"
+md-5 = "0.10"
+digest = "0.10"
 dhat = { version = "0.3", optional = true }
 
 [dev-dependencies]

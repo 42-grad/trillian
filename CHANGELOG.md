@@ -6,6 +6,272 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-13
+
+### Added
+- **`POST /checkpoint`** — folds the write-ahead log into a fresh snapshot and
+  empties it, so the log no longer grows without bound. The snapshot is written
+  atomically (`<path>.tmp` + fsync + rename), the store then re-maps it and
+  drops the checkpointed overlay. A crash between the rename and the truncation
+  is harmless: replaying the old records onto the new snapshot is idempotent
+  (inserts, deletes and terms are all set operations). Holds the store's write
+  lock in the same order as `/update`, so no update can slip between the
+  snapshot and the truncation (`src/sparql.rs`, `src/wal.rs`,
+  `src/hypertrie/query.rs`; `serve_durable_at` carries the snapshot path).
+- **`FILTER EXISTS` / `NOT EXISTS`** — the sub-pattern is evaluated with the
+  row's bindings substituted in (variables bound in the row become terms,
+  unbound ones stay free), over BGP, property paths, `FILTER`, `Join`,
+  `UNION` and `OPTIONAL` (`src/sparql.rs`). Works in a top-level `FILTER` and
+  inside an `OPTIONAL`'s filter alike. Constructs substitution cannot safely
+  enter (`MINUS`, `GROUP BY`, sub-`SELECT`, `BIND`, `VALUES`, federated
+  patterns) are refused up front with a message instead of every `EXISTS`
+  silently reading as false.
+- **`COALESCE`** — takes the first argument that does not error, an error only
+  when all do (`src/sparql.rs`).
+- **The previously unimplemented built-ins**: `SUBSTR` (XPath rounding
+  semantics), `CONCAT`, `REPLACE` (with `$1` capture references and the
+  `REGEX` flags), `ABS`/`CEIL`/`FLOOR`/`ROUND`, the date accessors
+  `YEAR`/`MONTH`/`DAY`/`HOURS`/`MINUTES`/`SECONDS` over `xsd:dateTime` and
+  `xsd:date` lexical forms (timezone validated, not applied), and the hash
+  functions `MD5`/`SHA1`/`SHA256`/`SHA384`/`SHA512` as hex digests
+  (`src/sparql.rs`; new dependencies `sha1`, `sha2`, `md-5`, `digest`).
+- **`MINUS`** — subtracts from the left solutions every one a right-hand
+  pattern is compatible with (`src/sparql.rs`): agreeing on every variable both
+  sides bind, *and* binding at least one in common. That second half is what
+  separates it from `FILTER NOT EXISTS` — a right side sharing no variable with
+  the left removes nothing, however well it matches. Binds nothing itself and
+  works under `?infer=rdfs`.
+- **`VALUES`** — an inline table of solutions, one or several variables wide,
+  as a group element or trailing the `WHERE` clause (`src/sparql.rs`). Rows
+  carry term IDs, so a term the graph lacks takes a query-local one and a
+  standalone table hands it back verbatim. `UNDEF` leaves a cell unbound,
+  which the join now reads as a wildcard — see below.
+- **Sub-`SELECT`** — a nested `SELECT` inside the `WHERE` clause
+  (`src/sparql.rs`), with its own `DISTINCT`, `ORDER BY`, `LIMIT`/`OFFSET` and
+  `GROUP BY`, joined against the enclosing pattern and nestable.
+  Variables the sub-`SELECT` does not project are out of scope outside it, so
+  the enclosing pattern may reuse those names. This closes the gap that made
+  aggregates hard to use: an aggregate computed in the inner query can now be
+  filtered and joined back against the graph
+  (`{ SELECT ?s (COUNT(*) AS ?c) WHERE { ?s :knows ?o } GROUP BY ?s }
+  FILTER(?c > 1) . ?s rdfs:label ?label`). A sub-`SELECT` works under
+  `?infer=rdfs` too.
+- **The remaining `GROUP BY` aggregates** — `COUNT(?x)`, `SUM`, `AVG`, `MIN`,
+  `MAX`, `SAMPLE` and `GROUP_CONCAT` (with `SEPARATOR`), each accepting
+  `DISTINCT` (`src/sparql.rs`); the "not supported" error from 0.3.0 is gone.
+  `MIN`/`MAX`/`SAMPLE` return the stored term and keep its datatype,
+  `GROUP_CONCAT` yields a plain string, and `SUM`/`AVG` compute a number so
+  they yield `xsd:double`. Over an empty group `SUM`/`AVG` are `0`
+  (an `xsd:integer`, as SPARQL 1.1 defines) and `GROUP_CONCAT` is `""`, while
+  `MIN`/`MAX`/`SAMPLE` are unbound.
+- **Expression arguments for `SUM`/`AVG`** — `SUM(?v + 1)`. The others still
+  need a bare variable, which is what lets them return the source term.
+- **Turtle (`.ttl`) input** (`src/hypertrie/turtle.rs`) — RDF 1.1 Turtle minus
+  RDF-star: prefixes and `@base` (both the `@` and SPARQL-style forms), `a`,
+  `;`/`,` lists, blank-node property lists, collections (expanded to an
+  `rdf:first`/`rdf:rest` chain), all four quote forms, and comments. The
+  numeric and boolean shorthands are typed by their shape, so a bare `30`
+  filters numerically. Parse errors carry a line number.
+- `TripleStore::ingest_turtle_file`, plus `ingest_rdf_file`, which picks the
+  parser from the extension. The `server` binary now takes either format
+  wherever it took `.nt`.
+
+### Changed
+- **The read path no longer re-validates UTF-8 per term** — `MappedDict::key`
+  (`src/hypertrie/dictionary.rs`) ran `str::from_utf8` on every bound term of
+  every result row (`append_term` and `term_to_json` resolve value and type
+  separately, so twice per row), re-proving what `from_mapped` already checks
+  once over the whole keys blob. `from_mapped` now also validates the offset
+  array at load — starts at 0, monotonic, inside the blob, on char boundaries
+  — which is the complete safety proof for the hot path, and `key` converts
+  with `from_utf8_unchecked` (debug builds keep the asserts; a corrupt
+  snapshot is rejected at load with a message instead of degrading term by
+  term to `""`). Measured over 50 rounds × 100k `resolve` + `resolve_type`
+  calls on multi-byte literals (release build): 28.4 → 2.4 ms per round,
+  ~11x on the dictionary read path.
+- **`decode_type` no longer allocates on the read path** — resolving a term's
+  type still built the datatype IRI for every `D`-prefixed key and the
+  language tag for every `G`-prefixed one, under every `FILTER`, `ORDER BY`,
+  `BIND` and aggregate (`src/hypertrie/dictionary.rs`). The hot paths now go
+  through a borrowed `TermTypeRef<'_>`: the language tag and an unfolded
+  datatype IRI borrow straight out of the key, and a **namespace-folded**
+  datatype (`xsd:*`, Wikidata) stays a static prefix + borrowed suffix in a
+  new `DatatypeRef`, so `classify` compares in folded space and the JSON
+  writer appends in pieces — both zero-alloc (`src/sparql.rs`). `TermType`
+  (owned) remains for parsing, WAL and other cold paths. Measured over
+  50 rounds × 200k typed-literal (`xsd:integer`) `resolve_type` calls
+  (release build): 20.4 → 9.1 ms per round, 2.2x on the type resolution.
+- **RDFS inference follows the whole schema** (`src/inference.rs`). Each rule's
+  schema lookup is one property path (`rdfs:subClassOf+`,
+  `rdfs:subPropertyOf+`, `rdfs:subPropertyOf*/rdfs:domain|rdfs:range/rdfs:subClassOf*`),
+  so the transitive rules need no fixpoint iteration and the four rules compose
+  in three branches per `rdf:type` pattern. Measured on a 1.2M-triple synthetic
+  graph with a three-level class tree: one subclass hop 10 ms/20k rows, two
+  hops 45 ms/200k rows, 1M rows through `rdfs:subPropertyOf` 68 ms.
+- **A `Join` with an empty left side no longer evaluates the right one**
+  (`src/sparql.rs`). `static_variables` reads a BGP's or path's column names
+  without evaluating it, which is what keeps an inference branch whose schema
+  path finds nothing from reading the data. A right side that would have
+  exceeded `TRILLIAN_MAX_ROWS` now returns an empty result instead of an error.
+- **`variables_in_bgp` counts blank nodes** (`src/sparql.rs`), under the same
+  `__bn_` name `translate_term_pattern` gives them.
+- **Each query is parsed once.** `query_needs_write` (`src/sparql.rs`) ran a
+  second full parse just to pick the lock, on every uncached `/sparql`,
+  `/stream` and `/count`. It is gone, with `execute_sparql_bind` and
+  `execute_count_bind`.
+- **`hash_join` splits its unfiltered and filtered paths** (`src/sparql.rs`).
+  Applying an `OPTIONAL` filter needs the merged left++right row, and building
+  it in the shared loop would have cost every plain `Join` and every
+  filter-free `OPTIONAL` two extra row copies per output row. The unfiltered
+  case is now its own loop that never builds it. Measured on a 2M-triple
+  synthetic graph (`COUNT(*)`, so serialization is excluded, best-of-5 over 5
+  rounds): a `Join` 197 → 150 ms and an `OPTIONAL` without a filter
+  104 → 80 ms, level with the cost before the filter fix below. Plain
+  multi-pattern BGPs go through the WCOJ engine and never touch `hash_join`.
+- **The `contains_extend`/`contains_group` algebra walks are one function** —
+  `contains_node` takes the predicate, so adding `contains_unknown_values_term`
+  did not mean a third copy of the same 20-line `match` (`src/sparql.rs`).
+- **Turning a term into a value no longer allocates twice per row** —
+  `classify()` and `lit_key()` (`src/sparql.rs`) built a constant datatype IRI
+  with `format!("{XSD}string")`/`boolean` on every call, just to compare it;
+  they now use `dt.strip_prefix(XSD)`, as `is_numeric_dt` already did. This sits
+  under every `FILTER`, `ORDER BY` and `BIND`. Measured over 200k typed integer
+  literals: `FILTER(?v > 0)` 336 → 161 ns/row (2.1x), the same filter with two
+  comparisons 591 → 241 ns/row (2.5x), `ORDER BY ?v` 369 → 229 ns/row (1.6x),
+  and `BIND(?v + 1)` 570 → 414 ns/row (1.4x). Behaviour is unchanged — both
+  forms test the same datatype IRI.
+
+### Fixed
+- **RDFS inference now fires at several patterns of one BGP**
+  (`src/inference.rs`). A branch rewrites a *combination* of patterns (the
+  cartesian product of "leave alone / apply rule" per pattern, capped at 128
+  combinations before falling back to one rewrite per branch), so
+  `{ ?s a :C . ?t a :D }` finds a solution when both types are inferred —
+  one through `rdfs:domain`, the other through `rdfs:range` in the same BGP.
+- **RDFS inference now reaches two more patterns** (`src/inference.rs`).
+  A property path is expanded into the equivalent triple patterns where it
+  leads with plain predicates, so the `rdf:type` step inside
+  `?s rdf:type/rdfs:subClassOf* ?c` carries the type branches instead of
+  looking at asserted triples only (e.g. a type derived through
+  `rdfs:domain` is now found). And an `rdf:type` pattern gains a fourth
+  branch for rdfs9 through a predicate declared a sub-property of
+  `rdf:type` (`?s ?q ?t . ?q rdfs:subPropertyOf+ rdf:type .
+  ?t rdfs:subClassOf* ?c`), so `ex:isA ⊑ rdf:type` fires the type rules —
+  including zero-hop class matches and the class hierarchy above them.
+- **An empty group pattern is the join identity** (`src/sparql.rs`). `eval_bgp`
+  forwarded `{ }` to the engine, whose plan is empty for it and yields **zero**
+  rows; the algebra says it is *one empty solution*. The wrong shape made
+  `OPTIONAL { OPTIONAL { … } }` silently unbind every row (the inner
+  `LeftJoin`'s left side never matched) and `{ } ?s ?p ?o` return nothing.
+  Nested and chained `OPTIONAL`s now bind through the empty group.
+- **N-Triples output escapes control and forbidden IRI characters**
+  (`src/hypertrie/export.rs`). `escape_literal` wrote every control character
+  except `\b`/`\f`/`\n`/`\r`/`\t` raw — invalid N-Triples — and IRIs were
+  emitted unescaped. Both now use `\uXXXX`/`\UXXXXXXXX` for the characters
+  N-Triples forbids raw (all of `#x00-#x20` in literals, plus `#x7F`; the
+  `IRIREF` set `< > " { } | ^ `` ` `` \` and `#x00-#x20` in IRIs), and
+  `parse_iri` decodes the escapes again, so export → import round-trips.
+- **`rdfs:range` inference read the wrong triple position**
+  (`src/inference.rs`). rdfs3 types the *object* of a data triple, but the
+  rewrite looked for `?s ?p ?c` with `?c` the queried class, so it never
+  entailed anything.
+- **Inference no longer returns one row per derivation.** Every rewritten BGP
+  is wrapped in `Project`/`Distinct` over the columns the pattern itself binds,
+  which also keeps the rewrite's helper variables inside the node.
+- **The response cache no longer mixes up inferred and plain results.**
+  `sparql_handler` (`src/sparql.rs`) keyed the cache on the query string alone,
+  but `infer` arrives as a separate parameter and never appears in it, so
+  `?infer=rdfs` and the plain query shared an entry and whichever ran first
+  decided both answers. The key now carries `infer` as well.
+- **An unbound join key is a wildcard, not a value.** `hash_join`
+  (`src/sparql.rs`) matched an unbound column as a value, where SPARQL calls
+  two solutions compatible when they agree on the variables both bind. Lifts
+  the `UNDEF` restriction on `VALUES`; a non-well-designed `OPTIONAL` chain
+  now returns the extra solutions the standard calls for.
+- **A query no longer writes anything.** A term a query computes (`BIND`, an
+  aggregate, a `VALUES` constant the graph lacks) was interned into the
+  dictionary under the write lock and logged, and a missed log entry shifted
+  every later ID on replay. Computed terms now take IDs from a query-local
+  overlay (`Ctx`/`Overlay`, `src/sparql.rs`), so a `SELECT` runs under the read
+  lock and touches neither the dictionary nor the log. The 48-query DBLP suite
+  at 37M triples grew the WAL by 7.5 MB before and by 0 B now.
+- **`BIND`, `GROUP BY`, aggregate sub-`SELECT`s and an unknown `VALUES` term
+  work under `?infer=rdfs`.** They were rejected because inference never took
+  the write lock interning needed; there is no longer one to take.
+- **A top-level `FILTER`/`BIND` Trillian cannot evaluate is now an error too.**
+  Same cause as the `OPTIONAL` case below, different symptom: `FILTER` reads an
+  expression error as "row does not pass", so `EXISTS`/`NOT EXISTS`, `COALESCE`
+  and unimplemented functions (`SUBSTR`, `ABS`, …) answered *every* query with
+  zero rows, and `BIND` left the variable unbound. `check_expr`
+  (`src/sparql.rs`) runs the same `unsupported_in_expr` walk before the rows.
+- **Non-ASCII literals were silently corrupted on ingest**
+  (`src/hypertrie/export.rs`). `parse_quoted_string` walked `s.as_bytes()` and
+  did `bytes[i] as char`, reading each UTF-8 byte as a Latin-1 codepoint, so
+  `"café"` loaded as `"cafÃ©"` — no error, and every existing test was ASCII.
+  Parsing now iterates characters, and the escapes the old code missed (`\'`,
+  `\b`, `\f`) are supported; `escape_literal` emits `\b`/`\f` so serialization
+  round-trips.
+- **A sub-`SELECT`'s modifiers no longer leak to the enclosing query.**
+  `peel_modifiers` walked the whole `Slice`/`Distinct`/`Project`/`OrderBy`
+  chain in one loop, so on a nested modifier stack the inner `SELECT`'s
+  projection overwrote the outer one and its `LIMIT` was attributed to the
+  outer level. It now stops at the sub-`SELECT` boundary, detected by the fixed
+  `Slice > Distinct > Project > OrderBy` nesting order of one query level.
+  Present since before 0.3.0: a sub-`SELECT` forming the whole `WHERE` body
+  already reached evaluation, and answered with the *inner* projection —
+  `SELECT ?s WHERE { { SELECT * WHERE { ?s ?p ?o } } }` returned `?s`, `?p` and
+  `?o`. (A sub-`SELECT` joined with anything else errored out instead, so only
+  the whole-body form returned wrong results silently.)
+- **A `FILTER` inside `OPTIONAL` was silently ignored** (`src/sparql.rs`). The
+  `LeftJoin` arm destructured the algebra node as `{ left, right, .. }`, and the
+  `..` dropped the left-join expression, so
+  `OPTIONAL { ?b :age ?age FILTER(?age < 30) }` returned every match regardless
+  of the filter. It is now applied during the join, with SPARQL 1.1 semantics:
+  a match that fails the expression does not count, so the left row falls
+  through and keeps the optional variables **unbound** rather than being
+  dropped. A `FILTER` placed *after* the `OPTIONAL` is unaffected — it still
+  filters the joined result, and that contrast is now covered by a test.
+  Because the expression is evaluated on the merged row, an `OPTIONAL` sharing
+  no variable with its left side now works as a non-equi join — the `FILTER`
+  *is* the join condition — where it previously produced a cross product:
+  `?b OPTIONAL { ?p :age ?age FILTER(?p = ?b) }` yields one row per `?b`.
+- **A `FILTER` inside `OPTIONAL` that Trillian cannot evaluate is now an error**
+  (`src/sparql.rs`). `eval` reports an unsupported construct the same way it
+  reports a type error — as an expression error — which a left join must read
+  as "no match". `FILTER EXISTS`, `NOT EXISTS`, `COALESCE` and unimplemented
+  functions such as `ABS` would therefore have rejected every match and
+  returned each left row with the optional variables unbound, which looks like
+  a real answer. The left-join expression is now checked before the join and
+  rejected by name (`Unsupported expression in a FILTER inside OPTIONAL:
+  EXISTS`). The check is static, so a construct that runtime short-circuiting
+  would have skipped is still rejected. A top-level `FILTER` now uses the same
+  walk — see above.
+
+## [0.3.0] - 2026-08-01
+
+### Added
+- **`BIND`** — computes an expression and binds it to a new variable
+  (`src/sparql.rs`). A value not yet in the dictionary (e.g. an arithmetic or
+  string result) is interned on the fly, so the query needs write access to
+  the store for that one request; queries without `BIND` are unaffected and
+  keep the fully concurrent read lock. Not yet supported together with
+  `?infer=rdfs`.
+- **`REGEX` in `FILTER`** — `REGEX(text, pattern, flags?)` with the `i`
+  (case-insensitive), `s` (dot matches newline), and `m` (multiline) flags.
+  Compiled patterns are cached process-wide to avoid recompiling per row.
+- **`GROUP BY` with `COUNT`** — basic aggregation support. `COUNT(*)` and
+  `COUNT(DISTINCT *)` are evaluated per group and interned as `xsd:integer`
+  literals. `HAVING` works out of the box because it is represented as a
+  `Filter` over the grouped results. Other aggregates (`SUM`, `AVG`, `MIN`,
+  `MAX`, `GROUP_CONCAT`, `SAMPLE`) return a clear "not supported" error.
+
+### Changed
+- Queries containing `GROUP BY` now take a write lock (like `BIND`) because
+  aggregate results must be interned into the dictionary. Non-aggregation
+  queries keep the fully concurrent read lock.
+- LIMIT pushdown is disabled when `GROUP BY` is present, so the full result
+  set is available for aggregation, `HAVING`, and ordering.
+
 ## [0.2.0] - 2026-07-03
 
 ### Added
@@ -107,7 +373,9 @@ Initial open-source release.
 ### Removed
 - The test-only `Stats` cardinality helper is gated out of release builds.
 
-[Unreleased]: https://github.com/42-grad/trillian/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/42-grad/trillian/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/42-grad/trillian/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/42-grad/trillian/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/42-grad/trillian/compare/v0.1.4...v0.2.0
 [0.1.4]: https://github.com/42-grad/trillian/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/42-grad/trillian/compare/v0.1.2...v0.1.3
