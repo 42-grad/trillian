@@ -140,6 +140,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   forms test the same datatype IRI.
 
 ### Fixed
+- **RDFS inference now fires at several patterns of one BGP**
+  (`src/inference.rs`). A branch rewrites a *combination* of patterns (the
+  cartesian product of "leave alone / apply rule" per pattern, capped at 128
+  combinations before falling back to one rewrite per branch), so
+  `{ ?s a :C . ?t a :D }` finds a solution when both types are inferred —
+  one through `rdfs:domain`, the other through `rdfs:range` in the same BGP.
 - **RDFS inference now reaches two more patterns** (`src/inference.rs`).
   A property path is expanded into the equivalent triple patterns where it
   leads with plain predicates, so the `rdf:type` step inside

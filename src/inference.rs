@@ -36,11 +36,14 @@
 //! `?s rdf:type/rdfs:subClassOf* ?c` carries the type branches instead of
 //! looking at asserted triples only.
 //!
-//! Two gaps remain: each branch rewrites one pattern, so a solution that needs
-//! inference at two patterns of the same BGP is missed; and the
-//! `rdfs:domain`/`rdfs:range` branches read every triple of an unbound entity,
-//! because the schema path binds the predicate but nothing pushes that binding
-//! into the BGP.
+//! A BGP's branches may rewrite several of its patterns at once (the
+//! cartesian product of "leave alone / apply rule" per pattern, capped for
+//! very large BGPs), so a solution that needs inference at two patterns of the
+//! same BGP is found too.
+//!
+//! One gap remains: the `rdfs:domain`/`rdfs:range` branches read every triple
+//! of an unbound entity, because the schema path binds the predicate but
+//! nothing pushes that binding into the BGP.
 
 use spargebra::algebra::{GraphPattern as GP, PropertyPathExpression as Ppe};
 use spargebra::term::{NamedNode, NamedNodePattern, TermPattern, TriplePattern, Variable};
@@ -231,56 +234,46 @@ fn flatten_path(path: Ppe) -> (Vec<NamedNode>, Option<Ppe>) {
         other => (Vec::new(), Some(other)),
     }
 }
-/// One inference branch: the rule's schema path, plus a full copy of the BGP
-/// with the triggering pattern replaced by the one the rule reads instead.
+/// One inference branch: the schema paths its rules read, plus a full copy of
+/// the BGP with the triggering patterns replaced by the ones the rules read
+/// instead.
 ///
 /// The copy is what preserves cross-pattern variable bindings — a branch is a
-/// complete alternative solution to the whole BGP, not to one triple.
+/// complete alternative solution to the whole BGP, not to one triple. A branch
+/// may rewrite **several** patterns at once, so `{ ?s a :C . ?t a :D }` still
+/// finds a solution when both types are inferred.
 struct Branch {
-    path: (TermPattern, Ppe, TermPattern),
-    /// A second schema path, for rules that need two lookups (rdfs9 through a
-    /// predicate that is a sub-property of `rdf:type`: the predicate closure
-    /// and then the class closure).
-    second: Option<(TermPattern, Ppe, TermPattern)>,
+    paths: Vec<(TermPattern, Ppe, TermPattern)>,
     patterns: Vec<TriplePattern>,
 }
 
 impl Branch {
-    fn new(patterns: &[TriplePattern], path: (TermPattern, Ppe, TermPattern)) -> Self {
-        Self {
-            path,
-            second: None,
-            patterns: patterns.to_vec(),
-        }
-    }
-
     /// The paths go on the **left**, so an empty schema lookup short-circuits
     /// the join before the data patterns are touched.
     fn into_pattern(self) -> GP {
-        let (subject, path, object) = self.path;
-        let data = GP::Bgp {
+        let mut gp = GP::Bgp {
             patterns: self.patterns,
         };
-        let right = match self.second {
-            Some((subject, path, object)) => GP::Join {
+        for (subject, path, object) in self.paths.into_iter().rev() {
+            gp = GP::Join {
                 left: Box::new(GP::Path {
                     subject,
                     path,
                     object,
                 }),
-                right: Box::new(data),
-            },
-            None => data,
-        };
-        GP::Join {
-            left: Box::new(GP::Path {
-                subject,
-                path,
-                object,
-            }),
-            right: Box::new(right),
+                right: Box::new(gp),
+            };
         }
+        gp
     }
+}
+
+/// One rule applied to one pattern: the replacement triple and the schema
+/// paths the rule reads.
+#[derive(Clone)]
+struct Rewrite {
+    pattern: TriplePattern,
+    paths: Vec<(TermPattern, Ppe, TermPattern)>,
 }
 
 /// The two rules that read a class off a predicate declaration.
@@ -292,76 +285,138 @@ enum Declaration {
     Range,
 }
 
+/// Above this many combinations the rewrite falls back to one pattern at a
+/// time (the single-pattern approximation), so a BGP with many patterns cannot
+/// blow the query up exponentially.
+const MAX_BRANCH_COMBINATIONS: usize = 128;
+
 fn inference_branches(patterns: &[TriplePattern], fresh: &mut u32) -> Vec<Branch> {
-    let mut branches = Vec::new();
-    for i in 0..patterns.len() {
-        if is_type_predicate(&patterns[i].predicate) {
-            branches.push(super_class_branch(patterns, i, fresh));
-            branches.push(declaration_branch(patterns, i, Declaration::Domain, fresh));
-            branches.push(declaration_branch(patterns, i, Declaration::Range, fresh));
-            branches.push(sub_property_type_branch(patterns, i, fresh));
-        } else {
-            branches.push(sub_property_branch(patterns, i, fresh));
+    // Per pattern: leave it alone, or apply one of its rules.
+    let options: Vec<Vec<Option<Rewrite>>> = (0..patterns.len())
+        .map(|i| {
+            let mut opts = vec![None];
+            opts.extend(rewrites_for(patterns, i, fresh).into_iter().map(Some));
+            opts
+        })
+        .collect();
+    let total: usize = options.iter().map(Vec::len).product();
+    let combinations: Vec<Vec<Option<Rewrite>>> = if total > MAX_BRANCH_COMBINATIONS {
+        // Fallback: exactly one rewritten pattern per branch.
+        let mut combos = Vec::new();
+        for (i, opts) in options.iter().enumerate() {
+            for opt in &opts[1..] {
+                let mut combo = vec![None; patterns.len()];
+                combo[i] = opt.clone();
+                combos.push(combo);
+            }
         }
+        combos
+    } else {
+        cartesian(&options)
+    };
+    combinations
+        .into_iter()
+        .filter(|combo| combo.iter().any(Option::is_some))
+        .map(|combo| {
+            let mut rewritten = patterns.to_vec();
+            let mut paths = Vec::new();
+            for (i, r) in combo.into_iter().enumerate() {
+                if let Some(r) = r {
+                    rewritten[i] = r.pattern;
+                    paths.extend(r.paths);
+                }
+            }
+            Branch {
+                paths,
+                patterns: rewritten,
+            }
+        })
+        .collect()
+}
+
+/// Every combination picking one option per list.
+fn cartesian(options: &[Vec<Option<Rewrite>>]) -> Vec<Vec<Option<Rewrite>>> {
+    let mut out = vec![Vec::new()];
+    for opts in options {
+        let mut next = Vec::with_capacity(out.len() * opts.len());
+        for prefix in &out {
+            for opt in opts {
+                let mut combo = prefix.clone();
+                combo.push(opt.clone());
+                next.push(combo);
+            }
+        }
+        out = next;
     }
-    branches
+    out
+}
+
+fn rewrites_for(patterns: &[TriplePattern], i: usize, fresh: &mut u32) -> Vec<Rewrite> {
+    if is_type_predicate(&patterns[i].predicate) {
+        vec![
+            super_class_rewrite(patterns, i, fresh),
+            declaration_rewrite(patterns, i, Declaration::Domain, fresh),
+            declaration_rewrite(patterns, i, Declaration::Range, fresh),
+            sub_property_type_rewrite(patterns, i, fresh),
+        ]
+    } else {
+        vec![sub_property_rewrite(patterns, i, fresh)]
+    }
 }
 
 /// `?s rdf:type ?c` ← `?s ?q ?t . ?q rdfs:subPropertyOf+ rdf:type .
 /// ?t rdfs:subClassOf* ?c` — rdfs9 through a predicate declared a
 /// sub-property of `rdf:type` (e.g. `ex:isA`), then the class hierarchy.
-fn sub_property_type_branch(patterns: &[TriplePattern], i: usize, fresh: &mut u32) -> Branch {
+fn sub_property_type_rewrite(patterns: &[TriplePattern], i: usize, fresh: &mut u32) -> Rewrite {
     let sub_property = fresh_var("typeprop", fresh);
     let derived = fresh_var("class", fresh);
-    let mut branch = Branch::new(
-        patterns,
-        (
-            var_term(&sub_property),
-            one_or_more(RDFS_SUBPROPERTY_OF),
-            TermPattern::NamedNode(NamedNode::new_unchecked(RDF_TYPE)),
-        ),
-    );
-    branch.second = Some((
-        var_term(&derived),
-        zero_or_more(RDFS_SUBCLASS_OF),
-        patterns[i].object.clone(),
-    ));
-    branch.patterns[i] = TriplePattern {
-        subject: patterns[i].subject.clone(),
-        predicate: NamedNodePattern::Variable(sub_property),
-        object: var_term(&derived),
-    };
-    branch
+    Rewrite {
+        paths: vec![
+            (
+                var_term(&sub_property),
+                one_or_more(RDFS_SUBPROPERTY_OF),
+                TermPattern::NamedNode(NamedNode::new_unchecked(RDF_TYPE)),
+            ),
+            (
+                var_term(&derived),
+                zero_or_more(RDFS_SUBCLASS_OF),
+                patterns[i].object.clone(),
+            ),
+        ],
+        pattern: TriplePattern {
+            subject: patterns[i].subject.clone(),
+            predicate: NamedNodePattern::Variable(sub_property),
+            object: var_term(&derived),
+        },
+    }
 }
 
 /// `?s rdf:type ?c` ← `?s rdf:type ?t . ?t rdfs:subClassOf+ ?c`.
-fn super_class_branch(patterns: &[TriplePattern], i: usize, fresh: &mut u32) -> Branch {
+fn super_class_rewrite(patterns: &[TriplePattern], i: usize, fresh: &mut u32) -> Rewrite {
     let sub_class = fresh_var("class", fresh);
-    let mut branch = Branch::new(
-        patterns,
-        (
+    Rewrite {
+        paths: vec![(
             var_term(&sub_class),
             one_or_more(RDFS_SUBCLASS_OF),
             patterns[i].object.clone(),
-        ),
-    );
-    branch.patterns[i] = TriplePattern {
-        subject: patterns[i].subject.clone(),
-        predicate: named(RDF_TYPE),
-        object: var_term(&sub_class),
-    };
-    branch
+        )],
+        pattern: TriplePattern {
+            subject: patterns[i].subject.clone(),
+            predicate: named(RDF_TYPE),
+            object: var_term(&sub_class),
+        },
+    }
 }
 
 /// `?s rdf:type ?c` ← the entity takes part in a triple whose predicate
 /// declares `?c` (or a subclass of it) as its domain/range, either itself or
 /// through a super-property.
-fn declaration_branch(
+fn declaration_rewrite(
     patterns: &[TriplePattern],
     i: usize,
     rule: Declaration,
     fresh: &mut u32,
-) -> Branch {
+) -> Rewrite {
     let entity = patterns[i].subject.clone();
     let predicate = fresh_var("pred", fresh);
     let other = var_term(&fresh_var("node", fresh));
@@ -369,51 +424,47 @@ fn declaration_branch(
         Declaration::Domain => RDFS_DOMAIN,
         Declaration::Range => RDFS_RANGE,
     };
-    let mut branch = Branch::new(
-        patterns,
-        (
-            var_term(&predicate),
-            declaration_path(declaration),
-            patterns[i].object.clone(),
-        ),
-    );
-    let predicate = NamedNodePattern::Variable(predicate);
-    branch.patterns[i] = match rule {
+    let pattern = match rule {
         Declaration::Domain => TriplePattern {
             subject: entity,
-            predicate,
+            predicate: NamedNodePattern::Variable(predicate.clone()),
             object: other,
         },
         Declaration::Range => TriplePattern {
             subject: other,
-            predicate,
+            predicate: NamedNodePattern::Variable(predicate.clone()),
             object: entity,
         },
     };
-    branch
+    Rewrite {
+        pattern,
+        paths: vec![(
+            var_term(&predicate),
+            declaration_path(declaration),
+            patterns[i].object.clone(),
+        )],
+    }
 }
 
 /// `?s ?p ?o` ← `?s ?q ?o . ?q rdfs:subPropertyOf+ ?p`.
-fn sub_property_branch(patterns: &[TriplePattern], i: usize, fresh: &mut u32) -> Branch {
+fn sub_property_rewrite(patterns: &[TriplePattern], i: usize, fresh: &mut u32) -> Rewrite {
     let sub_property = fresh_var("prop", fresh);
     let queried = match &patterns[i].predicate {
         NamedNodePattern::NamedNode(nn) => TermPattern::NamedNode(nn.clone()),
         NamedNodePattern::Variable(v) => TermPattern::Variable(v.clone()),
     };
-    let mut branch = Branch::new(
-        patterns,
-        (
+    Rewrite {
+        paths: vec![(
             var_term(&sub_property),
             one_or_more(RDFS_SUBPROPERTY_OF),
             queried,
-        ),
-    );
-    branch.patterns[i] = TriplePattern {
-        subject: patterns[i].subject.clone(),
-        predicate: NamedNodePattern::Variable(sub_property),
-        object: patterns[i].object.clone(),
-    };
-    branch
+        )],
+        pattern: TriplePattern {
+            subject: patterns[i].subject.clone(),
+            predicate: NamedNodePattern::Variable(sub_property),
+            object: patterns[i].object.clone(),
+        },
+    }
 }
 
 /// The columns a rewritten BGP keeps: its own variables plus its blank-node
@@ -610,9 +661,10 @@ mod tests {
     #[test]
     fn transitive_rules_are_closures() {
         let branches = inference_branches(&bgp_of(TYPE_PATTERN), &mut 0);
-        assert!(matches!(branches[0].path.1, Ppe::OneOrMore(_)));
+        assert_eq!(branches.len(), 4);
+        assert!(matches!(branches[0].paths[0].1, Ppe::OneOrMore(_)));
         for branch in &branches[1..3] {
-            let Ppe::Sequence(head, tail) = &branch.path.1 else {
+            let Ppe::Sequence(head, tail) = &branch.paths[0].1 else {
                 panic!("expected a sequence path")
             };
             assert!(matches!(**tail, Ppe::ZeroOrMore(_)));
@@ -625,9 +677,57 @@ mod tests {
         // closure as a second path (zero hops allowed — the declared type
         // itself is entailed).
         let sub_property_type = &branches[3];
-        assert!(matches!(sub_property_type.path.1, Ppe::OneOrMore(_)));
-        let (_, second, _) = sub_property_type.second.as_ref().expect("second path");
-        assert!(matches!(second, Ppe::ZeroOrMore(_)));
+        assert!(matches!(sub_property_type.paths[0].1, Ppe::OneOrMore(_)));
+        assert_eq!(sub_property_type.paths.len(), 2);
+        assert!(matches!(sub_property_type.paths[1].1, Ppe::ZeroOrMore(_)));
+    }
+
+    /// A solution that needs inference at **two** patterns of the same BGP is
+    /// found: one branch rewrites both.
+    #[test]
+    fn one_branch_can_rewrite_two_patterns() {
+        let patterns = bgp_of(
+            "SELECT ?s ?t WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/C> . \
+             ?t <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/D> }",
+        );
+        let branches = inference_branches(&patterns, &mut 0);
+        // Two type patterns: 5 options each, minus the unrewritten baseline.
+        assert_eq!(branches.len(), 24);
+        assert!(
+            branches.iter().any(|b| b.patterns != patterns),
+            "expected at least one rewritten branch"
+        );
+        assert!(
+            branches
+                .iter()
+                .any(|b| b.patterns[0] != patterns[0] && b.patterns[1] != patterns[1]),
+            "expected a branch that rewrites both patterns"
+        );
+    }
+
+    /// Many patterns fall back to one rewrite per branch, keeping the query
+    /// size linear instead of exponential.
+    #[test]
+    fn branch_explosion_falls_back_to_single_rewrites() {
+        let patterns = bgp_of(
+            "SELECT ?s WHERE { \
+             ?s <http://example.org/p1> ?o1 . ?s <http://example.org/p2> ?o2 . \
+             ?s <http://example.org/p3> ?o3 . ?s <http://example.org/p4> ?o4 . \
+             ?s <http://example.org/p5> ?o5 . ?s <http://example.org/p6> ?o6 . \
+             ?s <http://example.org/p7> ?o7 . ?s <http://example.org/p8> ?o8 }",
+        );
+        let branches = inference_branches(&patterns, &mut 0);
+        // 2^8 combinations would exceed the cap -> one rewritten pattern each.
+        assert_eq!(branches.len(), 8);
+        for branch in &branches {
+            let changed = branch
+                .patterns
+                .iter()
+                .zip(&patterns)
+                .filter(|(a, b)| a != b)
+                .count();
+            assert_eq!(changed, 1);
+        }
     }
 
     /// A path led by plain predicates is expanded into triple patterns, so the
