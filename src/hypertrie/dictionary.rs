@@ -597,16 +597,14 @@ mod snapshot {
     }
 
     /// Serializes `d` into a temp file and maps it read-only (as
-    /// `from_mapped` receives it in production).
-    fn mapped(d: &Dictionary) -> (Mmap, usize) {
+    /// `from_mapped` receives it in production). `tag` keeps parallel tests
+    /// from sharing (and racing on) one path.
+    fn mapped(d: &Dictionary, tag: &str) -> (Mmap, usize) {
         let mut buf = Vec::new();
         d.serialize_into(&mut buf);
         let n = d.len();
-        let path = std::env::temp_dir().join(format!(
-            "trillian_dict_test_{}_{}",
-            std::process::id(),
-            buf.len()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("trillian_dict_test_{}_{tag}", std::process::id()));
         let mut f = File::create(&path).unwrap();
         f.write_all(&buf).unwrap();
         f.sync_all().unwrap();
@@ -631,7 +629,7 @@ mod snapshot {
     #[test]
     fn mapped_snapshot_roundtrips() {
         let d = sample();
-        let (map, n) = mapped(&d);
+        let (map, n) = mapped(&d, "roundtrip");
         let dict = Dictionary::from_mapped(Arc::new(map), 0).unwrap();
         assert_eq!(dict.len(), n);
         assert_eq!(dict.resolve(0).as_deref(), Some("http://example.org/a"));
@@ -703,7 +701,7 @@ mod snapshot {
             );
         }
         // The valid snapshot still loads after all the corruption runs.
-        let (map, _) = mapped(&d);
+        let (map, _) = mapped(&d, "corrupt-tail");
         assert!(Dictionary::from_mapped(Arc::new(map), 0).is_ok());
     }
 }
