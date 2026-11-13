@@ -5,9 +5,9 @@ open an issue first to agree on the approach (see [CONTRIBUTING.md](CONTRIBUTING
 
 ## SPARQL features
 
-- `BIND`, sub-`SELECT`, and nested/multiple `OPTIONAL` patterns.
-- Aggregation: `GROUP BY` with `COUNT`/`SUM`/`MIN`/`MAX`/`AVG`.
-- `REGEX` in `FILTER`.
+- Remaining `?infer=rdfs` gap: the `rdfs:domain`/`rdfs:range` branches read
+  every triple of an unbound entity, because the schema path binds the
+  predicate but nothing pushes that binding into the BGP (`src/inference.rs`).
 - Property-path edge cases: tighten result-count parity on the remaining
   WDBench paths/C2RPQ deviations (notably blank-node-bearing transitive paths).
 - Pipeline execution across `OPTIONAL`/`LeftJoin` so those classes get the same
@@ -16,16 +16,20 @@ open an issue first to agree on the approach (see [CONTRIBUTING.md](CONTRIBUTING
 
 ## Storage & performance
 
+- Drop the per-term UTF-8 validation on the read path: `MappedDict::key`
+  (`src/hypertrie/dictionary.rs`) runs `str::from_utf8` *twice* for every bound
+  term of every result row — `append_term` and `term_to_json` resolve the value
+  and the type separately, and each goes through `raw_key` — re-proving what
+  `from_mapped` already checks once over the whole keys blob. Validating offset
+  monotonicity and char boundaries at load would let the hot path go back to
+  unchecked. Measured on 100k-row results against a binary built from `b37bc56`
+  (the WDBench run; the check ships in every release from `v0.1.2` on, so an
+  older tag is not a usable baseline): ~6% of query time, of which the ablation
+  attributes 3-6 percentage points to this check.
 - Derive `pred_subjects` on demand from the index (the last predicate-keyed list
   still held in owned RAM), or back it by a `BTreeSet` for O(log n) deletes.
-- WAL checkpointing / snapshot rotation.
 - A structure-sharing index (sharing common subtrees across the three
   permutations) to cut the dominant index footprint — a larger undertaking.
-
-## Data model & I/O
-
-- Turtle (`.ttl`) input in addition to N-Triples.
-- Quoted/escaped literal coverage beyond the current benchmark needs.
 
 ## Tooling
 

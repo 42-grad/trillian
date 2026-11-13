@@ -10,6 +10,9 @@ use string_interner::{StringInterner, Symbol};
 /// literals, or language/datatype strings (like `SEP` = `0x01`).
 const NS_ESC: char = '\u{2}';
 
+/// [`NS_ESC`] as the byte it appears as in keys.
+const NS_ESC_BYTE: u8 = NS_ESC as u8;
+
 /// Known long IRI prefixes. On real Wikidata data `entity/Q*` and
 /// `prop/direct/P*` make up the bulk of all IRIs; their prefix (29–37 chars)
 /// repeats millions of times. Folding replaces it with 2 bytes (`NS_ESC` +
@@ -67,7 +70,7 @@ type Interner = StringInterner<StringBackend<SymbolU32>>;
 /// Type of an RDF term. Stored per dictionary ID so the SPARQL output
 /// (term_to_json) can distinguish between IRI, literal with datatype, and
 /// literal with language tag.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TermType {
     Iri,
     Literal {
@@ -104,10 +107,125 @@ impl TermType {
     }
 }
 
+/// Borrowed view of a literal's datatype IRI. Datatype IRIs are
+/// namespace-**folded** at ingest (see [`fold_iri`]) — on Wikidata data most
+/// are `xsd:*` or Wikidata-prefixed — so the key stores `\x02` + code +
+/// suffix, and reconstructing the full IRI would cost one allocation per row.
+/// [`DatatypeRef`] keeps the two pieces apart so consumers can compare
+/// ([`DatatypeRef::strip_xsd`]) and append ([`DatatypeRef::write_json_body`])
+/// without ever unfolding; [`DatatypeRef::unfolded`] allocates only for the
+/// callers that genuinely need the whole IRI as one string.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum DatatypeRef<'a> {
+    /// The complete IRI, borrowed when it was stored unfolded.
+    Full(Cow<'a, str>),
+    /// A folded IRI: the static namespace prefix plus the suffix borrowed
+    /// (or owned, for query-local overlay keys) from the key.
+    Folded {
+        prefix: &'static str,
+        rest: Cow<'a, str>,
+    },
+}
+
+impl DatatypeRef<'_> {
+    /// The part after `http://www.w3.org/2001/XMLSchema#`, compared in folded
+    /// space — no allocation, no unfolding. `None` for other namespaces.
+    pub fn strip_xsd(&self) -> Option<&str> {
+        match self {
+            DatatypeRef::Full(s) => s.strip_prefix(XSD),
+            DatatypeRef::Folded { prefix, rest } if *prefix == XSD => Some(rest),
+            _ => None,
+        }
+    }
+
+    /// Whether the datatype is one of the numeric `xsd:` types.
+    pub fn is_numeric_xsd(&self) -> bool {
+        matches!(
+            self.strip_xsd(),
+            Some(
+                "integer"
+                    | "decimal"
+                    | "double"
+                    | "float"
+                    | "int"
+                    | "long"
+                    | "short"
+                    | "byte"
+                    | "nonNegativeInteger"
+                    | "positiveInteger"
+                    | "nonPositiveInteger"
+                    | "negativeInteger"
+                    | "unsignedInt"
+                    | "unsignedLong"
+                    | "unsignedShort"
+                    | "unsignedByte"
+            )
+        )
+    }
+
+    /// The full IRI, unfolded only when it was folded (then `Cow::Owned`).
+    pub fn unfolded(&self) -> Cow<'_, str> {
+        match self {
+            DatatypeRef::Full(s) => Cow::Borrowed(s),
+            DatatypeRef::Folded { prefix, rest } => {
+                let mut s = String::with_capacity(prefix.len() + rest.len());
+                s.push_str(prefix);
+                s.push_str(rest);
+                Cow::Owned(s)
+            }
+        }
+    }
+
+    /// The owned counterpart: suffix and full IRI become `Cow::Owned`.
+    pub fn into_owned_datatype(self) -> DatatypeRef<'static> {
+        match self {
+            DatatypeRef::Full(s) => DatatypeRef::Full(Cow::Owned(s.into_owned())),
+            DatatypeRef::Folded { prefix, rest } => DatatypeRef::Folded {
+                prefix,
+                rest: Cow::Owned(rest.into_owned()),
+            },
+        }
+    }
+}
+
+/// Borrowed view of a [`TermType`] for the hot read path. The datatype IRI and
+/// language tag borrow straight out of the interned key, so resolving a term's type
+/// under every `FILTER`, `ORDER BY`, `BIND` and aggregate allocates **nothing**
+/// — `TermType` allocated both strings per row. Convert with
+/// [`TermTypeRef::into_owned`] where an owned `TermType` is needed (parsing,
+/// WAL, cold paths).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TermTypeRef<'a> {
+    Iri,
+    Literal {
+        datatype: Option<DatatypeRef<'a>>,
+        lang: Option<Cow<'a, str>>,
+    },
+    BlankNode,
+}
+
+impl TermTypeRef<'_> {
+    /// The owned [`TermType`] counterpart (`Cow::Owned` for the datatype IRI
+    /// and language tag).
+    pub fn into_owned(self) -> TermType {
+        match self {
+            TermTypeRef::Iri => TermType::Iri,
+            TermTypeRef::BlankNode => TermType::BlankNode,
+            TermTypeRef::Literal { datatype, lang } => TermType::Literal {
+                datatype: datatype.map(|d| d.unfolded().into_owned()),
+                lang: lang.map(|l| l.into_owned()),
+            },
+        }
+    }
+}
+
 /// `xsd:string` – a plain literal (`datatype: None`) is, per RDF 1.1,
 /// **identical** to a literal explicitly typed with `xsd:string`. Both must
 /// therefore get the same dictionary key.
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
+
+/// The XSD namespace, for folded-datatype comparisons in [`DatatypeRef`].
+const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
 
 /// Separator between the type prefix and the lexical value in the interned key.
 /// `0x01` does not occur in normal IRIs, datatype IRIs, or language tags; the
@@ -150,24 +268,101 @@ fn decode_value(key: &str) -> &str {
 /// Reconstructs the term type from the prefix of an interned key.
 /// The type is fully encoded in the key (see [`encode_key`]) – a separate
 /// `Vec<TermType>` (48 B/term + its own strings) is thus unnecessary.
+#[inline]
 fn decode_type(key: &str) -> TermType {
-    let bytes = key.as_bytes();
-    match bytes.first() {
-        Some(b'I') => TermType::Iri,
-        Some(b'B') => TermType::BlankNode,
-        Some(b'L') => TermType::literal_plain(),
+    decode_type_ref(key).into_owned()
+}
+
+/// [`decode_type`], but borrowing: the datatype IRI and language tag come back
+/// as `Cow`s into the key (the datatype namespace-unfolds where folded), so
+/// the hot read path never allocates.
+fn decode_type_ref(key: &str) -> TermTypeRef<'_> {
+    match key.as_bytes().first() {
+        Some(b'I') => TermTypeRef::Iri,
+        Some(b'B') => TermTypeRef::BlankNode,
+        Some(b'L') => TermTypeRef::Literal {
+            datatype: None,
+            lang: None,
+        },
         Some(b'G') => {
             // G<lang>\x01<value>  -> language literal
             let sep = key.find(SEP).unwrap_or(key.len());
-            TermType::literal_lang(&key[1..sep])
+            TermTypeRef::Literal {
+                datatype: None,
+                lang: Some(Cow::Borrowed(&key[1..sep])),
+            }
         }
         Some(b'D') => {
-            // D<datatype>\x01<value>  -> typed literal (unfold the datatype)
+            // D<datatype>\x01<value>  -> typed literal. The datatype IRI is
+            // namespace-folded in the key; keep prefix and suffix apart
+            // instead of unfolding (that would allocate per row).
             let sep = key.find(SEP).unwrap_or(key.len());
-            TermType::literal_datatype(unfold_iri(&key[1..sep]).into_owned())
+            TermTypeRef::Literal {
+                datatype: Some(split_datatype(&key[1..sep])),
+                lang: None,
+            }
         }
-        _ => TermType::Iri, // defensive
+        _ => TermTypeRef::Iri, // defensive
     }
+}
+
+/// Splits a stored datatype IRI into [`DatatypeRef`] pieces: a namespace-
+/// folded IRI (`\x02` + code + suffix) keeps its static prefix, an unfolded
+/// one comes back complete. Zero allocation.
+fn split_datatype(folded: &str) -> DatatypeRef<'_> {
+    let bytes = folded.as_bytes();
+    match bytes.first() {
+        Some(&NS_ESC_BYTE) if folded.len() >= 2 => {
+            let idx = (bytes[1].wrapping_sub(b'A')) as usize;
+            match NS_PREFIXES.get(idx) {
+                Some(&prefix) => DatatypeRef::Folded {
+                    prefix,
+                    rest: Cow::Borrowed(&folded[2..]),
+                },
+                None => DatatypeRef::Full(Cow::Borrowed(folded)),
+            }
+        }
+        _ => DatatypeRef::Full(Cow::Borrowed(folded)),
+    }
+}
+
+/// [`decode_type_ref`], but the language tag and the datatype suffix are
+/// always **owned**. For overlays whose keys do not outlive the call (the
+/// query-local term overlay in `src/sparql.rs`); that path is cold.
+pub fn decode_type_ref_owned(key: &str) -> TermTypeRef<'static> {
+    match key.as_bytes().first() {
+        Some(b'G') => {
+            let sep = key.find(SEP).unwrap_or(key.len());
+            TermTypeRef::Literal {
+                datatype: None,
+                lang: Some(Cow::Owned(key[1..sep].to_string())),
+            }
+        }
+        Some(b'D') => {
+            let sep = key.find(SEP).unwrap_or(key.len());
+            TermTypeRef::Literal {
+                datatype: Some(split_datatype(&key[1..sep]).into_owned_datatype()),
+                lang: None,
+            }
+        }
+        // IRI / blank node / plain literal carry no strings to own.
+        _ => match key.as_bytes().first() {
+            Some(b'L') => TermTypeRef::Literal {
+                datatype: None,
+                lang: None,
+            },
+            _ => TermTypeRef::Iri, // defensive
+        },
+    }
+}
+
+/// Whether `i` is a character boundary of a byte slice (`str::is_char_boundary`
+/// exists for `str` only; the offsets array indexes the blob as bytes).
+#[inline]
+fn is_boundary(blob: &[u8], i: usize) -> bool {
+    // A boundary is the end or any byte that does not continue a multi-byte
+    // character (UTF-8 continuation bytes are 0b10xxxxxx, negative as `i8`).
+    i == blob.len() || (i < blob.len() && (blob[i] as i8) >= 0)
 }
 
 /// Read-only dictionary base, **zero-copy from the mmap snapshot**. Holds no
@@ -199,14 +394,23 @@ impl MappedDict {
     fn key(&self, id: usize) -> &str {
         let o = self.key_offsets();
         let blob = &self.map[self.keys_off..self.keys_off + self.keys_len];
-        // Checked: the snapshot is attacker-controllable, so a corrupt offset or
-        // non-UTF-8/boundary-splitting slice must NOT cause UB. Fall back to ""
-        // (a corrupt snapshot already failed validation in `from_mapped`; this is
-        // defence in depth on the hot path).
+        // Unchecked on the hot path: `from_mapped` proved at load that the blob
+        // is valid UTF-8 and that every offset is monotonic, inside the blob,
+        // and on a char boundary — re-checking that per bound term of every
+        // result row (measured at ~6% of query time on 100k-row results) is
+        // pure overhead. `raw_key` only calls this for `id < n`, so the offset
+        // array always has the `id` and `id + 1` entries; an out-of-range ID
+        // panics on the index and can never reach a slice. Debug builds
+        // re-check the invariants anyway; release trusts the load-time proof.
+        debug_assert!(o[id] <= o[id + 1]);
         let (lo, hi) = (o[id] as usize, o[id + 1] as usize);
-        blob.get(lo..hi)
-            .and_then(|b| std::str::from_utf8(b).ok())
-            .unwrap_or("")
+        debug_assert!(hi <= blob.len() && lo <= hi);
+        debug_assert!(is_boundary(blob, lo) && is_boundary(blob, hi));
+        debug_assert!(std::str::from_utf8(&blob[lo..hi]).is_ok());
+        // SAFETY: every offset was validated against exactly these invariants
+        // in `from_mapped` (monotonicity, bounds, char boundaries, and the blob
+        // being UTF-8) — see the validation block there.
+        unsafe { std::str::from_utf8_unchecked(&blob[lo..hi]) }
     }
     /// Binary search over the key-sorted IDs. O(log n).
     fn lookup(&self, key: &str) -> Option<u32> {
@@ -300,15 +504,37 @@ impl Dictionary {
     /// Returns the ID of a term by lexical value **and** type.
     #[inline]
     pub fn lookup_term(&self, value: &str, typ: &TermType) -> Option<u32> {
-        let key = encode_key(value, typ);
+        self.lookup_encoded(&encode_key(value, typ))
+    }
+
+    /// Same, for a key already built by [`Dictionary::encode`].
+    #[inline]
+    pub fn lookup_encoded(&self, key: &str) -> Option<u32> {
         if let Some(m) = &self.mapped
-            && let Some(id) = m.lookup(&key)
+            && let Some(id) = m.lookup(key)
         {
             return Some(id);
         }
         self.interner
-            .get(&key)
+            .get(key)
             .map(|s| self.base_n() as u32 + s.to_usize() as u32)
+    }
+
+    /// The interned-key encoding, for a caller that mints IDs outside the
+    /// dictionary and must key terms exactly as it would.
+    pub fn encode(value: &str, typ: &TermType) -> String {
+        encode_key(value, typ)
+    }
+
+    /// Lexical value and type of such a key.
+    pub fn decode(key: &str) -> (Cow<'_, str>, TermType) {
+        let val = decode_value(key);
+        let value = if key.as_bytes().first() == Some(&b'I') {
+            unfold_iri(val)
+        } else {
+            Cow::Borrowed(val)
+        };
+        (value, decode_type(key))
     }
 
     /// Convenience: ID of an IRI term.
@@ -334,7 +560,15 @@ impl Dictionary {
     /// Returns the type of a term (reconstructed from the key prefix).
     #[inline]
     pub fn resolve_type(&self, id: u32) -> Option<TermType> {
-        self.raw_key(id).map(decode_type)
+        self.raw_key(id).map(|k| decode_type_ref(k).into_owned())
+    }
+
+    /// [`Dictionary::resolve_type`], but borrowing: the datatype IRI and
+    /// language tag come back as `Cow`s into the mmap'd key, so the hot read
+    /// path (`append_term`, `term_to_fv`, …) allocates nothing.
+    #[inline]
+    pub fn resolve_type_ref(&self, id: u32) -> Option<TermTypeRef<'_>> {
+        self.raw_key(id).map(decode_type_ref)
     }
 
     /// Rough byte estimate of the **owned** RAM (for the memory report). The
@@ -446,6 +680,28 @@ impl Dictionary {
         if std::str::from_utf8(&b[keys_off..keys_end]).is_err() {
             return Err("dictionary keys blob is not valid UTF-8".to_string());
         }
+        // Validate the offsets once at load so the per-term hot path
+        // (`MappedDict::key`) can go back to unchecked conversion: they must
+        // start at 0, be monotonic, stay inside the blob (whose length **is**
+        // the last offset), and sit on char boundaries — otherwise slicing a
+        // key could split a multi-byte character. Together with the UTF-8
+        // check above this is the complete safety proof for `key`.
+        let offs: &[u64] = bytemuck::try_cast_slice(&b[offs_off..offs_off + (n + 1) * 8])
+            .map_err(|_| "dictionary offset array is misaligned".to_string())?;
+        let blob = &b[keys_off..keys_end];
+        if offs[0] != 0 {
+            return Err("dictionary key offsets do not start at 0".to_string());
+        }
+        let mut prev = 0u64;
+        for &off in offs {
+            if off < prev || off > blob.len() as u64 {
+                return Err("dictionary key offsets are corrupt".to_string());
+            }
+            if !is_boundary(blob, off as usize) {
+                return Err("dictionary key offset splits a character".to_string());
+            }
+            prev = off;
+        }
         Ok(Dictionary {
             mapped: Some(MappedDict {
                 map: map.clone(),
@@ -515,6 +771,187 @@ mod tests {
         let id = d.insert_with_type(weird, TermType::literal_plain());
         assert_eq!(d.resolve(id).as_deref(), Some(weird));
         assert_eq!(d.lookup_term(weird, &TermType::literal_plain()), Some(id));
+    }
+
+    /// The borrowed type view agrees with the owned one, and borrows the
+    /// datatype/language tag straight out of the key (only a *folded*
+    /// datatype IRI comes back as an owned `Cow` after unfolding).
+    #[test]
+    fn type_ref_matches_owned_and_borrows() {
+        let mut d = Dictionary::new();
+        let lang = d.insert_with_type("hallo", TermType::literal_lang("de"));
+        let xsd = d.insert_with_type(
+            "25",
+            TermType::literal_datatype("http://www.w3.org/2001/XMLSchema#integer"),
+        );
+        let custom = d.insert_with_type("x", TermType::literal_datatype("http://example.org/c"));
+        let plain = d.insert_with_type("y", TermType::literal_plain());
+        let iri = d.insert("http://example.org/i");
+
+        let owned_of_ref = |id: u32| d.resolve_type_ref(id).map(|t| t.into_owned());
+        for id in [lang, xsd, custom, plain, iri] {
+            assert_eq!(owned_of_ref(id), d.resolve_type(id), "id {id}");
+        }
+        // Language tag borrows.
+        assert!(matches!(
+            d.resolve_type_ref(lang),
+            Some(TermTypeRef::Literal {
+                lang: Some(Cow::Borrowed("de")),
+                ..
+            })
+        ));
+        // Unfolded datatype IRI borrows; the folded XSD one keeps pieces apart.
+        assert!(matches!(
+            d.resolve_type_ref(custom),
+            Some(TermTypeRef::Literal {
+                datatype: Some(DatatypeRef::Full(Cow::Borrowed("http://example.org/c"))),
+                ..
+            })
+        ));
+        assert!(matches!(
+            d.resolve_type_ref(xsd),
+            Some(TermTypeRef::Literal {
+                datatype: Some(DatatypeRef::Folded {
+                    prefix: "http://www.w3.org/2001/XMLSchema#",
+                    rest: Cow::Borrowed("integer")
+                }),
+                ..
+            })
+        ));
+        assert!(matches!(
+            d.resolve_type_ref(plain),
+            Some(TermTypeRef::Literal {
+                datatype: None,
+                lang: None
+            })
+        ));
+        assert!(matches!(d.resolve_type_ref(iri), Some(TermTypeRef::Iri)));
+    }
+}
+
+#[cfg(test)]
+mod snapshot {
+    use super::*;
+    use memmap2::Mmap;
+    use std::fs::File;
+    use std::io::Write;
+
+    /// Layout of `serialize_into`: `[n:u32][pad][offsets:(n+1)×u64][blob][pad][sorted]`.
+    fn section_parts(buf: &[u8], n: usize) -> (usize, usize, usize) {
+        let offs = 8;
+        let last_off = offs + n * 8;
+        let keys_len = u64::from_le_bytes(buf[last_off..last_off + 8].try_into().unwrap()) as usize;
+        let keys = last_off + 8;
+        (offs, keys, keys_len)
+    }
+
+    /// Serializes `d` into a temp file and maps it read-only (as
+    /// `from_mapped` receives it in production). `tag` keeps parallel tests
+    /// from sharing (and racing on) one path.
+    fn mapped(d: &Dictionary, tag: &str) -> (Mmap, usize) {
+        let mut buf = Vec::new();
+        d.serialize_into(&mut buf);
+        let n = d.len();
+        let path =
+            std::env::temp_dir().join(format!("trillian_dict_test_{}_{tag}", std::process::id()));
+        let mut f = File::create(&path).unwrap();
+        f.write_all(&buf).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+        // SAFETY: mapping a file we just closed after writing; its length is
+        // fixed, so no concurrent truncation can unmap pages under us.
+        (
+            unsafe { Mmap::map(&File::open(&path).unwrap()) }.unwrap(),
+            n,
+        )
+    }
+
+    /// A dictionary with one ASCII and one multi-byte term, ready to map.
+    fn sample() -> Dictionary {
+        let mut d = Dictionary::new();
+        d.insert("http://example.org/a");
+        d.insert_with_type("é", TermType::literal_plain());
+        d
+    }
+
+    /// A valid snapshot loads and resolves both terms intact.
+    #[test]
+    fn mapped_snapshot_roundtrips() {
+        let d = sample();
+        let (map, n) = mapped(&d, "roundtrip");
+        let dict = Dictionary::from_mapped(Arc::new(map), 0).unwrap();
+        assert_eq!(dict.len(), n);
+        assert_eq!(dict.resolve(0).as_deref(), Some("http://example.org/a"));
+        assert_eq!(dict.resolve(1).as_deref(), Some("é"));
+        assert_eq!(dict.lookup_iri("http://example.org/a"), Some(0));
+    }
+
+    /// Corrupting one region must be rejected at load, never yield UB on the
+    /// (now unchecked) hot path: bad UTF-8, non-monotonic / out-of-bounds /
+    /// char-boundary-splitting offsets, and a tail short of the blob end.
+    #[test]
+    fn corrupt_snapshot_is_rejected_at_load() {
+        let d = sample();
+        let mut buf = Vec::new();
+        d.serialize_into(&mut buf);
+        let (offs, keys, keys_len) = section_parts(&buf, d.len());
+        drop(buf);
+        // u64 offset slot `i` in little-endian.
+        let set_off = |buf: &mut [u8], i: usize, v: u64| {
+            let at = offs + i * 8;
+            buf[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        };
+        // The blob contains only ASCII + one 'é' at key 1; putting 0xFF inside
+        // the blob makes it invalid UTF-8.
+        let c_utf8 = |b: &mut [u8]| b[keys] = 0xFF;
+        let c_monotonic = |b: &mut [u8]| {
+            // offsets[1] jumps past offsets[2] -> non-monotonic
+            let at = offs + 2 * 8;
+            let next = u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+            set_off(b, 1, next + 1);
+        };
+        let c_bounds = |b: &mut [u8]| {
+            // offsets[1] beyond the blob end -> out of bounds
+            set_off(b, 1, keys_len as u64 + 1);
+        };
+        let c_split = |b: &mut [u8]| {
+            // key 1 ("L\x01é") occupies blob bytes 22..26, so its 'é' sits at
+            // 24..26 and offset 25 would split it
+            set_off(b, 1, 25);
+        };
+        let c_cover = |b: &mut [u8]| {
+            // offsets[0] pushed forward -> the first key's head is unreachable
+            set_off(b, 0, 5);
+        };
+        type CorruptCase<'a> = (&'a str, &'a dyn Fn(&mut [u8]));
+        let cases: [CorruptCase; 5] = [
+            ("not valid UTF-8", &c_utf8),
+            ("offsets are corrupt", &c_monotonic),
+            ("offsets are corrupt", &c_bounds),
+            ("splits a character", &c_split),
+            ("do not start at 0", &c_cover),
+        ];
+        for (expect, corrupt) in cases {
+            let mut buf = Vec::new();
+            d.serialize_into(&mut buf);
+            corrupt(&mut buf);
+            let path = std::env::temp_dir().join(format!(
+                "trillian_dict_corrupt_{}_{}",
+                std::process::id(),
+                expect.len()
+            ));
+            File::create(&path).unwrap().write_all(&buf).unwrap();
+            // SAFETY: same as in `mapped` — a freshly written, fixed-length file.
+            let map = unsafe { Mmap::map(&File::open(&path).unwrap()) }.unwrap();
+            let err = Dictionary::from_mapped(Arc::new(map), 0).unwrap_err();
+            assert!(
+                err.contains(expect),
+                "expected \"{expect}\" in error, got: {err}"
+            );
+        }
+        // The valid snapshot still loads after all the corruption runs.
+        let (map, _) = mapped(&d, "corrupt-tail");
+        assert!(Dictionary::from_mapped(Arc::new(map), 0).is_ok());
     }
 }
 

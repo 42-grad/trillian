@@ -1,5 +1,9 @@
 <p align="center">
-  <img src="logo.png" alt="Trillian" width="480">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="assets/logo-light.png">
+    <img src="assets/logo-light.png" alt="Trillian" width="320">
+  </picture>
 </p>
 
 # Trillian
@@ -43,15 +47,53 @@ contribution to open, sovereign, and sustainable data infrastructure.
 ## Supported SPARQL
 
 - `SELECT` and `ASK`; projection, `DISTINCT`, `LIMIT`, `OFFSET`
-- Basic graph patterns, `OPTIONAL` (left joins), `UNION`
+- Basic graph patterns, `OPTIONAL` (left joins, including a `FILTER` inside the
+  group, which acts as the join condition), `UNION`
+- `MINUS` — subtracts the solutions a right-hand pattern is compatible with.
+  A right side sharing no variable with the left has a disjoint domain and
+  removes nothing, however well it matches.
 - `FILTER` — 3-valued logic: comparisons, `&&`/`||`/`!`, `BOUND`, arithmetic,
   `IN`, `IF`, and `STR`/`LANG`/`DATATYPE`/`STRLEN`/`U`-`LCASE`/`CONTAINS`/
   `STRSTARTS`/`STRENDS`/`isIRI`/`isLiteral`/`isNumeric`/`isBlank`
+- `REGEX` in `FILTER`, with the `i`, `s`, and `m` flags
 - `ORDER BY` (type-aware: numeric before lexical), with `LIMIT`/`DISTINCT`
+- `BIND`
+- `VALUES` — an inline table of solutions, one or several variables wide,
+  either as a group element or trailing the `WHERE` clause. A term the graph
+  lacks gets a query-local ID, so a standalone table hands it back verbatim.
+  `UNDEF` leaves a cell unbound, which the join matches as a wildcard.
+- `GROUP BY` with `HAVING` and the `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`,
+  `SAMPLE` and `GROUP_CONCAT` aggregates, each accepting `DISTINCT`.
+  `MIN`/`MAX`/`SAMPLE` hand back the stored term, so the result keeps its
+  original datatype; `GROUP_CONCAT` always yields a plain string; `SUM`/`AVG`
+  compute a new number and yield `xsd:double`, as `BIND` arithmetic does.
+  Because they build a fresh value, `SUM` and `AVG` accept any expression
+  argument (`SUM(?v + 1)`); the others need a bare variable — `MIN(?v)`, not
+  `MIN(?v + 1)` — to keep the term they return intact. Over an empty group
+  `COUNT`, `SUM` and `AVG` are `0` (an `xsd:integer`, as SPARQL 1.1 defines)
+  and `GROUP_CONCAT` is `""`, while `MIN`/`MAX`/`SAMPLE` are unbound.
 - **Property paths**: `/ ^ | * + ?` and negated property sets
-- IRIs, typed/`@lang` literals, blank nodes; `INSERT DATA`/`DELETE DATA`
+- **Sub-`SELECT`** — a nested `SELECT` in the `WHERE` clause, with its own
+  `DISTINCT`/`ORDER BY`/`LIMIT`/`OFFSET` and `GROUP BY`, joined against the
+  enclosing pattern. Variables it does not project are out of scope outside it,
+  so the enclosing pattern may reuse those names. This is what lets an
+  aggregate be joined back against the graph — "entities with more than *n*
+  links, plus their labels":
 
-Not yet supported (but planned): `BIND`, `GROUP BY`/aggregation, sub-`SELECT`, `REGEX`.
+  ```sparql
+  SELECT ?s ?c ?label WHERE {
+    { SELECT ?s (COUNT(*) AS ?c) WHERE { ?s :knows ?o } GROUP BY ?s }
+    FILTER(?c > 1)
+    ?s rdfs:label ?label
+  }
+  ```
+- IRIs, typed/`@lang` literals, blank nodes; `INSERT DATA`/`DELETE DATA`
+- **Input formats**: N-Triples (`.nt`, streaming) and Turtle (`.ttl`)
+
+Not yet supported (but planned): `FILTER EXISTS`/`NOT EXISTS`, `COALESCE`, and
+the functions outside the list above (`SUBSTR`, `ABS`, `CONCAT`, `REPLACE`, the
+date and hash functions, …). All are rejected with an error rather than
+silently answered — see [ROADMAP](ROADMAP.md).
 
 ### Inference (RDFS backward chaining)
 
@@ -61,10 +103,16 @@ reachable through RDFS rules:
 
 | Rule | Effect |
 |------|--------|
-| `rdfs:subClassOf` | `?x a :C` also matches `?x a :D` when `:D subClassOf :C` |
-| `rdfs:subPropertyOf` | `?x :p ?y` also matches `?x :q ?y` when `:q subPropertyOf :p` |
-| `rdfs:domain` | `?x a :C` triggers `?x :p ?y` where `:p domain :C` |
-| `rdfs:range` | `?x a :C` triggers `?y :p ?x` where `:p range :C` |
+| `rdfs:subClassOf` | `?x a :C` also matches `?x a :D` when `:D` is a subclass of `:C` |
+| `rdfs:subPropertyOf` | `?x :p ?y` also matches `?x :q ?y` when `:q` is a sub-property of `:p` |
+| `rdfs:domain` | `?x a :C` also matches `?x :p ?y` when `:p`, or a super-property of it, has `:C` or a subclass of it as its domain |
+| `rdfs:range` | `?x a :C` also matches `?y :p ?x` when `:p`, or a super-property of it, has `:C` or a subclass of it as its range |
+
+Both hierarchies are followed transitively, and one entailed triple is one row
+however many rules derive it. Not covered: a property path in the query is not
+rewritten, a predicate that is a sub-property of `rdf:type` does not fire the
+type rules, and a solution that needs inference at two patterns of the same
+group is missed.
 
 ```bash
 curl -G 'http://localhost:9090/sparql' \
@@ -78,8 +126,8 @@ curl -G 'http://localhost:9090/sparql' \
 cargo build --release --bin server     # builds the `server` binary
 cargo test                             # runs the suite
 
-# Build an index from N-Triples, persist it, then serve it:
-./target/release/server build data.nt /tmp/data.bin
+# Build an index from N-Triples or Turtle, persist it, then serve it:
+./target/release/server build data.nt /tmp/data.bin   # or data.ttl
 ./target/release/server load  /tmp/data.bin 9090
 ```
 
@@ -99,8 +147,16 @@ curl -G 'http://localhost:9090/sparql' \
 | `/stream` | GET/POST | NDJSON stream: header line + one binding per line |
 | `/count`  | GET/POST | Result count for a SELECT/ASK |
 | `/update` | POST    | `INSERT DATA` / `DELETE DATA` |
+| `/checkpoint` | POST | Fold the WAL into the snapshot and empty it |
 
+All query endpoints support an optional `infer=rdfs` query parameter that enables
+RDFS backward-chaining inference (subclass, subproperty, domain, range). Example:
 
+```bash
+curl -G 'http://localhost:9090/sparql' \
+  --data-urlencode 'query=SELECT ?s WHERE { ?s rdf:type ex:Animal }' \
+  --data-urlencode 'infer=rdfs'
+```
 
 ## Example: GraphRAG with Mistral AI
 
