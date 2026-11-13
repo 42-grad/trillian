@@ -137,6 +137,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `OPTIONAL { OPTIONAL { … } }` silently unbind every row (the inner
   `LeftJoin`'s left side never matched) and `{ } ?s ?p ?o` return nothing.
   Nested and chained `OPTIONAL`s now bind through the empty group.
+- **N-Triples output escapes control and forbidden IRI characters**
+  (`src/hypertrie/export.rs`). `escape_literal` wrote every control character
+  except `\b`/`\f`/`\n`/`\r`/`\t` raw — invalid N-Triples — and IRIs were
+  emitted unescaped. Both now use `\uXXXX`/`\UXXXXXXXX` for the characters
+  N-Triples forbids raw (all of `#x00-#x20` in literals, plus `#x7F`; the
+  `IRIREF` set `< > " { } | ^ `` ` `` \` and `#x00-#x20` in IRIs), and
+  `parse_iri` decodes the escapes again, so export → import round-trips.
 - **`rdfs:range` inference read the wrong triple position**
   (`src/inference.rs`). rdfs3 types the *object* of a data triple, but the
   rewrite looked for `?s ?p ?c` with `?c` the queried class, so it never
