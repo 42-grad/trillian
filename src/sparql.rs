@@ -4629,6 +4629,29 @@ mod tests {
         assert_eq!(values_of(&rows, "s"), vec!["http://example.org/Alice"]);
     }
 
+    /// A solution that needs inference at **two** patterns of the same BGP:
+    /// one type comes from `rdfs:domain`, the other from `rdfs:range`.
+    #[test]
+    fn inference_at_two_patterns_of_the_same_bgp() {
+        let store = rdfs_store(&[
+            ("worksAt", "domain", "Person"),
+            ("livesIn", "range", "Place"),
+            ("Alice", "worksAt", "Acme"),
+            ("Bob", "livesIn", "Springfield"),
+        ]);
+        let rows = infer_rows_of(
+            &store,
+            "SELECT ?s ?t WHERE { ?s \
+             <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Person> . \
+             ?t <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Place> }",
+        );
+        assert_eq!(values_of(&rows, "s"), vec!["http://example.org/Alice"]);
+        assert_eq!(
+            values_of(&rows, "t"),
+            vec!["http://example.org/Springfield"]
+        );
+    }
+
     /// rdfs9 through a predicate declared a sub-property of `rdf:type`: the
     /// derived type is the declared class itself (zero `subClassOf` hops) and
     /// is generalized along the class hierarchy otherwise.

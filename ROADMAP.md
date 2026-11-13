@@ -5,11 +5,9 @@ open an issue first to agree on the approach (see [CONTRIBUTING.md](CONTRIBUTING
 
 ## SPARQL features
 
-- Remaining `?infer=rdfs` gaps: each branch rewrites one pattern, so
-  `{ ?s a :C . ?t a :D }` with only inferred types for both returns no row;
-  and the `rdfs:domain`/`rdfs:range` branches read every triple of an unbound
-  entity, because the schema path binds the predicate but nothing pushes that
-  binding into the BGP (`src/inference.rs`).
+- Remaining `?infer=rdfs` gap: the `rdfs:domain`/`rdfs:range` branches read
+  every triple of an unbound entity, because the schema path binds the
+  predicate but nothing pushes that binding into the BGP (`src/inference.rs`).
 - Property-path edge cases: tighten result-count parity on the remaining
   WDBench paths/C2RPQ deviations (notably blank-node-bearing transitive paths).
 - Pipeline execution across `OPTIONAL`/`LeftJoin` so those classes get the same
