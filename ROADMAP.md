@@ -5,11 +5,6 @@ open an issue first to agree on the approach (see [CONTRIBUTING.md](CONTRIBUTING
 
 ## SPARQL features
 
-- `FILTER EXISTS`/`NOT EXISTS`, `COALESCE`, and the unimplemented functions
-  (`SUBSTR`, `ABS`, `CONCAT`, `REPLACE`, the date and hash functions, …), all
-  named by `unsupported_in_expr` and rejected today, in a top-level `FILTER`
-  and inside an `OPTIONAL` alike. `EXISTS` needs the filter evaluator to reach
-  `eval_where`; the functions are additions to `eval_func`.
 - Remaining `?infer=rdfs` gaps: a property path in the query is not rewritten,
   so `?s rdf:type/rdfs:subClassOf* ?c` sees asserted triples only; a predicate
   that is a sub-property of `rdf:type` does not fire the type rules; each
@@ -25,12 +20,6 @@ open an issue first to agree on the approach (see [CONTRIBUTING.md](CONTRIBUTING
 
 ## Storage & performance
 
-- Stop allocating per row when a term becomes a value: `decode_type`
-  (`src/hypertrie/dictionary.rs`) still allocates the datatype IRI for every
-  `D`-prefixed key and the language tag for every `G`-prefixed one, under every
-  `FILTER`, `ORDER BY`, `BIND` and aggregate. Needs a borrowed/`Cow` term type.
-  (The `classify()`/`lit_key()` half of this was fixed in #49 with
-  `dt.strip_prefix(XSD)`.)
 - Drop the per-term UTF-8 validation on the read path: `MappedDict::key`
   (`src/hypertrie/dictionary.rs`) runs `str::from_utf8` *twice* for every bound
   term of every result row — `append_term` and `term_to_json` resolve the value

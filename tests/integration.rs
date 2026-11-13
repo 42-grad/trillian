@@ -340,17 +340,36 @@ fn optional_inner_filter_is_the_join_condition_without_shared_vars() {
 }
 
 #[test]
-fn optional_inner_filter_rejects_unsupported_expressions() {
+fn optional_inner_filter_exists_evaluates_with_the_merged_row() {
     let store = optional_filter_store();
     let engine = HybridEngine::new();
-    // `eval` cannot do EXISTS, and a left join reads that error as "no match" —
-    // which would silently unbind every row. It has to be an error instead.
+    // `eval` handles EXISTS; the hash join evaluates it on the merged row, so
+    // it must neither error nor silently unbind the OPTIONAL.
     let q = format!(
         "SELECT ?b ?age WHERE {{ <{EX}alice> <{EX}knows> ?b \
          OPTIONAL {{ ?b <{EX}age> ?age FILTER EXISTS {{ ?b <{EX}age> ?a2 }} }} }}"
     );
+    let rows = bindings(&execute_sparql(&store, &engine, &q).unwrap());
+    let got = ages_by_person(&rows);
+    assert_eq!(
+        got["bob"], "25",
+        "EXISTS over the merged row keeps the match"
+    );
+    assert_eq!(got["carol"], "60");
+}
+
+#[test]
+fn optional_inner_filter_still_rejects_unsupported_functions() {
+    let store = optional_filter_store();
+    let engine = HybridEngine::new();
+    // A construct `eval` cannot handle reads as "no match" in a left join —
+    // which would silently unbind every row. It has to be an error instead.
+    let q = format!(
+        "SELECT ?b ?age WHERE {{ <{EX}alice> <{EX}knows> ?b \
+         OPTIONAL {{ ?b <{EX}age> ?age FILTER LANGMATCHES(STR(?age), \"en\") }} }}"
+    );
     let err = execute_sparql(&store, &engine, &q).unwrap_err();
-    assert!(err.contains("EXISTS"), "unexpected error: {err}");
+    assert!(err.contains("LANGMATCHES"), "unexpected error: {err}");
 }
 
 #[test]
@@ -1103,8 +1122,7 @@ fn minus_treats_an_unbound_column_as_compatible() {
 fn unsupported_filter_expressions_are_refused() {
     let store = social_store();
     let engine = HybridEngine::new();
-    let q =
-        format!("SELECT ?s WHERE {{ ?s <{EX}knows> ?o FILTER NOT EXISTS {{ ?s <{EX}age> ?a }} }}");
+    let q = format!("SELECT ?s WHERE {{ ?s <{EX}knows> ?o FILTER(NOW() > \"\") }}");
     let err = execute_sparql(&store, &engine, &q).unwrap_err();
-    assert!(err.contains("EXISTS"), "unexpected error: {err}");
+    assert!(err.contains("NOW"), "unexpected error: {err}");
 }
